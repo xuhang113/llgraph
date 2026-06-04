@@ -1,0 +1,59 @@
+{
+  "thought": {
+    "enabled": true,
+    "max_chars": 8000,
+    "emit_plan_line": true,
+    "use_builtin_fallback": true
+  },
+  "edits": {
+    "prefer_search_replace": true,
+    "require_unique_match": true,
+    "persist_edits": true,
+    "snapshot_on_first_edit": true,
+    "confirm_writes": "interactive"
+  },
+  "llm": {
+    "model": "claude-sonnet-4-6"
+  },
+  "writes": {
+    "chunk_max_chars": 8000,
+    "failures_before_hint": 2
+  },
+  "context": {
+    "budget_source": "model",
+    "context_fallback_max_tokens": 200000,
+    "auto_compress_ratio": 0.8,
+    "compress_trigger_max_tokens": 64000,
+    "incremental_tool_prune": true,
+    "keep_recent_tool_messages": 12,
+    "keep_recent_turns": 6,
+    "keep_recent_token_ratio": 0.25,
+    "compress_model": null,
+    "session_archive_on_compress": true,
+    "compress_retrieval_enabled": true,
+    "compress_retrieval_top_k": 5,
+    "compress_tool_mask_max_chars": 2000,
+    "tool_result_max_chars": 10000,
+    "tool_result_preview_lines": 40,
+    "spill_dir": ".llgraph/context/tool-results",
+    "spill_enabled": true
+  },
+  "shell": {
+    "enabled": true,
+    "timeout_sec": 120,
+    "max_output_chars": 100000,
+    "terminal_log_dir": ".llgraph/context/terminals",
+    "log_commands": true
+  },
+  "logging": {
+    "level": "info",
+    "search_file": true,
+    "retention_days": 30,
+    "execution_log": true
+  },
+  "review": {
+    "output_dir": "~/llgraph-review",
+    "spec_paths": ["CONTRIBUTING.md"],
+    "exclude_prefixes": [".cursor/", "node_modules/", ".llgraph/", ".git/"]
+  }
+}

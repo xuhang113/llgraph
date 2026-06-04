@@ -1,0 +1,11 @@
+---
+description: 示例工作区通用规范（llgraph demo）
+alwaysApply: true
+---
+
+# 工作区通用规则（示例）
+
+- 路径一律使用**相对工作区根**的路径（如 `services/auth-api/README.md`）。
+- 改代码前先用 `read_file` / `grep_files` / `search_workspace` 确认现状，勿臆造未读文件。
+- 局部修改优先 `search_replace`；新建文件用 `write_file`。
+- 不要提交或输出生产环境密钥、内网地址、账号密码。

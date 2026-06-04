@@ -1,0 +1,55 @@
+"""会话级 Rule / Skill 配置（/rule、/skill 命令修改）。"""
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ContextSession:
+    """
+    每轮对话注入模型的规则与技能状态。
+
+    active_skills: 用户通过 /skill 启用的技能名（对应 .llgraph/skills/<name>/）
+    disabled_rules: 用户临时禁用的规则 id（/rule off）
+    forced_rules: 用户强制启用的 glob 规则 id（/rule on）
+    auto_match_skills: 是否根据用户消息自动匹配技能 description
+    include_markdowns_index: 是否在上下文中附带 markdowns/ 索引
+    write_failure_hint: 写工具连续失败后注入下一轮的提醒（由 WriteFailureTracker 设置）
+  """
+
+    active_skills: list[str] = field(default_factory=list)
+    disabled_rules: set[str] = field(default_factory=set)
+    forced_rules: set[str] = field(default_factory=set)
+    auto_match_skills: bool = True
+    include_markdowns_index: bool = True
+    write_failure_hint: str = ""
+    organize_preflight_done: bool = False
+    survey_enabled: bool | None = None
+
+    def activate_skill(self, name: str) -> None:
+        """
+        启用技能（去重保序）。
+
+        @param name 技能目录名
+        """
+        key = name.strip().lower()
+        if not key:
+            return
+        lowered = [s.lower() for s in self.active_skills]
+        if key not in lowered:
+            self.active_skills.append(name.strip())
+
+    def deactivate_skill(self, name: str) -> bool:
+        """
+        关闭指定技能。
+
+        @param name 技能名
+        @return 是否曾启用
+        """
+        key = name.strip().lower()
+        before = len(self.active_skills)
+        self.active_skills = [s for s in self.active_skills if s.lower() != key]
+        return len(self.active_skills) < before
+
+    def clear_skills(self) -> None:
+        """清空已启用技能。"""
+        self.active_skills.clear()

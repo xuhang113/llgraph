@@ -1,0 +1,30 @@
+{
+  "provider": "local",
+  "local": {
+    "model": "BAAI/bge-small-zh-v1.5",
+    "device": "auto",
+    "batch_size": 32,
+    "normalize": true
+  },
+  "remote": {
+    "model": "text-embedding-3-small",
+    "dimension": 1536,
+    "batch_size": 32,
+    "base_url": "",
+    "api_key": ""
+  },
+  "index": {
+    "max_files": 0,
+    "progressive": true,
+    "manifest_flush_every": 50,
+    "progress_log_every": 500,
+    "prepare_workers": 4,
+    "embed_accumulate_chunks": 128,
+    "use_embed_cache": false,
+    "watch": {
+      "enabled": true,
+      "with_agent": true,
+      "debounce_sec": 5
+    }
+  }
+}

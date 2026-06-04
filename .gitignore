@@ -1,0 +1,64 @@
+# --- Python ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+*.cover
+
+# --- 环境与密钥（勿提交真实凭据）---
+.env
+.env.*
+!.env.example
+llgraph.env
+*.env.local
+secrets/
+*.pem
+*.key
+*.p12
+credentials.json
+service-account*.json
+
+# --- llgraph 运行时数据 ---
+# 仅忽略「本仓库根」下的运行时目录（本地试跑 llgraph 时产生）
+/.llgraph/
+
+# 任意工作区内的会话/索引/落盘（用户在自己 monorepo 里跑 agent 时产生，不应进 llgraph 仓库）
+**/.llgraph/sessions/
+**/.llgraph/index/
+**/.llgraph/context/
+
+# examples/default-workspace/.llgraph/ 为 demo 配置，需提交，不在此列
+
+# --- 评审 / 本地产出 ---
+llgraph-review/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- 日志与临时文件 ---
+*.log
+*.tmp
+.cache/

@@ -1,0 +1,17 @@
+{
+  "defaults": {
+    "timeout_sec": 60,
+    "allow_write_tools": false
+  },
+  "servers": {
+    "filesystem": {
+      "enabled": true,
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "${WORKSPACE_ROOT}"
+      ]
+    }
+  }
+}

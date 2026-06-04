@@ -1,0 +1,68 @@
+{
+  "llm": {
+    "max_tokens": 16384,
+    "provider_label": "AI Gateway",
+    "models_doc": "",
+    "rate_label": "relative cost",
+    "message_dispatch_defaults": {
+      "expand_parallel_tools": false,
+      "patch_reasoning_content": false
+    },
+    "models": [
+      {
+        "id": "kimi-k2.5",
+        "rate": 1,
+        "hint": "cost-effective daily use",
+        "context_window": 262144,
+        "dispatch": {
+          "expand_parallel_tools": true,
+          "patch_reasoning_content": true
+        }
+      },
+      {
+        "id": "kimi-k2.6",
+        "rate": 1.7,
+        "hint": "coding",
+        "context_window": 262144,
+        "dispatch": {
+          "expand_parallel_tools": true,
+          "patch_reasoning_content": true
+        }
+      },
+      {
+        "id": "claude-sonnet-4-6",
+        "rate": 2,
+        "hint": "balanced",
+        "context_window": 200000,
+        "dispatch": {
+          "expand_parallel_tools": false,
+          "patch_reasoning_content": false,
+          "strip_assistant_thinking_blocks": true,
+          "rewrite_tool_history_as_text": true
+        }
+      },
+      {
+        "id": "gpt-5.4",
+        "rate": 2.5,
+        "context_window": 200000,
+        "dispatch": {
+          "expand_parallel_tools": false,
+          "patch_reasoning_content": false,
+          "strip_assistant_thinking_blocks": true
+        }
+      }
+    ]
+  },
+  "logging": {
+    "level": "warning",
+    "search_file": true
+  },
+  "web_search": {
+    "default_enabled": false,
+    "api_key_env": "TAVILY_API_KEY",
+    "max_results": 3,
+    "search_depth": "ultra-fast",
+    "include_answer": false,
+    "timeout_sec": 25
+  }
+}

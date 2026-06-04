@@ -1,0 +1,14 @@
+---
+description: llgraph 解析 Office/PDF 时仅用 read_file，无 Cursor MCP
+globs: **/*.{xlsx,xls,docx,pdf}
+alwaysApply: false
+---
+
+# 文件解析（llgraph）
+
+llgraph CLI **没有** Cursor 的 document-edit / MCP 工具。
+
+- 工作区内文本类文件：用 `read_file`。
+- Excel/Word/PDF：说明 llgraph 无法直接解析，请用户在 Cursor 中处理、或导出文本后粘贴，或自行用本地工具。
+
+禁止为「读一份 xlsx」默认编写并执行 Python 脚本，除非用户明确要求用脚本。
