@@ -12,17 +12,9 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 
 from llgraph.config.mcp_config import McpServerConfig, McpSettings, format_mcp_summary
+from llgraph.permissions.mcp import is_write_mcp_tool
 
 logger = logging.getLogger(__name__)
-
-_WRITE_TOOL_KEYWORDS = frozenset({
-    "write", "edit", "delete", "create", "update", "insert", "remove", "patch",
-})
-
-
-def _tool_looks_like_write(name: str, description: str) -> bool:
-    text = f"{name} {description}".lower()
-    return any(kw in text for kw in _WRITE_TOOL_KEYWORDS)
 
 
 class _McpServerRuntime:
@@ -196,7 +188,7 @@ class McpToolRegistry:
         for mcp_tool in runtime.list_tools():
             name = mcp_tool.name
             desc = mcp_tool.description or name
-            if not permit_write and _tool_looks_like_write(name, desc):
+            if not permit_write and is_write_mcp_tool(name, desc):
                 continue
             lc_name = f"mcp__{server_name}__{name}"
             input_schema = mcp_tool.inputSchema if hasattr(mcp_tool, "inputSchema") else {}

@@ -98,6 +98,76 @@ def _print_trace_stats(
     print("更多: /log tail | /log purge", flush=True)
 
 
+# 内置元命令首 token（不含 /）；新增命令须同步更新 handle_meta_command 与此集合
+_BUILTIN_META_COMMAND_NAMES = frozenset({
+    "index",
+    "survey",
+    "paste",
+    "p",
+    "watch",
+    "write",
+    "web",
+    "model",
+    "config",
+    "session",
+    "sessionid",
+    "session-id",
+    "sessions",
+    "help",
+    "h",
+    "compress",
+    "context",
+    "tools",
+    "review",
+    "commands",
+    "trace",
+    "log",
+    "rule",
+    "skill",
+    "changes",
+    "undo",
+    "diff",
+})
+
+
+def _meta_command_token(text: str) -> str | None:
+    """
+    解析首 token 元命令名（不含 /）。
+
+    @param text 用户输入
+    @return 命令名小写；非 /command 形式则 None
+    """
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None
+    try:
+        parts = shlex.split(stripped)
+    except ValueError:
+        return None
+    if not parts or not parts[0].startswith("/"):
+        return None
+    name = parts[0][1:]
+    if not name or "/" in name:
+        return None
+    return name.lower()
+
+
+def is_registered_meta_command(text: str, workspace: Path) -> bool:
+    """
+    输入是否为已注册元命令（仅此类不发给 Agent）。
+
+    @param text 用户输入
+    @param workspace 工作区根（查 .llgraph/commands 自定义命令）
+    @return 是否走 handle_meta_command
+    """
+    token = _meta_command_token(text)
+    if token is None:
+        return False
+    if token in _BUILTIN_META_COMMAND_NAMES:
+        return True
+    return resolve_command(workspace, token) is not None
+
+
 def _handle_index_meta_command(line: str, workspace: Path) -> bool:
     """
     处理 /index 及子命令（在交互会话内构建索引）。

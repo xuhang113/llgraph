@@ -11,6 +11,7 @@ from llgraph.context.context_session import ContextSession
 from llgraph.survey.edit_confirm import EditConfirmGate
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.display.trace_display import TraceSession
+from llgraph.sandbox.policy import SandboxPolicy
 
 
 @dataclass
@@ -33,3 +34,4 @@ class AgentSessionContext:
     watch_service: Any | None = None
     web_search_enabled: bool = False
     edit_confirm_gate: EditConfirmGate | None = None
+    sandbox_policy: SandboxPolicy | None = None

@@ -475,7 +475,9 @@ def create_filesystem_tools(
         @param end_line 结束行号（含）；0 表示读到文件末尾
         """
         try:
-            target = resolve_catalog_read_path(ctx.root, path)
+            target = resolve_catalog_read_path(
+                ctx.root, path, sandbox=ctx.sandbox_policy
+            )
         except ValueError as exc:
             return str(exc)
         if not target.is_file():
@@ -516,7 +518,10 @@ def create_filesystem_tools(
             return err
         ctx.ensure_write_allowed()
         rel = path.strip().lstrip("/")
-        target = ctx.resolve_path(rel)
+        try:
+            target = ctx.resolve_path(rel, for_write=True)
+        except PermissionError as exc:
+            return str(exc)
         action = "覆盖" if target.is_file() else "创建"
         denied = _confirm_write(rel, f"是否{action}文件")
         if denied:
@@ -543,7 +548,10 @@ def create_filesystem_tools(
             return err
         ctx.ensure_write_allowed()
         rel = path.strip().lstrip("/")
-        target = ctx.resolve_path(rel)
+        try:
+            target = ctx.resolve_path(rel, for_write=True)
+        except PermissionError as exc:
+            return str(exc)
         denied = _confirm_write(rel, "是否追加内容到文件")
         if denied:
             return denied
@@ -581,7 +589,10 @@ def create_filesystem_tools(
         denied = _confirm_write(rel, "是否编辑文件")
         if denied:
             return denied
-        target = ctx.resolve_path(rel)
+        try:
+            target = ctx.resolve_path(rel, for_write=True)
+        except PermissionError as exc:
+            return str(exc)
         if not target.is_file():
             return f"文件不存在: {rel}"
         try:

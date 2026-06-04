@@ -19,6 +19,7 @@ from llgraph.survey.edit_confirm import EditConfirmGate
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.core.write_failure_tracker import WriteFailureTracker
 from llgraph.core.workspace import WorkspaceContext
+from llgraph.sandbox.policy import SandboxPolicy
 
 
 @tool
@@ -38,6 +39,7 @@ def get_agent_tools(
     write_failure_tracker: WriteFailureTracker | None = None,
     web_search_enabled: bool = False,
     edit_confirm_gate: EditConfirmGate | None = None,
+    sandbox_policy: SandboxPolicy | None = None,
 ) -> list:
     """
     组装 Agent 可用工具列表。
@@ -50,11 +52,17 @@ def get_agent_tools(
     @param context_spill 工具结果落盘（P6）
     @param write_failure_tracker 写工具失败计数
     @param web_search_enabled 是否注册 web_search（Tavily）
+    @param sandbox_policy OS 沙箱策略；None 时按 sandbox.json 默认（通常关闭）
     @return Tool 列表
     """
     root = Path(workspace_root or ".").expanduser().resolve()
     skip_dirs = frozenset(resolve_index_settings(root).skip_dirs)
-    ctx = WorkspaceContext(root, allow_write=allow_write, extra_skip_dirs=skip_dirs)
+    ctx = WorkspaceContext(
+        root,
+        allow_write=allow_write,
+        extra_skip_dirs=skip_dirs,
+        sandbox_policy=sandbox_policy,
+    )
     fs_tools = create_filesystem_tools(
         ctx,
         edit_tracker=edit_tracker,
@@ -65,7 +73,16 @@ def get_agent_tools(
     index_tools = create_code_index_tools(root)
     history_tools = create_session_history_tools(root)
     shell_tools = create_shell_tools(ctx, allow_write=allow_write)
-    web_tools = create_web_search_tools(root) if web_search_enabled else []
+    sandbox_blocks_network = (
+        sandbox_policy is not None
+        and sandbox_policy.enabled
+        and sandbox_policy.network == "deny"
+    )
+    web_tools = (
+        create_web_search_tools(root)
+        if web_search_enabled and not sandbox_blocks_network
+        else []
+    )
     extra = list(mcp_tools or [])
     tools = [
         get_current_utc_time,

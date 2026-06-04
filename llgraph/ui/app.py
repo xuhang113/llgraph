@@ -442,7 +442,9 @@ class LlgraphApp(App[None]):
 
     def _submit_message(self, text: str) -> None:
         self._last_user_message = text
-        if text.startswith("/"):
+        from llgraph.commands.meta_commands import is_registered_meta_command
+
+        if is_registered_meta_command(text, self._params.workspace):
             self._chat_user(text)
             self._handle_meta(text)
             return

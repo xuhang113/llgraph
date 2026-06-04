@@ -176,7 +176,9 @@ def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
     if _try_expand_trace_step(params, text):
         return True
 
-    if text.startswith("/"):
+    from llgraph.commands.meta_commands import is_registered_meta_command
+
+    if is_registered_meta_command(text, params.workspace):
         from llgraph.ui.style import sty
 
         preview = text.split("\n", 1)[0]
@@ -184,6 +186,8 @@ def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
         handled = _handle_meta(params, text, last_user=last_user)
         if handled and params.agent_session is not None:
             params.agent = params.agent_session.agent
+        elif not handled:
+            print(f"未知命令 {preview}，输入 /help 查看。", flush=True)
         return True
 
     effective = text

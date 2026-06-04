@@ -28,6 +28,7 @@ from llgraph.survey.edit_confirm import EditConfirmGate
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.context.context_spill import ContextSpill
 from llgraph.core.write_failure_tracker import WriteFailureTracker
+from llgraph.sandbox.policy import SandboxPolicy
 from llgraph.loaders.thought_loader import build_thought_prompt_block
 from llgraph.session.session_manifest import sync_session_manifest_to_agent_state
 from llgraph.context.message_normalize import make_prompt_normalizer
@@ -140,6 +141,7 @@ def build_agent(
     web_search_enabled: bool = False,
     edit_confirm_gate: EditConfirmGate | None = None,
     context_session: ContextSession | None = None,
+    sandbox_policy: SandboxPolicy | None = None,
 ):
     """
     构建 ReAct Agent：LLM（Gateway）+ 工具循环。
@@ -154,6 +156,7 @@ def build_agent(
     @param write_failure_tracker 写工具失败提醒
     @param web_search_enabled 是否注册 web_search
     @param edit_confirm_gate 写文件前终端确认
+    @param sandbox_policy OS 沙箱策略
     @return 已编译的 LangGraph Runnable
     """
     root = Path(workspace_root or ".").expanduser().resolve()
@@ -168,6 +171,7 @@ def build_agent(
         write_failure_tracker=write_failure_tracker,
         web_search_enabled=web_search_enabled,
         edit_confirm_gate=edit_confirm_gate,
+        sandbox_policy=sandbox_policy,
     )
     from llgraph.core.llm_settings import resolve_effective_model
     from llgraph.core.prompt_cache import (
@@ -196,6 +200,16 @@ def build_agent(
         web_search_enabled=web_search_enabled,
         survey_interactive_enabled=survey_interactive_enabled(root, context_session),
     )
+    if sandbox_policy is not None and sandbox_policy.enabled:
+        from llgraph.config.sandbox_settings import format_sandbox_config_hint
+
+        system_prompt = (
+            f"{system_prompt}\n\n"
+            f"OS 沙箱已启用（{sandbox_policy.backend}，mode={sandbox_policy.mode}）。"
+            "文件工具与 Shell 受 sandbox.json 路径/网络策略约束；"
+            "被拒绝时会提示配置路径。\n"
+            f"{format_sandbox_config_hint(root)}"
+        )
 
     return create_react_agent(
         llm,
@@ -250,6 +264,7 @@ def rebuild_agent_preserving_memory(
         web_search_enabled=web,
         edit_confirm_gate=getattr(agent_session, "edit_confirm_gate", None),
         context_session=agent_session.context_session,
+        sandbox_policy=getattr(agent_session, "sandbox_policy", None),
     )
     if messages and agent_session.with_memory:
         from llgraph.context.message_normalize import reorder_pinned_system_messages

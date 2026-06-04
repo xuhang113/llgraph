@@ -219,6 +219,16 @@ def main() -> None:
         help="允许写入文件（默认只读；含 search_replace / write_file）",
     )
     parser.add_argument(
+        "--sandbox",
+        action="store_true",
+        help="启用 OS 沙箱（macOS sandbox-exec / Linux bwrap；覆盖 sandbox.json enabled=false）",
+    )
+    parser.add_argument(
+        "--no-sandbox",
+        action="store_true",
+        help="禁用 OS 沙箱（覆盖 sandbox.json enabled=true）",
+    )
+    parser.add_argument(
         "--no-spill",
         action="store_true",
         help="禁用大工具结果落盘（调试；默认开启 P6 动态上下文）",
@@ -431,6 +441,28 @@ def main() -> None:
         preview_lines=max(1, args.preview_lines),
     )
     allow_write = args.write
+    if args.sandbox and args.no_sandbox:
+        print("错误: 不能同时指定 --sandbox 与 --no-sandbox", file=sys.stderr)
+        sys.exit(1)
+
+    from llgraph.config.sandbox_settings import resolve_sandbox_settings
+    from llgraph.sandbox.policy import build_sandbox_policy
+
+    cli_sandbox: bool | None = True if args.sandbox else False if args.no_sandbox else None
+    sandbox_settings = resolve_sandbox_settings(workspace)
+    sandbox_policy = build_sandbox_policy(
+        workspace, sandbox_settings, cli_enabled=cli_sandbox
+    )
+    sandbox_warning = sandbox_policy.startup_warning()
+    if sandbox_policy.active and sandbox_warning:
+        print(f"警告: {sandbox_warning}", file=sys.stderr)
+    elif sandbox_policy.enabled:
+        print(
+            f"沙箱已启用 ({sandbox_policy.backend}, mode={sandbox_policy.mode}, "
+            f"network={sandbox_policy.network})",
+            flush=True,
+        )
+
     context_session = ContextSession()
 
     from llgraph.code_index.index_watch import (
@@ -457,7 +489,7 @@ def main() -> None:
 
         mcp_tools, mcp_registry, mcp_summary = load_mcp_tool_bundle(
             workspace,
-            allow_write=allow_write,
+            allow_write=allow_write and not sandbox_policy.enabled,
         )
         from llgraph.session.session_web_search import resolve_initial_web_search_enabled
 
@@ -502,6 +534,7 @@ def main() -> None:
                 web_search_enabled=web_search_enabled,
                 edit_confirm_gate=edit_confirm_gate,
                 context_session=context_session,
+                sandbox_policy=sandbox_policy,
             )
             if not args.message:
                 print(
@@ -573,6 +606,7 @@ def main() -> None:
             web_search_enabled=web_search_enabled,
             edit_confirm_gate=edit_confirm_gate,
             context_session=context_session,
+            sandbox_policy=sandbox_policy,
         )
         agent_session = AgentSessionContext(
             agent=agent,
@@ -591,6 +625,7 @@ def main() -> None:
             watch_service=watch_service,
             web_search_enabled=web_search_enabled,
             edit_confirm_gate=edit_confirm_gate,
+            sandbox_policy=sandbox_policy,
         )
         from llgraph.session.session_file_store import restore_session_to_agent
 
