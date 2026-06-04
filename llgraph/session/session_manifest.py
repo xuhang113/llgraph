@@ -21,8 +21,9 @@ SESSION_MANIFEST_TAG = "<session-manifest>"
 _MANIFEST_VERSION = 1
 
 _CATALOG_READ_HINT = (
-    "Skills/Rules 仅提供描述与路径句柄，正文不在对话上下文中。"
-    "任务匹配描述后须 `read_file <path>` 读取；长文用 `start_line`/`end_line` 分段。"
+    "Skills/Rules 目录提供描述与路径；⭐ 推荐技能正文已注入 workspace-context。"
+    "其余条目用 `read_file <path>`（path 可为工作区相对路径或 ~/.llgraph 下绝对路径）。"
+    "长文用 `start_line`/`end_line` 分段。"
     "压缩/换模型后远早对话不在每轮上下文：先看 <conversation-anchor>，"
     "细节用 `search_session_history(query=关键词)` 检索 archive/messages；全文再 read_file 归档路径。"
 )

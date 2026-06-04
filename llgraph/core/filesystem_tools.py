@@ -7,6 +7,7 @@ from pathlib import Path
 
 from langchain_core.tools import StructuredTool
 
+from llgraph.config.catalog_paths import resolve_catalog_read_path
 from llgraph.survey.edit_confirm import EditConfirmGate
 from llgraph.config.edit_settings import resolve_edit_settings
 from llgraph.cli.search_terms import build_search_terms
@@ -465,13 +466,18 @@ def create_filesystem_tools(
         end_line: int = 0,
     ) -> str:
         """
-        读取工作区内单个文本文件（可指定行号范围）。
+        读取文本文件（可指定行号范围）。
 
-        @param path 相对工作区的文件路径
+        path 可为工作区相对路径，或目录中给出的 ~/.llgraph/skills|rules 绝对路径。
+
+        @param path 文件路径
         @param start_line 起始行号，从 1 开始
         @param end_line 结束行号（含）；0 表示读到文件末尾
         """
-        target = ctx.resolve_path(path)
+        try:
+            target = resolve_catalog_read_path(ctx.root, path)
+        except ValueError as exc:
+            return str(exc)
         if not target.is_file():
             return f"文件不存在: {path}"
 

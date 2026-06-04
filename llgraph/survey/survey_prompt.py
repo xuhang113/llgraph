@@ -538,6 +538,15 @@ def maybe_preflight_survey_for_user_message(
         return None
     payload = format_survey_answers_for_agent(answers)
     merged = f"{user_message.strip()}\n\n{payload}"
+    # 业务梳理向导完成后自动启用 project-organize，正文注入 workspace-context
+    if workspace is not None and context_session is not None:
+        from llgraph.context.context_session import ContextSession
+        from llgraph.loaders.skills_loader import discover_skills
+
+        if isinstance(context_session, ContextSession):
+            skill_names = {s.name.lower() for s in discover_skills(workspace)}
+            if "project-organize" in skill_names:
+                context_session.activate_skill("project-organize")
     return merged, True
 
 

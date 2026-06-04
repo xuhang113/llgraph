@@ -24,6 +24,48 @@ def _truncate(text: str, limit: int, label: str) -> str:
     return text[: limit - 40] + f"\n\n…（{label} 已截断，共 {len(text)} 字符；完整目录见 <session-manifest>）"
 
 
+DEFAULT_SKILL_BODY_MAX_CHARS = 6_000
+
+
+def _format_recommended_skill_bodies(
+    workspace: Path,
+    session: ContextSession,
+    user_message: str,
+) -> str:
+    """
+    本回合 ⭐ 推荐技能的正文（避免 read_file 无法读 ~/.llgraph 时卡住）。
+
+    @param workspace 工作区根
+    @param session 会话 skill 状态
+    @param user_message 用户消息
+    @return Markdown 块；无推荐时空串
+    """
+    all_skills = discover_skills(workspace)
+    active = resolve_active_skills(
+        all_skills,
+        session_active=session.active_skills,
+        user_message=user_message,
+        auto_match=session.auto_match_skills,
+    )
+    if not active:
+        return ""
+    lines = ["## 本回合推荐技能（正文）", ""]
+    for skill in active:
+        path = format_catalog_path(workspace, skill.skill_dir / "SKILL.md", skill.scope)
+        body = skill.body.strip()
+        if not body:
+            continue
+        lines.append(f"### {skill.name}")
+        lines.append(f"- 路径: `{path}`")
+        lines.append("")
+        lines.append(body)
+        lines.append("")
+    text = "\n".join(lines).strip()
+    if not text:
+        return ""
+    return _truncate(text, DEFAULT_SKILL_BODY_MAX_CHARS, "推荐技能正文")
+
+
 def _format_skill_catalog(workspace: Path, session: ContextSession, user_message: str) -> str:
     """技能目录：全量列出，⭐ 标记本回合推荐。"""
     all_skills = discover_skills(workspace)
@@ -91,6 +133,10 @@ def build_workspace_context_block(
     skill_catalog = _format_skill_catalog(workspace, session, user_message)
     if skill_catalog:
         sections.append(_truncate(skill_catalog.strip(), catalog_max_chars, "Skills 目录"))
+
+    skill_bodies = _format_recommended_skill_bodies(workspace, session, user_message)
+    if skill_bodies:
+        sections.append(skill_bodies)
 
     all_rules = discover_rules(workspace)
     active_rules = select_rules_for_turn(
