@@ -44,11 +44,23 @@ def indent_line(level: int = 1) -> str:
     return "  " * level
 
 
+def _is_interactive_tty() -> bool:
+    """
+    stdin/stdout 均为 TTY 时视为交互终端。
+
+    @return 是否交互 TTY
+    """
+    stdin_tty = hasattr(sys.stdin, "isatty") and sys.stdin.isatty()
+    stdout_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    return stdin_tty and stdout_tty
+
+
 def color_enabled() -> bool:
     """
     是否启用 ANSI（经典终端 trace 保留；TUI RichLog 会剥离）。
 
-    LLGRAPH_COLOR=1 可强制着色（覆盖 NO_COLOR）；LLGRAPH_COLOR=0 强制关闭。
+    LLGRAPH_COLOR=1 可强制着色；LLGRAPH_COLOR=0 强制关闭。
+    交互终端默认着色（与 prompt-toolkit 斜杠补全一致），NO_COLOR 仅影响非交互输出。
 
     @return 是否着色
     """
@@ -57,6 +69,8 @@ def color_enabled() -> bool:
         return True
     if llgraph_color in ("0", "false", "no", "off"):
         return False
+    if _is_interactive_tty():
+        return True
     if os.environ.get("NO_COLOR", "").strip():
         return False
     if os.environ.get("FORCE_COLOR", "").strip():

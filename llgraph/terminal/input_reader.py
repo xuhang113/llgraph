@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from llgraph.ui.keys import is_exit_command
+from llgraph.ui.output import emit, emit_hint
 
 # 须在首次 input() 之前加载，macOS 上才能让 ↑↓ 翻阅历史
 try:
@@ -151,12 +151,12 @@ def _read_paste_block() -> str:
 
     @return 合并后的文本；取消时返回空字符串
     """
-    print(
+    emit(
         "多行粘贴模式：粘贴内容后任选一种结束\n"
         "  · 单独一行输入 ---\n"
         "  · 或连续两次回车\n"
         "  · Ctrl+C 取消并回到对话",
-        flush=True,
+        colorize=True,
     )
     lines: list[str] = []
     saw_empty = False
@@ -164,7 +164,7 @@ def _read_paste_block() -> str:
         try:
             line = _read_paste_line()
         except KeyboardInterrupt:
-            print("\n[已取消粘贴]", flush=True)
+            emit("\n[已取消粘贴]", colorize=True)
             return ""
         except EOFError:
             break
@@ -193,15 +193,23 @@ def _drain_buffered_lines(timeout: float = 0.35) -> list[str]:
     return extra
 
 
-def read_interactive_user_message() -> str:
+def read_interactive_user_message(workspace: Path | None = None) -> str:
     """
-    读取一条用户消息（含粘贴合并与 /paste）。
+    读取一条用户消息（含粘贴合并、/paste、斜杠补全）。
 
+    @param workspace 工作区根（斜杠补全 Skills/Commands）
     @return 用户输入（可能多行）
     @raises EOFError 输入结束
     """
     prompt = "\n> "
-    if sys.stdin.isatty():
+    if sys.stdin.isatty() and workspace is not None:
+        from llgraph.terminal.slash_complete import prompt_toolkit_available
+
+        if prompt_toolkit_available():
+            line = _read_tty_line_with_slash_complete(workspace, prompt)
+        else:
+            line = _read_tty_line(prompt)
+    elif sys.stdin.isatty():
         line = _read_tty_line(prompt)
     else:
         print(prompt, end="", flush=True)
@@ -216,5 +224,85 @@ def read_interactive_user_message() -> str:
     merged = [line]
     merged.extend(_drain_buffered_lines())
     if len(merged) > 1:
-        print(f"[已合并 {len(merged)} 行粘贴]", flush=True)
+        emit_hint(f"[已合并 {len(merged)} 行粘贴]")
     return "\n".join(merged).strip()
+
+
+def _read_tty_line_with_slash_complete(workspace: Path, prompt: str) -> str:
+    """
+    prompt_toolkit 输入：/ 触发 Skills/Commands 动态补全。
+
+    @param workspace 工作区根
+    @param prompt 提示符
+    @return 用户输入行
+    @raises EOFError 输入结束
+    """
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.filters import has_completions
+    from prompt_toolkit.formatted_text import ANSI
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.shortcuts import CompleteStyle
+
+    from llgraph.terminal.slash_complete import build_slash_completer
+    from llgraph.terminal.slash_completion_menu import patch_slash_completion_menu_full_width
+    from llgraph.terminal.slash_prompt_theme import SLASH_COMPLETION_STYLE
+
+    bindings = KeyBindings()
+
+    @bindings.add("down", filter=has_completions, eager=True)
+    @bindings.add("c-n", filter=has_completions, eager=True)
+    def _complete_down(event) -> None:
+        buff = event.current_buffer
+        state = buff.complete_state
+        if state is None or not state.completions:
+            return
+        if state.complete_index is None:
+            buff.go_to_completion(0)
+        else:
+            buff.complete_next()
+
+    @bindings.add("up", filter=has_completions, eager=True)
+    @bindings.add("c-p", filter=has_completions, eager=True)
+    def _complete_up(event) -> None:
+        buff = event.current_buffer
+        state = buff.complete_state
+        if state is None or not state.completions:
+            return
+        if state.complete_index is None:
+            buff.go_to_completion(len(state.completions) - 1)
+        else:
+            buff.complete_previous()
+
+    @bindings.add("enter", filter=has_completions)
+    def _enter_apply_completion(event) -> None:
+        buff = event.current_buffer
+        state = buff.complete_state
+        # 仅当用户用 ↑↓ 选中某项时 Enter 才插入；未选中则关闭菜单并提交当前输入
+        if state is not None and state.complete_index is not None:
+            completion = state.current_completion
+            if completion is not None:
+                buff.apply_completion(completion)
+            buff.cancel_completion()
+            return
+        buff.cancel_completion()
+        buff.validate_and_handle()
+
+    session = PromptSession(
+        completer=build_slash_completer(workspace),
+        complete_while_typing=True,
+        complete_in_thread=False,
+        complete_style=CompleteStyle.COLUMN,
+        style=SLASH_COMPLETION_STYLE,
+        include_default_pygments_style=False,
+        key_bindings=bindings,
+        reserve_space_for_menu=10,
+    )
+    patch_slash_completion_menu_full_width(session)
+
+    try:
+        line = session.prompt(ANSI(prompt))
+    except KeyboardInterrupt:
+        raise
+    except EOFError:
+        raise EOFError from None
+    return line.rstrip("\r\n")

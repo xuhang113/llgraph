@@ -38,6 +38,7 @@ class IndexWatchService:
         self._timer_lock = threading.Lock()
         self._observer = None
         self._running = False
+        self._shutting_down = False
         self._last_run_at: str | None = None
         self._last_files_updated = 0
         self._logger = get_index_logger()
@@ -65,19 +66,21 @@ class IndexWatchService:
         """
         if self._running:
             return True
+        self._shutting_down = False
         try:
             from watchdog.events import FileSystemEventHandler
             from watchdog.observers import Observer
         except ImportError:
-            print(_WATCHDOG_MISSING, flush=True)
+            from llgraph.ui.output import emit_warn
+
+            emit_warn(_WATCHDOG_MISSING)
             return False
 
         lock = IndexLock(self._workspace)
         if not lock.try_acquire():
-            print(
-                "[index-watch] 已有全量 llgraph index 在运行，跳过自动监听",
-                flush=True,
-            )
+            from llgraph.ui.output import emit_warn
+
+            emit_warn("[index-watch] 已有全量 llgraph index 在运行，跳过自动监听")
             return False
         self._index_lock = lock
 
@@ -110,20 +113,29 @@ class IndexWatchService:
 
     def stop(self) -> None:
         """停止监听并释放索引锁。"""
+        self._shutting_down = True
         if not self._running and not getattr(self, "_index_lock", None):
             return
         with self._timer_lock:
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
+        with self._pending_lock:
+            self._pending.clear()
         if self._observer is not None:
-            self._observer.stop()
-            self._observer.join(timeout=5)
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=1.5)
+            except Exception:
+                pass
             self._observer = None
         self._running = False
         lock = getattr(self, "_index_lock", None)
         if lock is not None:
-            lock.release()
+            try:
+                lock.release()
+            except Exception:
+                pass
             self._index_lock = None
         from llgraph.ui.context import ui_notify
 
@@ -181,6 +193,8 @@ class IndexWatchService:
 
     def _flush_pending(self) -> None:
         """执行 pending 路径的增量索引。"""
+        if self._shutting_down or not self._running:
+            return
         with self._pending_lock:
             batch = list(self._pending)
             self._pending.clear()
@@ -228,6 +242,8 @@ def attach_watch_shutdown(service: IndexWatchService | None) -> None:
     service._shutdown_registered = True
 
     def _stop() -> None:
+        if getattr(service, "_shutting_down", False):
+            return
         service.stop()
 
     atexit.register(_stop)

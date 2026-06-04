@@ -469,6 +469,12 @@ def try_run_survey_followup(
     ui_notify("survey", "请在下方菜单中确认（已隐藏选项正文）")
     answers = run_survey_interactive(spec)
     if answers is None:
+        from llgraph.ui.output import emit_hint
+
+        emit_hint(
+            "[survey] 已取消确认。输入 /survey 重新打开向导，"
+            "或直接说明你的选择继续对话。"
+        )
         return None
     return format_survey_answers_for_agent(answers)
 
@@ -535,18 +541,15 @@ def maybe_preflight_survey_for_user_message(
     spec = build_organize_preflight_survey(user_message)
     answers = run_survey_interactive(spec)
     if answers is None:
+        from llgraph.ui.output import emit_hint
+
+        emit_hint(
+            "[survey] 已取消前置确认。可重新发送原问题，或输入 /survey 打开向导。"
+        )
         return None
     payload = format_survey_answers_for_agent(answers)
     merged = f"{user_message.strip()}\n\n{payload}"
-    # 业务梳理向导完成后自动启用 project-organize，正文注入 workspace-context
-    if workspace is not None and context_session is not None:
-        from llgraph.context.context_session import ContextSession
-        from llgraph.loaders.skills_loader import discover_skills
-
-        if isinstance(context_session, ContextSession):
-            skill_names = {s.name.lower() for s in discover_skills(workspace)}
-            if "project-organize" in skill_names:
-                context_session.activate_skill("project-organize")
+    # 不在此 persist activate_skill：本回合由 auto_match + 用户消息触发 project-organize 即可
     return merged, True
 
 

@@ -5,6 +5,7 @@ import shlex
 from pathlib import Path
 from llgraph.core.agent_session import AgentSessionContext
 from llgraph.loaders.commands_loader import format_commands_help, resolve_command
+from llgraph.context.context_builder import format_rules_list
 from llgraph.context.context_compressor import apply_compress_to_agent_state, format_compress_report
 from llgraph.context.context_session import ContextSession
 from llgraph.commands.review_command import run_review
@@ -19,6 +20,7 @@ from llgraph.display.trace_display import (
     print_trace_step_list,
     set_trace_step_tokens,
 )
+from llgraph.ui.output import emit, emit_error, emit_ok, emit_report, emit_warn
 
 
 def _print_trace_stats(
@@ -50,17 +52,16 @@ def _print_trace_stats(
     # 启发式：system + 首轮 user 约可缓存前缀
     cacheable = min(messages_tokens, int(messages_tokens * 0.15)) if messages_tokens else 0
 
-    print(
+    emit_report(
         format_spill_stats(
             messages_tokens=messages_tokens,
             spilled_bytes=spilled_bytes,
             spill_count=spill_count,
             cacheable_prefix_estimate=cacheable,
-        ),
-        flush=True,
+        )
     )
     spill_dir = workspace / ".llgraph" / "context" / "tool-results"
-    print(f"落盘目录: {spill_dir}", flush=True)
+    emit(f"落盘目录: {spill_dir}", colorize=True)
     try:
         from llgraph.display.execution_log import (
             execution_log_path,
@@ -69,8 +70,8 @@ def _print_trace_stats(
         )
         from llgraph.core.llm_settings import resolve_effective_model
 
-        print(f"执行日志: {execution_log_path(workspace)}", flush=True)
-        print(f"当前模型: {resolve_effective_model(workspace)}", flush=True)
+        emit(f"执行日志: {execution_log_path(workspace)}", colorize=True)
+        emit(f"当前模型: {resolve_effective_model(workspace)}", colorize=True)
         if agent_session is not None:
             config = {"configurable": {"thread_id": agent_session.thread_id}}
             try:
@@ -79,12 +80,12 @@ def _print_trace_stats(
                 usage = extract_usage_from_messages(messages)
                 totals = usage.get("totals") or {}
                 if totals:
-                    print(
+                    emit(
                         "网关 usage 累计: "
                         f"in={totals.get('input_tokens', 0)} "
                         f"out={totals.get('output_tokens', 0)} "
                         f"cache_read={totals.get('cache_read_input_tokens', 0)}",
-                        flush=True,
+                        colorize=True,
                     )
             except Exception:
                 pass
@@ -92,12 +93,10 @@ def _print_trace_stats(
         if last:
             from llgraph.display.execution_log import format_execution_record
 
-            print(f"最近一轮: {format_execution_record(last[0])}", flush=True)
+            emit(f"最近一轮: {format_execution_record(last[0])}", colorize=True)
     except Exception:
         pass
-    print("更多: /log tail | /log purge", flush=True)
-
-
+    emit("更多: /log tail | /log purge", colorize=True)
 # 内置元命令首 token（不含 /）；新增命令须同步更新 handle_meta_command 与此集合
 _BUILTIN_META_COMMAND_NAMES = frozenset({
     "index",
@@ -185,7 +184,7 @@ def _handle_index_meta_command(line: str, workspace: Path) -> bool:
     try:
         parts = shlex.split(line.strip())
     except ValueError as exc:
-        print(f"无法解析 /index 参数: {exc}", flush=True)
+        emit(f"无法解析 /index 参数: {exc}", colorize=True)
         return True
 
     tokens: list[str] = []
@@ -196,7 +195,7 @@ def _handle_index_meta_command(line: str, workspace: Path) -> bool:
 
     if not tokens:
         print_index_status(workspace)
-        print("", flush=True)
+        emit("", colorize=True)
         print_index_interactive_help()
         return True
 
@@ -285,7 +284,7 @@ def _handle_survey_command(
                 agent_session,
                 allow_write=agent_session.allow_write,
             )
-        print("Survey 交互已关闭（本会话）。", flush=True)
+        emit("Survey 交互已关闭（本会话）。", colorize=True)
         return True
     if sub in ("on", "enable", "1"):
         if context_session is not None:
@@ -297,18 +296,17 @@ def _handle_survey_command(
                 agent_session,
                 allow_write=agent_session.allow_write,
             )
-        print("Survey 交互已开启（本会话）。", flush=True)
+        emit("Survey 交互已开启（本会话）。", colorize=True)
         return True
     if sub in ("status", "?"):
-        print(format_survey_status(workspace, context_session), flush=True)
+        emit_report(format_survey_status(workspace, context_session))
         return True
 
     if not survey_command_enabled(workspace, context_session):
-        print(
-            "Survey 已禁用（--no-survey / agent.json survey.enabled=false / /survey off）。",
-            flush=True,
+        emit_warn(
+            "Survey 已禁用（--no-survey / agent.json survey.enabled=false / /survey off）。"
         )
-        print(format_survey_status(workspace, context_session), flush=True)
+        emit_report(format_survey_status(workspace, context_session))
         return True
 
     from llgraph.survey.survey_prompt import (
@@ -322,15 +320,15 @@ def _handle_survey_command(
     if answers is None:
         return True
     payload = format_survey_answers_for_agent(answers)
-    print("\n--- 确认结果 ---\n", flush=True)
-    print(payload, flush=True)
+    emit("\n--- 确认结果 ---\n", colorize=True)
+    emit(payload, colorize=True)
     if agent_session is None:
-        print("\n（无 Agent 会话，请复制以上内容作为下一条消息发送）", flush=True)
+        emit("\n（无 Agent 会话，请复制以上内容作为下一条消息发送）", colorize=True)
         return True
     from llgraph.core.agent import invoke_agent
 
     try:
-        print("\n▶ 正在将确认结果提交给 Agent…\n", flush=True)
+        emit("\n▶ 正在将确认结果提交给 Agent…\n", colorize=True)
         invoke_agent(
             agent_session.agent,
             payload,
@@ -342,9 +340,9 @@ def _handle_survey_command(
             write_failure_tracker=agent_session.write_failure_tracker,
             context_spill=agent_session.context_spill,
         )
-        print()
+        emit()
     except Exception as exc:
-        print(f"运行失败: {exc}", flush=True)
+        emit(f"运行失败: {exc}", colorize=True)
     return True
 
 
@@ -364,13 +362,13 @@ def _handle_watch_command(
     from llgraph.code_index.index_watch import ensure_index_watch, format_watch_status
 
     if agent_session is None:
-        print("仅交互模式支持 /watch。", flush=True)
+        emit("仅交互模式支持 /watch。", colorize=True)
         return True
 
     try:
         parts = shlex.split(line.strip())
     except ValueError as exc:
-        print(f"无法解析 /watch 参数: {exc}", flush=True)
+        emit(f"无法解析 /watch 参数: {exc}", colorize=True)
         return True
 
     tokens: list[str] = []
@@ -380,7 +378,7 @@ def _handle_watch_command(
         tokens = parts
 
     if not tokens or tokens[0].lower() in ("status", "?"):
-        print(format_watch_status(agent_session.watch_service, workspace), flush=True)
+        emit_report(format_watch_status(agent_session.watch_service, workspace))
         return True
 
     sub = tokens[0].lower()
@@ -392,25 +390,25 @@ def _handle_watch_command(
         service, err = ensure_index_watch(workspace, agent_session.watch_service)
         agent_session.watch_service = service
         if err:
-            print(err, flush=True)
+            emit(err, colorize=True)
         elif was_active:
-            print("index watch 已在运行。", flush=True)
+            emit("index watch 已在运行。", colorize=True)
         else:
-            print("已启动 index watch（保存文件后自动增量索引）。", flush=True)
+            emit("已启动 index watch（保存文件后自动增量索引）。", colorize=True)
         return True
 
     if sub in ("off", "false", "0", "stop", "disable"):
         service = agent_session.watch_service
         if service is None or not service.active:
-            print("index watch 未运行。", flush=True)
+            emit("index watch 未运行。", colorize=True)
             return True
         service.stop()
-        print("已停止 index watch。", flush=True)
+        emit("已停止 index watch。", colorize=True)
         return True
 
-    print(
+    emit(
         "用法: /watch  |  /watch status  |  /watch on  |  /watch off",
-        flush=True,
+        colorize=True,
     )
     return True
 
@@ -431,13 +429,13 @@ def _handle_write_command(
     from llgraph.session.session_write_mode import format_write_mode_status, set_session_write_mode
 
     if agent_session is None:
-        print("仅交互模式支持 /write。", flush=True)
+        emit("仅交互模式支持 /write。", colorize=True)
         return True
 
     try:
         parts = shlex.split(line.strip())
     except ValueError as exc:
-        print(f"无法解析 /write 参数: {exc}", flush=True)
+        emit(f"无法解析 /write 参数: {exc}", colorize=True)
         return True
 
     tokens: list[str] = []
@@ -447,28 +445,28 @@ def _handle_write_command(
         tokens = parts
 
     if not tokens:
-        print(format_write_mode_status(agent_session), flush=True)
+        emit_report(format_write_mode_status(agent_session))
         return True
 
     sub = tokens[0].lower()
     if sub in ("on", "true", "1", "enable", "w"):
         if set_session_write_mode(agent_session, enabled=True, context_session=context_session):
-            print("已切换为可写模式（写工具与受限 shell 已启用，会话历史已保留）。", flush=True)
+            emit("已切换为可写模式（写工具与受限 shell 已启用，会话历史已保留）。", colorize=True)
         else:
-            print("当前已是可写模式。", flush=True)
+            emit("当前已是可写模式。", colorize=True)
         return True
 
     if sub in ("off", "false", "0", "disable", "ro", "readonly"):
         if set_session_write_mode(agent_session, enabled=False, context_session=context_session):
-            print("已切换为只读模式（禁止写文件；/changes · /undo 仍可用）。", flush=True)
+            emit("已切换为只读模式（禁止写文件；/changes · /undo 仍可用）。", colorize=True)
         else:
-            print("当前已是只读模式。", flush=True)
+            emit("当前已是只读模式。", colorize=True)
         return True
 
-    print(
+    emit(
         "用法: /write  |  /write on  |  /write off\n"
         "说明: 切换后重建 Agent，对话历史保留；等价于启动时 -w 开关。",
-        flush=True,
+        colorize=True,
     )
     return True
 
@@ -490,13 +488,13 @@ def _handle_web_command(
     )
 
     if agent_session is None:
-        print("仅交互模式支持 /web。", flush=True)
+        emit("仅交互模式支持 /web。", colorize=True)
         return True
 
     try:
         parts = shlex.split(line.strip())
     except ValueError as exc:
-        print(f"无法解析 /web 参数: {exc}", flush=True)
+        emit(f"无法解析 /web 参数: {exc}", colorize=True)
         return True
 
     tokens: list[str] = []
@@ -506,27 +504,27 @@ def _handle_web_command(
         tokens = parts
 
     if not tokens or tokens[0].lower() in ("status", "?"):
-        print(format_web_search_status(agent_session), flush=True)
+        emit_report(format_web_search_status(agent_session))
         return True
 
     sub = tokens[0].lower()
     if sub in ("on", "true", "1", "start", "enable"):
         changed, msg = set_session_web_search_mode(agent_session, enabled=True)
-        print(msg, flush=True)
+        emit(msg, colorize=True)
         if not changed and "未配置" in msg:
             pass
         return True
 
     if sub in ("off", "false", "0", "stop", "disable"):
         changed, msg = set_session_web_search_mode(agent_session, enabled=False)
-        print(msg, flush=True)
+        emit(msg, colorize=True)
         return True
 
-    print(
+    emit(
         "用法: /web  |  /web status  |  /web on  |  /web off\n"
-        "说明: 启用后注册 web_search（Tavily）；切换后重建 Agent，对话历史保留。",
+        "说明: 启用后注册 web_search（Tavily）；切换后重建 Agent，对话历史保留。\n"
         "Skill/Rule: 仅注入描述+路径，正文请 read_file；锚点见 <session-manifest>。",
-        flush=True,
+        colorize=True,
     )
     return True
 
@@ -557,7 +555,7 @@ def _handle_model_command(
     try:
         parts = shlex.split(line.strip())
     except ValueError as exc:
-        print(f"无法解析 /model 参数: {exc}", flush=True)
+        emit(f"无法解析 /model 参数: {exc}", colorize=True)
         return True
 
     tokens: list[str] = []
@@ -570,23 +568,22 @@ def _handle_model_command(
     write_mode = _effective_allow_write(agent_session, allow_write)
 
     if not tokens or tokens[0].lower() in ("list", "ls", "?"):
-        print(format_model_status(workspace), flush=True)
-        print("", flush=True)
+        emit_report(format_model_status(workspace))
+        emit("", colorize=True)
         try:
-            print(format_models_list(workspace, current=current), flush=True)
+            emit_report(format_models_list(workspace, current=current))
         except RuntimeError as exc:
-            print(f"拉取网关模型列表失败: {exc}", flush=True)
-            print("仍可用 /model <模型名> 手动切换。", flush=True)
+            emit(f"拉取网关模型列表失败: {exc}", colorize=True)
+            emit("仍可用 /model <模型名> 手动切换。", colorize=True)
         return True
 
     if tokens[0].lower() == "refresh":
         try:
-            print(
-                format_models_list(workspace, current=current, force_refresh=True),
-                flush=True,
+            emit_report(
+                format_models_list(workspace, current=current, force_refresh=True)
             )
         except RuntimeError as exc:
-            print(f"刷新失败: {exc}", flush=True)
+            emit(f"刷新失败: {exc}", colorize=True)
         return True
 
     if tokens[0].lower() in ("reset", "default", "env"):
@@ -599,20 +596,19 @@ def _handle_model_command(
                 on_file_changed=agent_session.on_file_changed if write_mode else None,
             )
         restored = resolve_effective_model(workspace)
-        print(f"已恢复默认模型: {restored}", flush=True)
+        emit(f"已恢复默认模型: {restored}", colorize=True)
         return True
 
     new_model = tokens[0].strip()
     if not new_model:
-        print("用法: /model <模型名>  |  /model list  |  /model reset", flush=True)
+        emit("用法: /model <模型名>  |  /model list  |  /model reset", colorize=True)
         return True
 
     set_runtime_model(new_model)
     if not is_catalog_model(workspace, new_model):
-        print(
+        emit_warn(
             f"提示: {new_model!r} 不在 agent.json 模型目录（llm.models）内，"
-            "若调用失败请 /model list 换模型。",
-            flush=True,
+            "若调用失败请 /model list 换模型。"
         )
     if agent_session is not None:
         rebuild_agent_preserving_memory(
@@ -621,7 +617,7 @@ def _handle_model_command(
             mcp_tools=agent_session.mcp_tools,
             on_file_changed=agent_session.on_file_changed if write_mode else None,
         )
-    print(f"已切换模型: {new_model}（下一条消息起生效，会话历史已保留）", flush=True)
+    emit(f"已切换模型: {new_model}（下一条消息起生效，会话历史已保留）", colorize=True)
     return True
 
 
@@ -639,7 +635,7 @@ def _handle_session_command(
     @return 是否已处理
     """
     if agent_session is None:
-        print("需要交互会话才能切换 thread_id。", flush=True)
+        emit("需要交互会话才能切换 thread_id。", colorize=True)
         return True
 
     from llgraph.session.session_switch import (
@@ -657,9 +653,8 @@ def _handle_session_command(
         return spill is not None and bool(getattr(spill, "disabled", False))
 
     if not sub or sub in ("list", "ls"):
-        print(
-            format_session_command_help(workspace, agent_session.thread_id),
-            flush=True,
+        emit_report(
+            format_session_command_help(workspace, agent_session.thread_id)
         )
         return True
 
@@ -674,7 +669,7 @@ def _handle_session_command(
         _, msg = switch_agent_thread(
             agent_session, new_id, no_spill=_no_spill()
         )
-        print(msg, flush=True)
+        emit(msg, colorize=True)
         return True
 
     if sub in ("use", "switch", "resume") and len(parts) >= 3:
@@ -682,7 +677,7 @@ def _handle_session_command(
         _, msg = switch_agent_thread(
             agent_session, tid, no_spill=_no_spill()
         )
-        print(msg, flush=True)
+        emit(msg, colorize=True)
         return True
 
     if sub in ("title", "rename", "name"):
@@ -694,22 +689,22 @@ def _handle_session_command(
             stripped.strip(),
         )
         if not m:
-            print(
+            emit(
                 "用法: /session title <新标题>\n"
                 "      /session title <thread_id> <新标题>",
-                flush=True,
+                colorize=True,
             )
             return True
         tid = m.group(1) or agent_session.thread_id
         title_text = m.group(2).strip()
         ok, msg = set_session_title(workspace, tid, title_text, source="manual")
-        print(msg, flush=True)
+        emit(msg, colorize=True)
         if ok and tid == agent_session.thread_id:
             from llgraph.session.session_meta import resolve_session_display_title
 
-            print(
+            emit(
                 f"当前展示: {resolve_session_display_title(workspace, tid)}",
-                flush=True,
+                colorize=True,
             )
         return True
 
@@ -729,14 +724,14 @@ def _handle_session_command(
         tokens = stripped.split()
         flags = {t.lower() for t in tokens if t.startswith("--")}
         if len(tokens) < 3:
-            print(
+            emit(
                 "用法:\n"
                 "  /session delete <thread_id>           删除指定会话\n"
                 "  /session delete <thread_id> --force   删除当前会话\n"
                 "  /session delete empty                 删除空壳会话\n"
                 "  /session delete all                   删除除当前外全部\n"
                 "  /session delete all --including-current  全量删除并切到新会话",
-                flush=True,
+                colorize=True,
             )
             return True
 
@@ -744,10 +739,10 @@ def _handle_session_command(
         if target.lower() == "empty":
             empty_ids = list_empty_session_ids(workspace)
             if not empty_ids:
-                print("（无空壳会话）", flush=True)
+                emit("（无空壳会话）", colorize=True)
                 return True
             report = delete_sessions(workspace, empty_ids)
-            print(format_delete_report(report), flush=True)
+            emit_report(format_delete_report(report))
             return True
 
         if target.lower() == "all":
@@ -756,19 +751,18 @@ def _handle_session_command(
             )
             ids = list_workspace_session_ids(workspace)
             if not ids:
-                print("（无可删除会话）", flush=True)
+                emit("（无可删除会话）", colorize=True)
                 return True
             if not including_current:
                 ids = [i for i in ids if i != agent_session.thread_id]
             if not ids:
-                print(
-                    "除当前外无其它会话；全量删除请加: /session delete all --including-current",
-                    flush=True,
+                emit_warn(
+                    "除当前外无其它会话；全量删除请加: /session delete all --including-current"
                 )
                 return True
             deleted_current = agent_session.thread_id in ids
             report = delete_sessions(workspace, ids)
-            print(format_delete_report(report), flush=True)
+            emit_report(format_delete_report(report))
             if deleted_current and report.success_count > 0:
                 new_id = create_new_thread_id()
                 set_session_title(
@@ -777,34 +771,33 @@ def _handle_session_command(
                 _, msg = switch_agent_thread(
                     agent_session, new_id, no_spill=_no_spill()
                 )
-                print(msg, flush=True)
+                emit(msg, colorize=True)
             return True
 
         try:
             tid = validate_thread_id(target)
         except ValueError as exc:
-            print(str(exc), flush=True)
+            emit_error(str(exc))
             return True
 
         if tid == agent_session.thread_id and "--force" not in flags:
-            print(
+            emit_warn(
                 "不能删除当前会话。请先 /session new，或:\n"
                 "  /session delete "
                 + tid
-                + " --force",
-                flush=True,
+                + " --force"
             )
             return True
 
         result = delete_session(workspace, tid)
         if result.ok:
-            print(f"已删除会话 {tid}。", flush=True)
+            emit(f"已删除会话 {tid}。", colorize=True)
             for path in result.removed_paths:
-                print(f"  - {path}", flush=True)
+                emit(f"  - {path}", colorize=True)
             if not result.removed_paths:
-                print("  （该会话无落盘文件或已不存在）", flush=True)
+                emit("  （该会话无落盘文件或已不存在）", colorize=True)
         else:
-            print(f"删除失败 {tid}: {result.error}", flush=True)
+            emit(f"删除失败 {tid}: {result.error}", colorize=True)
             return True
 
         if tid == agent_session.thread_id:
@@ -815,12 +808,11 @@ def _handle_session_command(
             _, msg = switch_agent_thread(
                 agent_session, new_id, no_spill=_no_spill()
             )
-            print(msg, flush=True)
+            emit(msg, colorize=True)
         return True
 
-    print(
-        format_session_command_help(workspace, agent_session.thread_id),
-        flush=True,
+    emit_report(
+        format_session_command_help(workspace, agent_session.thread_id)
     )
     return True
 
@@ -829,31 +821,31 @@ def _print_skills_usage(workspace: Path, session: ContextSession) -> None:
     from llgraph.config.catalog_paths import scope_label
 
     skills = discover_skills(workspace)
-    print(
+    emit(
         "技能（Skills）— 项目: .llgraph/skills/<name>/SKILL.md  |  个人: ~/.llgraph/skills/",
-        flush=True,
+        colorize=True,
     )
     if not skills:
-        print(
+        emit(
             "  （未找到技能；llgraph --init-config / --init-user-config）",
-            flush=True,
+            colorize=True,
         )
     else:
         for skill in skills:
             active = "✓" if skill.name.lower() in [s.lower() for s in session.active_skills] else " "
             origin = scope_label(skill.scope)
-            print(f"  [{active}] {skill.name} [{origin}] — {skill.description}", flush=True)
+            emit(f"  [{active}] {skill.name} [{origin}] — {skill.description}", colorize=True)
     active = ", ".join(session.active_skills) if session.active_skills else "（无）"
-    print(f"当前启用: {active}", flush=True)
-    print("自动匹配: " + ("开" if session.auto_match_skills else "关"), flush=True)
-    print("", flush=True)
-    print("命令:", flush=True)
-    print("  /skill              列出技能", flush=True)
-    print("  /skill <name>       启用技能（可多次）", flush=True)
-    print("  /skill off <name>   关闭指定技能", flush=True)
-    print("  /skill clear        清空已启用技能", flush=True)
-    print("  /skill auto on|off  开关按消息自动匹配", flush=True)
-    print("  说明: 仅注入描述+路径，正文须 read_file；会话锚点 <session-manifest>", flush=True)
+    emit(f"当前启用: {active}", colorize=True)
+    emit("自动匹配: " + ("开" if session.auto_match_skills else "关"), colorize=True)
+    emit("", colorize=True)
+    emit("命令:", colorize=True)
+    emit("  /skill              列出技能", colorize=True)
+    emit("  /skill <name>       启用技能（可多次）", colorize=True)
+    emit("  /skill off <name>   关闭指定技能", colorize=True)
+    emit("  /skill clear        清空已启用技能", colorize=True)
+    emit("  /skill auto on|off  开关按消息自动匹配", colorize=True)
+    emit("  说明: 仅注入描述+路径，正文须 read_file；会话锚点 <session-manifest>", colorize=True)
 
 
 def handle_meta_command(
@@ -880,7 +872,6 @@ def handle_meta_command(
     @param mcp_summary MCP 加载摘要（/help 用）
     @return True 表示已消费，不发给 Agent
     """
-    from llgraph.context.context_builder import format_rules_list
     from llgraph.commands.help_text import print_interactive_help
 
     allow_write = _effective_allow_write(agent_session, allow_write)
@@ -900,12 +891,12 @@ def handle_meta_command(
         )
 
     if lower in ("/paste", "/p", "paste"):
-        print(
+        emit(
             "请直接输入 /paste 后回车进入粘贴模式，或:\n"
             "  1. 输入 /paste 回车\n"
             "  2. 粘贴完整报错/日志\n"
             "  3. 单独一行输入 --- 结束",
-            flush=True,
+            colorize=True,
         )
         return True
 
@@ -936,7 +927,7 @@ def handle_meta_command(
     if lower == "/config" or lower == "config":
         from llgraph.core.agent_config import format_agent_config_sources
 
-        print(format_agent_config_sources(workspace), flush=True)
+        emit_report(format_agent_config_sources(workspace))
         return True
 
     if lower == "/session" or lower == "session":
@@ -947,7 +938,7 @@ def handle_meta_command(
 
     if lower in ("/sessionid", "sessionid", "/session-id", "session-id"):
         if agent_session is None:
-            print("需要交互会话才能查看 thread_id。", flush=True)
+            emit("需要交互会话才能查看 thread_id。", colorize=True)
             return True
         from llgraph.session.session_switch import print_current_session_info
 
@@ -958,7 +949,7 @@ def handle_meta_command(
         from llgraph.session.session_registry import format_sessions_list
 
         current = agent_session.thread_id if agent_session is not None else None
-        print(format_sessions_list(workspace, current_thread_id=current), flush=True)
+        emit_report(format_sessions_list(workspace, current_thread_id=current))
         return True
 
     if lower in ("/help", "help", "?", "/h", "h"):
@@ -973,7 +964,7 @@ def handle_meta_command(
             workspace=workspace,
             mcp_summary=mcp_summary,
         )
-        print(format_commands_help(workspace), flush=True)
+        emit_report(format_commands_help(workspace))
         return True
 
     if lower in ("/compress", "compress") or lower.startswith("/compress "):
@@ -998,14 +989,13 @@ def handle_meta_command(
             agent_session.web_search_enabled if agent_session is not None else False
         )
         mcp = agent_session.mcp_tools if agent_session is not None else None
-        print(
+        emit_report(
             format_agent_tools_report(
                 workspace,
                 allow_write=allow_write,
                 web_search_enabled=web_enabled,
                 mcp_tools=mcp,
-            ),
-            flush=True,
+            )
         )
         return True
 
@@ -1013,7 +1003,7 @@ def handle_meta_command(
         return _handle_review(stripped, workspace, edit_tracker, last_user_message)
 
     if lower == "/commands" or lower == "commands":
-        print(format_commands_help(workspace), flush=True)
+        emit_report(format_commands_help(workspace))
         return True
 
     if lower == "/trace" or lower == "trace":
@@ -1023,7 +1013,7 @@ def handle_meta_command(
     if lower == "/log" or lower == "log":
         from llgraph.config.logging_settings import format_log_status
 
-        print(format_log_status(workspace), flush=True)
+        emit_report(format_log_status(workspace))
         return True
 
     if lower.startswith("/log ") or lower.startswith("log "):
@@ -1031,19 +1021,19 @@ def handle_meta_command(
         if len(parts) < 2:
             from llgraph.config.logging_settings import format_log_status
 
-            print(format_log_status(workspace), flush=True)
+            emit_report(format_log_status(workspace))
             return True
         sub = parts[1].strip().lower()
         if sub in ("tail", "exec", "execution"):
             from llgraph.display.execution_log import format_execution_tail
 
-            print(format_execution_tail(workspace), flush=True)
+            emit_report(format_execution_tail(workspace))
             return True
         if sub == "purge":
             from llgraph.display.log_retention import format_purge_report, run_log_retention
 
             report = run_log_retention(workspace, quiet=False)
-            print(format_purge_report(report), flush=True)
+            emit_report(format_purge_report(report))
             return True
         if sub in ("file on", "file off"):
             from llgraph.config.logging_settings import (
@@ -1059,9 +1049,9 @@ def handle_meta_command(
                 level_name(level),
                 search_file=file_on,
             )
-            print(
+            emit(
                 f"向量检索落盘 search.log: {'开' if file_on else '关'}",
-                flush=True,
+                colorize=True,
             )
             return True
         from llgraph.config.logging_settings import level_name, set_runtime_log_level
@@ -1069,12 +1059,11 @@ def handle_meta_command(
         try:
             effective = set_runtime_log_level(workspace, parts[1].strip())
         except Exception:
-            print(
-                f"未知级别: {parts[1]!r}，可用 debug | info | warning | error",
-                flush=True,
+            emit_warn(
+                f"未知级别: {parts[1]!r}，可用 debug | info | warning | error"
             )
             return True
-        print(f"已切换向量检索日志: {level_name(effective)}", flush=True)
+        emit(f"已切换向量检索日志: {level_name(effective)}", colorize=True)
         return True
 
     if lower.startswith("/trace ") or lower.startswith("trace "):
@@ -1091,18 +1080,18 @@ def handle_meta_command(
                 arg = parts[2].strip().lower()
                 if arg in ("on", "off"):
                     enabled = set_trace_step_tokens(trace_session, arg == "on")
-                    print(
+                    emit(
                         f"步骤 token 显示: {'开' if enabled else '关'}",
-                        flush=True,
+                        colorize=True,
                     )
                     return True
                 if arg in ("stats",):
                     _print_trace_stats(workspace, agent_session)
                     return True
             enabled = set_trace_step_tokens(trace_session, None)
-            print(
+            emit(
                 f"步骤 token 显示: {'开' if enabled else '关'}",
-                flush=True,
+                colorize=True,
             )
             return True
         if sub in ("step", "expand"):
@@ -1125,23 +1114,21 @@ def handle_meta_command(
         mode_arg = parts[1] if len(parts) == 2 else " ".join(parts[1:])
         mode = parse_trace_mode(mode_arg)
         if mode is None:
-            print(
-                f"未知子命令或模式: {parts[1]!r}，可用 all | steps | reply | none | step | token | stats",
-                flush=True,
+            emit_warn(
+                f"未知子命令或模式: {parts[1]!r}，可用 all | steps | reply | none | step | token | stats"
             )
             _print_trace_usage(trace_session)
             return True
         trace_session.mode = mode
         from llgraph.display.trace_display import TRACE_MODE_LABELS
 
-        print(
-            f"已切换: {TRACE_MODE_LABELS[mode]} ({mode.value})",
-            flush=True,
+        emit_ok(
+            f"已切换: {TRACE_MODE_LABELS[mode]} ({mode.value})"
         )
         return True
 
     if lower == "/rule" or lower == "rule":
-        print(format_rules_list(workspace, context_session, last_user_message), flush=True)
+        emit_report(format_rules_list(workspace, context_session, last_user_message))
         return True
 
     if lower.startswith("/rule ") or lower.startswith("rule "):
@@ -1165,13 +1152,13 @@ def handle_meta_command(
 
     if lower.startswith("/diff ") or lower.startswith("diff "):
         if edit_tracker is None:
-            print("请使用 llgraph -w 启动以启用 /diff。", flush=True)
+            emit("请使用 llgraph -w 启动以启用 /diff。", colorize=True)
             return True
         parts = stripped.split(maxsplit=1)
         if len(parts) < 2:
-            print("用法: /diff <相对路径>", flush=True)
+            emit("用法: /diff <相对路径>", colorize=True)
             return True
-        print(edit_tracker.format_diff(parts[1]), flush=True)
+        emit_report(edit_tracker.format_diff(parts[1]))
         return True
 
     if _try_custom_command(
@@ -1189,7 +1176,7 @@ def handle_meta_command(
 def _handle_compress(workspace: Path, agent_session: AgentSessionContext | None) -> bool:
     """处理 /compress。"""
     if agent_session is None or not agent_session.with_memory:
-        print("当前无会话历史（交互模式默认有 memory；/compress 需多轮对话）。", flush=True)
+        emit("当前无会话历史（交互模式默认有 memory；/compress 需多轮对话）。", colorize=True)
         return True
     report = apply_compress_to_agent_state(
         agent_session.agent,
@@ -1198,9 +1185,9 @@ def _handle_compress(workspace: Path, agent_session: AgentSessionContext | None)
         force=True,
     )
     if report is None:
-        print("无需压缩或消息为空。", flush=True)
+        emit("无需压缩或消息为空。", colorize=True)
     else:
-        print(format_compress_report(report), flush=True)
+        emit_report(format_compress_report(report))
         from llgraph.display.execution_log import log_compress_event
 
         log_compress_event(
@@ -1247,12 +1234,12 @@ def _handle_review(
             last_user_message=last_user_message,
         )
     except Exception as exc:
-        print(f"评审失败: {exc}", flush=True)
+        emit(f"评审失败: {exc}", colorize=True)
         return True
-    print(f"评审已落盘: {review_path}", flush=True)
+    emit(f"评审已落盘: {review_path}", colorize=True)
     if summary:
-        print("--- 摘要 ---", flush=True)
-        print(summary, flush=True)
+        emit("--- 摘要 ---", colorize=True)
+        emit(summary, colorize=True)
     return True
 
 
@@ -1284,13 +1271,13 @@ def _try_custom_command(
         return False
 
     if cmd.requires_write and not allow_write:
-        print(f"命令 /{cmd.name} 需要写权限，请使用 llgraph -w 启动。", flush=True)
+        emit(f"命令 /{cmd.name} 需要写权限，请使用 llgraph -w 启动。", colorize=True)
         return True
 
     args_tail = stripped.split(maxsplit=1)[1].strip() if " " in stripped else ""
     if cmd.handler == "prompt":
         if agent_session is None:
-            print("Agent 未就绪，无法执行 prompt 命令。", flush=True)
+            emit("Agent 未就绪，无法执行 prompt 命令。", colorize=True)
             return True
         from llgraph.core.agent import invoke_agent
 
@@ -1301,7 +1288,7 @@ def _try_custom_command(
             f"</custom-command>\n\n"
             f"用户补充: {user_tail}"
         )
-        print(f"执行自定义命令 /{cmd.name} …\n", flush=True)
+        emit(f"执行自定义命令 /{cmd.name} …\n", colorize=True)
         try:
             invoke_agent(
                 agent_session.agent,
@@ -1315,9 +1302,9 @@ def _try_custom_command(
                 write_failure_tracker=agent_session.write_failure_tracker,
                 context_spill=agent_session.context_spill,
             )
-            print()
+            emit()
         except Exception as exc:
-            print(f"命令执行失败: {exc}", flush=True)
+            emit(f"命令执行失败: {exc}", colorize=True)
         return True
 
     if cmd.handler == "builtin":
@@ -1331,10 +1318,10 @@ def _try_custom_command(
                 tracker,
                 last_user_message,
             )
-        print(f"未知 builtin 命令: {cmd.name}", flush=True)
+        emit(f"未知 builtin 命令: {cmd.name}", colorize=True)
         return True
 
-    print(f"不支持的 handler: {cmd.handler}（仅 prompt / builtin）", flush=True)
+    emit(f"不支持的 handler: {cmd.handler}（仅 prompt / builtin）", colorize=True)
     return True
 
 
@@ -1347,7 +1334,7 @@ def _handle_changes_command(stripped: str, edit_tracker: SessionEditTracker | No
     @return 恒为 True
     """
     if edit_tracker is None:
-        print("当前为只读模式或未启用编辑追踪；请使用 llgraph -w 启动。", flush=True)
+        emit("当前为只读模式或未启用编辑追踪；请使用 llgraph -w 启动。", colorize=True)
         return True
 
     parts = stripped.split(maxsplit=2)
@@ -1355,23 +1342,23 @@ def _handle_changes_command(stripped: str, edit_tracker: SessionEditTracker | No
 
     if sub == "clear":
         edit_tracker.clear_display()
-        print("已清空本会话变更列表（内存）；落盘 edits.jsonl 仍保留。", flush=True)
+        emit("已清空本会话变更列表（内存）；落盘 edits.jsonl 仍保留。", colorize=True)
         return True
 
     if sub == "reset":
         edit_tracker.reset_persisted()
-        print("已重置本会话变更记录与快照（含落盘）。", flush=True)
+        emit("已重置本会话变更记录与快照（含落盘）。", colorize=True)
         return True
 
     if sub == "diff" and len(parts) >= 3:
-        print(edit_tracker.format_diff(parts[2]), flush=True)
+        emit_report(edit_tracker.format_diff(parts[2]))
         return True
 
     if sub == "diff":
-        print("用法: /changes diff <相对路径>", flush=True)
+        emit("用法: /changes diff <相对路径>", colorize=True)
         return True
 
-    print(edit_tracker.format_changes_list(), flush=True)
+    emit_report(edit_tracker.format_changes_list())
     return True
 
 
@@ -1389,29 +1376,29 @@ def _handle_undo_command(
     @return 恒为 True
     """
     if edit_tracker is None:
-        print("请使用 llgraph -w 启动以启用 /undo。", flush=True)
+        emit("请使用 llgraph -w 启动以启用 /undo。", colorize=True)
         return True
     if not allow_write:
-        print("当前为只读模式，无法写回文件。请使用 llgraph -w 启动。", flush=True)
+        emit("当前为只读模式，无法写回文件。请使用 llgraph -w 启动。", colorize=True)
         return True
 
     parts = stripped.split(maxsplit=1)
     if len(parts) < 2:
-        print(edit_tracker.format_undo_usage(), flush=True)
+        emit_report(edit_tracker.format_undo_usage())
         return True
 
     target = parts[1].strip()
     if not target:
-        print(edit_tracker.format_undo_usage(), flush=True)
+        emit_report(edit_tracker.format_undo_usage())
         return True
 
     if target.lower() == "all":
         results = edit_tracker.restore_all()
-        print(edit_tracker.format_undo_report(results), flush=True)
+        emit_report(edit_tracker.format_undo_report(results))
         return True
 
     result = edit_tracker.restore_path(target)
-    print(edit_tracker.format_undo_report([result]), flush=True)
+    emit_report(edit_tracker.format_undo_report([result]))
     return True
 
 
@@ -1423,41 +1410,41 @@ def _handle_rule_subcommand(
 ) -> bool:
     parts = stripped.split(maxsplit=2)
     if len(parts) < 2:
-        print(format_rules_list(workspace, session, last_user_message), flush=True)
+        emit_report(format_rules_list(workspace, session, last_user_message))
         return True
 
     sub = parts[1].lower()
     if sub in ("list", "ls"):
-        print(format_rules_list(workspace, session, last_user_message), flush=True)
+        emit_report(format_rules_list(workspace, session, last_user_message))
         return True
 
     if sub == "reset":
         session.disabled_rules.clear()
         session.forced_rules.clear()
-        print("已重置规则覆盖（恢复默认 alwaysApply + glob 自动匹配）", flush=True)
+        emit("已重置规则覆盖（恢复默认 alwaysApply + glob 自动匹配）", colorize=True)
         return True
 
     if sub in ("on", "enable") and len(parts) >= 3:
         rule_id = _resolve_rule_id(workspace, parts[2])
         if not rule_id:
-            print(f"未找到规则: {parts[2]!r}", flush=True)
+            emit(f"未找到规则: {parts[2]!r}", colorize=True)
             return True
         session.disabled_rules.discard(rule_id)
         session.forced_rules.add(rule_id)
-        print(f"已强制启用: {rule_id}", flush=True)
+        emit(f"已强制启用: {rule_id}", colorize=True)
         return True
 
     if sub in ("off", "disable") and len(parts) >= 3:
         rule_id = _resolve_rule_id(workspace, parts[2])
         if not rule_id:
-            print(f"未找到规则: {parts[2]!r}", flush=True)
+            emit(f"未找到规则: {parts[2]!r}", colorize=True)
             return True
         session.forced_rules.discard(rule_id)
         session.disabled_rules.add(rule_id)
-        print(f"已禁用: {rule_id}", flush=True)
+        emit(f"已禁用: {rule_id}", colorize=True)
         return True
 
-    print(format_rules_list(workspace, session, last_user_message), flush=True)
+    emit_report(format_rules_list(workspace, session, last_user_message))
     return True
 
 
@@ -1483,27 +1470,27 @@ def _handle_skill_subcommand(stripped: str, workspace: Path, session: ContextSes
 
     if sub == "clear":
         session.clear_skills()
-        print("已清空启用的技能", flush=True)
+        emit("已清空启用的技能", colorize=True)
         return True
 
     if sub == "auto" and len(parts) >= 3:
         flag = parts[2].lower()
         if flag in ("on", "1", "true"):
             session.auto_match_skills = True
-            print("已开启技能自动匹配", flush=True)
+            emit("已开启技能自动匹配", colorize=True)
         elif flag in ("off", "0", "false"):
             session.auto_match_skills = False
-            print("已关闭技能自动匹配", flush=True)
+            emit("已关闭技能自动匹配", colorize=True)
         else:
-            print("用法: /skill auto on|off", flush=True)
+            emit("用法: /skill auto on|off", colorize=True)
         return True
 
     if sub == "off" and len(parts) >= 3:
         name = parts[2]
         if session.deactivate_skill(name):
-            print(f"已关闭技能: {name}", flush=True)
+            emit(f"已关闭技能: {name}", colorize=True)
         else:
-            print(f"技能未启用: {name!r}", flush=True)
+            emit(f"技能未启用: {name!r}", colorize=True)
         return True
 
     skill_name = parts[1]
@@ -1511,8 +1498,8 @@ def _handle_skill_subcommand(stripped: str, workspace: Path, session: ContextSes
     known = {s.name.lower(): s.name for s in skills}
     key = skill_name.lower()
     if key not in known:
-        print(f"未找到技能: {skill_name!r}（见 /skill 列表）", flush=True)
+        emit(f"未找到技能: {skill_name!r}（见 /skill 列表）", colorize=True)
         return True
     session.activate_skill(known[key])
-    print(f"已启用技能: {known[key]}（下一条消息起注入）", flush=True)
+    emit(f"已启用技能: {known[key]}（下一条消息起注入）", colorize=True)
     return True

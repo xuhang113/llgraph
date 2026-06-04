@@ -12,7 +12,7 @@ from llgraph.session.session_edits import SessionEditTracker
 from llgraph.display.trace_display import TraceSession
 from llgraph.ui.banner import print_terminal_session_banner
 from llgraph.ui.keys import MSG_GOODBYE, MSG_INTERRUPT_EXIT, is_exit_command
-from llgraph.ui.output import write_dialog_line
+from llgraph.ui.output import emit, emit_error, emit_milestone, emit_ok, emit_warn, write_dialog_line
 from llgraph.ui.sink import StdoutTraceSink
 from llgraph.core.write_failure_tracker import WriteFailureTracker
 
@@ -102,10 +102,10 @@ def _run_turn(params: TerminalSessionParams, user_input: str) -> str | None:
             context_spill=spill,
         )
     except KeyboardInterrupt:
-        print(f"\n{MSG_INTERRUPT_EXIT}", flush=True)
+        emit(f"\n{MSG_INTERRUPT_EXIT}", colorize=True)
         return None
     except Exception as exc:
-        print(f"\n● 错误: {exc}", flush=True)
+        emit_error(f"错误: {exc}")
         return None
 
 
@@ -133,29 +133,38 @@ def _handle_meta(params: TerminalSessionParams, text: str, *, last_user: str) ->
     )
 
 
-def _maybe_survey_followup(params: TerminalSessionParams, assistant_text: str) -> None:
+def _maybe_survey_followup(
+    params: TerminalSessionParams,
+    assistant_text: str,
+    *,
+    raw_assistant_text: str | None = None,
+) -> None:
     """
     问卷确认后自动续聊。
 
     @param params 会话参数
-    @param assistant_text 助手回复
+    @param assistant_text 展示用助手回复
+    @param raw_assistant_text 含 survey 块的原文（解析用）
     """
     from llgraph.survey.survey_prompt import resolve_survey_from_assistant, try_run_survey_followup
     from llgraph.config.survey_settings import survey_followup_enabled
 
     if not survey_followup_enabled(params.workspace, params.context_session):
         return
-    if resolve_survey_from_assistant(assistant_text) is None:
+    parse_text = (raw_assistant_text or assistant_text or "").strip()
+    if not parse_text:
         return
-    print("\n▶ 检测到确认问卷，请在下方菜单中选择…", flush=True)
+    if resolve_survey_from_assistant(parse_text) is None:
+        return
+    emit_milestone("检测到确认问卷，请在下方菜单中选择（Esc 取消）…")
     followup = try_run_survey_followup(
-        assistant_text,
+        parse_text,
         workspace=params.workspace,
         context_session=params.context_session,
     )
     if not followup:
         return
-    print("\n▶ 正在将确认结果提交给 Agent…", flush=True)
+    emit_milestone("正在将确认结果提交给 Agent…")
     _run_turn(params, followup)
 
 
@@ -168,7 +177,7 @@ def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
     @return False 表示应退出会话
     """
     if is_exit_command(text):
-        print(MSG_GOODBYE, flush=True)
+        emit_ok(MSG_GOODBYE)
         return False
 
     last_user = text
@@ -182,12 +191,12 @@ def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
         from llgraph.ui.style import sty
 
         preview = text.split("\n", 1)[0]
-        print(sty(f"❯ {preview}", "prompt"), flush=True)
+        emit(sty(f"❯ {preview}", "prompt"))
         handled = _handle_meta(params, text, last_user=last_user)
         if handled and params.agent_session is not None:
             params.agent = params.agent_session.agent
         elif not handled:
-            print(f"未知命令 {preview}，输入 /help 查看。", flush=True)
+            emit_warn(f"未知命令 {preview}，输入 /help 查看。")
         return True
 
     effective = text
@@ -210,7 +219,11 @@ def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
         return True
     if params.agent_session is not None:
         params.agent = params.agent_session.agent
-    _maybe_survey_followup(params, reply)
+    _maybe_survey_followup(
+        params,
+        reply,
+        raw_assistant_text=params.trace_session.last_turn_raw_reply or reply,
+    )
     return True
 
 
@@ -240,7 +253,7 @@ def run_terminal_session(params: TerminalSessionParams) -> None:
         resume_hint=params.resume_hint,
         memory_kind=params.memory_kind,
     )
-    print("", flush=True)
+    emit()
 
     if params.opening_message:
         if not _process_user_message(params, params.opening_message.strip()):
@@ -253,12 +266,12 @@ def run_terminal_session(params: TerminalSessionParams) -> None:
     try:
         while True:
             try:
-                user_input = read_interactive_user_message().strip()
+                user_input = read_interactive_user_message(params.workspace).strip()
             except KeyboardInterrupt:
-                print("\n[已取消输入]", flush=True)
+                emit("\n[已取消输入]", colorize=True)
                 continue
             except EOFError:
-                print(f"\n{MSG_GOODBYE}", flush=True)
+                emit(f"\n{MSG_GOODBYE}", colorize=True)
                 break
             if not user_input:
                 continue

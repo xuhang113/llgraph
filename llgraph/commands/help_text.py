@@ -1,13 +1,14 @@
 """llgraph 交互与会话内命令帮助文案。"""
 
+from __future__ import annotations
+
 from pathlib import Path
 
 from llgraph.context.context_session import ContextSession
+from llgraph.display.trace_display import TRACE_MODE_LABELS, TraceSession
 from llgraph.loaders.rules_loader import discover_rules
 from llgraph.loaders.skills_loader import discover_skills
 from llgraph.ui.keys import HELP_SHORTCUT_LINES
-from llgraph.display.trace_display import TRACE_MODE_LABELS, TraceSession
-
 
 def print_interactive_help(
     *,
@@ -86,7 +87,9 @@ llgraph 交互帮助
   /rule              列出规则（项目 .llgraph/rules + 个人 ~/.llgraph/rules）
   /rule on|off <id>  强制启用/禁用某条 glob 规则
   /skill             列出技能（项目 + 个人 ~/.llgraph/skills/，同名个人优先）
-  /skill <name>      启用技能（如 tracking）
+  /skill <name>      启用技能（下一条消息起生效）
+  /{{name}} <任务>     启用技能并执行（如 /tracking 梳理埋点链路）
+  输入 /             终端与 TUI 均支持斜杠补全（Skills / Commands / 内置）
   /skill clear       清空已启用技能
   Thought 规范       .llgraph/thought/*.md + .llgraph/agent.json（检索无结果扩词等）
   /index             查看索引状态；/index full|incremental|rebuild 在会话内构建
@@ -170,6 +173,6 @@ llgraph 交互帮助
   search_workspace 的 keywords 须由模型一次给出多个相关词（无内置业务词典）。
   例如整理直播：keywords=live,livestream,broadcast,streaming,room,acme-live,直播
 """
-    from llgraph.ui.output import write_dialog_block
+    from llgraph.ui.output import emit_report
 
-    write_dialog_block(text.strip())
+    emit_report(text.strip())

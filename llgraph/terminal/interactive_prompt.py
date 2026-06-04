@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import sys
 
-from llgraph.terminal.redraw import redraw_tty_block, reset_tty_redraw_slot
-from llgraph.ui.prompts import MenuOption
+from llgraph.ui.output import emit
+from llgraph.ui.style import sty
 
 _ANSI_HIDE_CURSOR = "\033[?25l"
 _ANSI_SHOW_CURSOR = "\033[?25h"
@@ -57,9 +57,9 @@ def prompt_menu_tty(
     if not options:
         return None
     if not _stdin_is_tty():
-        print(title, flush=True)
+        emit(title, colorize=True)
         for idx, opt in enumerate(options):
-            print(f"  [{idx}] {opt.label}", flush=True)
+            emit(f"  [{idx}] {opt.label}", colorize=True)
         try:
             raw = input("选择序号: ").strip()
             picked = int(raw)
@@ -76,13 +76,17 @@ def prompt_menu_tty(
     sys.stdout.flush()
     try:
         while True:
-            lines = [title, ""]
+            lines = [sty(title, "title"), ""]
             for idx, opt in enumerate(options):
                 mark = "›" if idx == index else " "
                 hint = f"  ({opt.hint})" if opt.hint else ""
-                lines.append(f" {mark} {opt.label}{hint}")
+                if idx == index:
+                    row = sty(f" {mark} {opt.label}{hint}", "accent")
+                else:
+                    row = sty(f" {mark} ", "hint") + sty(opt.label, "value") + sty(hint, "hint")
+                lines.append(row)
             lines.append("")
-            lines.append("Enter 确认 · ↑↓ 移动 · Esc 取消")
+            lines.append(sty("Enter 确认 · ↑↓ 移动 · Esc 取消", "hint"))
             redraw_tty_block("\n".join(lines), slot=slot)
             key = _read_key_tty()
             if key in ("\r", "\n"):

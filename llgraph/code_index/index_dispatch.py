@@ -121,29 +121,39 @@ def print_index_status(workspace: Path) -> None:
 
     @param workspace 工作区根
     """
+    from llgraph.ui.output import emit_report
+
     status = get_index_status(workspace)
     log_dir = index_log_dir(workspace)
     latest_log = log_dir / "latest.log"
-    print(f"workspace: {workspace}")
-    print(f"lance: {status.lance_path}")
-    print(f"exists: {status.exists}")
-    print(f"chunks: {status.chunk_count}")
-    print(f"vector_dim: {status.vector_dim}")
-    print(f"last_indexed_at: {status.last_indexed_at or '(无)'}")
+    lines = [
+        f"workspace: {workspace}",
+        f"lance: {status.lance_path}",
+        f"exists: {status.exists}",
+        f"chunks: {status.chunk_count}",
+        f"vector_dim: {status.vector_dim}",
+        f"last_indexed_at: {status.last_indexed_at or '(无)'}",
+    ]
     manifest = load_manifest(workspace)
-    print(f"manifest_files: {len(manifest)}")
+    lines.append(f"manifest_files: {len(manifest)}")
     idx_cfg = resolve_index_settings(workspace)
     cap = idx_cfg.max_files if idx_cfg.max_files > 0 else "无限制"
-    print(f"index.max_files: {cap}  progressive: {idx_cfg.progressive}")
-    print(f"index.use_embed_cache: {idx_cfg.use_embed_cache}")
-    if idx_cfg.skip_dirs:
-        print(f"index.skip_dirs: {', '.join(idx_cfg.skip_dirs)}")
-    print(
-        f"index.watch: enabled={idx_cfg.watch_enabled} "
-        f"with_agent={idx_cfg.watch_with_agent} "
-        f"debounce={idx_cfg.watch_debounce_sec}s"
+    lines.extend(
+        [
+            f"index.max_files: {cap}  progressive: {idx_cfg.progressive}",
+            f"index.use_embed_cache: {idx_cfg.use_embed_cache}",
+        ]
     )
-    print(f"index.show_progress: {idx_cfg.show_progress}")
+    if idx_cfg.skip_dirs:
+        lines.append(f"index.skip_dirs: {', '.join(idx_cfg.skip_dirs)}")
+    lines.extend(
+        [
+            f"index.watch: enabled={idx_cfg.watch_enabled} "
+            f"with_agent={idx_cfg.watch_with_agent} "
+            f"debounce={idx_cfg.watch_debounce_sec}s",
+            f"index.show_progress: {idx_cfg.show_progress}",
+        ]
+    )
     if meta_path(workspace).is_file():
         import json
 
@@ -151,36 +161,51 @@ def print_index_status(workspace: Path) -> None:
             meta = json.loads(meta_path(workspace).read_text(encoding="utf-8"))
             complete = meta.get("sync_complete")
             if complete is not None:
-                print(f"sync_complete: {complete}")
+                lines.append(f"sync_complete: {complete}")
         except (OSError, json.JSONDecodeError):
             pass
-    print(f"manifest: {manifest_path(workspace)}")
-    print(f"embed_cache: {embed_cache_path(workspace)}")
-    print(f"embedding: {format_embedding_status(workspace)}")
+    lines.extend(
+        [
+            f"manifest: {manifest_path(workspace)}",
+            f"embed_cache: {embed_cache_path(workspace)}",
+            f"embedding: {format_embedding_status(workspace)}",
+        ]
+    )
     ws_cfg = workspace / ".llgraph" / EMBEDDING_CONFIG_FILENAME
-    print(f"embedding_config: {ws_cfg} {'(存在)' if ws_cfg.is_file() else '(默认/用户级)'}")
-    print(f"log_dir: {log_dir}")
+    lines.append(
+        f"embedding_config: {ws_cfg} {'(存在)' if ws_cfg.is_file() else '(默认/用户级)'}"
+    )
+    lines.append(f"log_dir: {log_dir}")
     if latest_log.exists():
-        print(f"latest_log: {latest_log.resolve()}")
+        lines.append(f"latest_log: {latest_log.resolve()}")
     search_log = search_log_path(workspace)
     if search_log.is_file():
-        print(f"search_log: {search_log.resolve()}（向量检索审计，/log 控制级别）")
+        lines.append(
+            f"search_log: {search_log.resolve()}（向量检索审计，/log 控制级别）"
+        )
     else:
-        print(f"search_log: {search_log}（尚无记录；--log-level info 或 /log info 后产生）")
+        lines.append(
+            f"search_log: {search_log}（尚无记录；--log-level info 或 /log info 后产生）"
+        )
+    emit_report("\n".join(lines))
 
 
 def print_index_interactive_help() -> None:
     """交互会话 /index 用法。"""
-    print("命令:", flush=True)
-    print("  /index              查看状态 + 简要说明", flush=True)
-    print("  /index status       仅查看状态", flush=True)
-    print("  /index full         全量索引（等同 llgraph index）", flush=True)
-    print("  /index incremental  增量索引", flush=True)
-    print("  /index rebuild      强制重建（清 Lance + manifest）", flush=True)
-    print("  /index dry-run      试运行，不写库", flush=True)
-    print("  /watch on|off       会话内启停索引监听（同 /watch status）", flush=True)
-    print("  可选: --path <子目录>  --ast  --clear-embed-cache  -q（-q 关闭进度条）", flush=True)
-    print("  日志: .llgraph/index/logs/latest.log", flush=True)
+    from llgraph.ui.output import emit_block
+
+    emit_block(
+        "命令:\n"
+        "  /index              查看状态 + 简要说明\n"
+        "  /index status       仅查看状态\n"
+        "  /index full         全量索引（等同 llgraph index）\n"
+        "  /index incremental  增量索引\n"
+        "  /index rebuild      强制重建（清 Lance + manifest）\n"
+        "  /index dry-run      试运行，不写库\n"
+        "  /watch on|off       会话内启停索引监听（同 /watch status）\n"
+        "  可选: --path <子目录>  --ast  --clear-embed-cache  -q（-q 关闭进度条）\n"
+        "  日志: .llgraph/index/logs/latest.log"
+    )
 
 
 def _apply_action_to_args(args: argparse.Namespace) -> None:

@@ -83,6 +83,23 @@ def discover_skills(workspace: Path) -> list[SkillEntry]:
     return sorted(by_name.values(), key=lambda s: s.name.lower())
 
 
+def resolve_skill_by_token(workspace: Path, token: str) -> SkillEntry | None:
+    """
+    按斜杠命令 token 查找技能（不含 /）。
+
+    @param workspace 工作区根
+    @param token 首 token，如 tracking
+    @return 匹配技能；无则 None
+    """
+    key = token.strip().lstrip("/").lower()
+    if not key:
+        return None
+    for skill in discover_skills(workspace):
+        if skill.name.lower() == key:
+            return skill
+    return None
+
+
 def match_skills_by_message(skills: list[SkillEntry], message: str) -> list[str]:
     """
     根据用户消息自动匹配技能名。

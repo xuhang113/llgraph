@@ -4,6 +4,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
@@ -119,6 +120,148 @@ def _format_tool_args(args: Any, *, verbose: bool = False) -> str:
     if len(raw) > limit:
         return raw[: limit - 1] + "…"
     return raw
+
+
+def _short_tool_target(args: Any) -> str:
+    """
+    工具调用摘要中的关键参数（路径、查询等）。
+
+    @param args 工具参数字典
+    @return 短描述；无则空串
+    """
+    if not isinstance(args, dict):
+        return ""
+    for key in ("path", "query", "pattern", "command", "url"):
+        val = args.get(key)
+        if not isinstance(val, str) or not val.strip():
+            continue
+        text = val.strip()
+        if key == "path" and len(text) > 48:
+            name = Path(text).name
+            if name:
+                return f"…/{name}"
+        if len(text) > 48:
+            return text[:45] + "…"
+        return text
+    return ""
+
+
+def _format_planned_tools_summary(tool_calls: list, *, verbose: bool = False) -> str:
+    """
+    模型决策步摘要：强调「拟调用」、尚未执行。
+
+    @param tool_calls AIMessage.tool_calls
+    @param verbose 完整模式用计数摘要
+    @return 如 拟调用 read_file(…/sandbox.json)
+    """
+    if not tool_calls:
+        return "无工具调用"
+    if verbose:
+        return f"{len(tool_calls)} 个工具"
+    parts: list[str] = []
+    for call in tool_calls:
+        name = call.get("name", "?")
+        target = _short_tool_target(call.get("args") or {})
+        if target:
+            parts.append(f"{name}({target})")
+        else:
+            parts.append(str(name))
+    if len(parts) == 1:
+        return f"拟调用 {parts[0]}"
+    joined = ", ".join(parts[:3])
+    if len(parts) > 3:
+        joined += f" 等 {len(parts)} 个"
+    return f"拟调用 {joined}"
+
+
+def _format_turn_skills_line(
+    workspace: Path | None,
+    context_session: Any | None,
+    user_message: str,
+) -> str:
+    """
+    本回合生效技能一行摘要（/skill 会话启用 或 消息自动匹配）。
+
+    @param workspace 工作区根
+    @param context_session Rule/Skill 会话状态
+    @param user_message 用户消息（自动匹配用）
+    @return 如 ⭐ 本回合技能: tracking（自动）；无则空串
+    """
+    if workspace is None or context_session is None:
+        return ""
+    from llgraph.loaders.skills_loader import discover_skills, resolve_active_skills
+
+    all_skills = discover_skills(workspace)
+    active = resolve_active_skills(
+        all_skills,
+        session_active=context_session.active_skills,
+        user_message=user_message,
+        auto_match=context_session.auto_match_skills,
+    )
+    if not active:
+        return ""
+    session_pinned = {s.lower() for s in context_session.active_skills}
+    labels: list[str] = []
+    for skill in active:
+        key = skill.name.lower()
+        if key in session_pinned:
+            origin = "会话启用"
+        else:
+            origin = "自动"
+        labels.append(f"{skill.name}（{origin}）")
+    return "⭐ 本回合技能: " + ", ".join(labels)
+
+
+def _short_tool_target(args: Any) -> str:
+    """
+    工具调用摘要中的关键参数（路径、查询等）。
+
+    @param args 工具参数字典
+    @return 短描述；无则空串
+    """
+    if not isinstance(args, dict):
+        return ""
+    for key in ("path", "query", "pattern", "command", "url"):
+        val = args.get(key)
+        if not isinstance(val, str) or not val.strip():
+            continue
+        text = val.strip()
+        if key == "path" and len(text) > 44:
+            name = Path(text).name
+            if name:
+                return f"…/{name}"
+        if len(text) > 44:
+            return text[:41] + "…"
+        return text
+    return ""
+
+
+def _format_planned_tools_summary(tool_calls: list, *, verbose: bool = False) -> str:
+    """
+    模型决策步摘要：强调「拟调用」、尚未执行。
+
+    @param tool_calls LangGraph tool_calls
+    @param verbose 是否 verbose 模式
+    @return 折叠行摘要
+    """
+    if not tool_calls:
+        return "无工具调用"
+    if verbose:
+        return f"{len(tool_calls)} 个工具"
+    parts: list[str] = []
+    for call in tool_calls:
+        name = call.get("name", "?")
+        target = _short_tool_target(call.get("args") or {})
+        if target:
+            parts.append(f"{name}({target})")
+        else:
+            parts.append(str(name))
+    if len(parts) == 1:
+        return f"拟调用 {parts[0]}"
+    joined = ", ".join(parts[:3])
+    if len(parts) > 3:
+        joined += f" 等 {len(parts)} 个"
+    return f"拟调用 {joined}"
 
 
 def _tool_output_looks_like_error(text: str) -> bool:
@@ -238,6 +381,7 @@ class TraceSession:
     preview_lines: int = DEFAULT_PREVIEW_LINES
     show_step_tokens: bool = True
     last_turn_steps: list[TraceStepRecord] = field(default_factory=list)
+    last_turn_raw_reply: str = ""
     trace_sink: Any = None
 
     def shows_process(self) -> bool:
@@ -318,6 +462,11 @@ def _trace_line(session: TraceSession, text: str) -> None:
 
         payload = strip_ansi(text)
     if sink is None:
+        from llgraph.ui.style import color_enabled
+        from llgraph.ui.terminal_theme import _has_ansi, colorize_terminal_text
+
+        if color_enabled() and payload.strip() and not _has_ansi(payload):
+            payload = colorize_terminal_text(payload)
         print(payload, flush=True)
         return
     sink.line(payload)
@@ -372,6 +521,7 @@ class TurnRunResult:
     """单轮执行结果（供执行日志与调用方）。"""
 
     text: str
+    raw_text: str = ""
     tool_names: list[str] = field(default_factory=list)
     duration_sec: float = 0.0
 
@@ -393,15 +543,23 @@ class TurnTracePrinter:
         from llgraph.survey.survey_prompt import SurveyStreamFilter
 
         self._survey_filter = SurveyStreamFilter()
+        self._stream_open = False
 
     def _line(self, text: str = "") -> None:
+        # 步骤行须独占一行：先结束未换行的流式片段（避免【规划】与 ▶ #N 窜行）
+        if self._stream_open:
+            self._stream_end()
         _trace_line(self._session, text)
 
     def _stream(self, text: str) -> None:
+        if text:
+            self._stream_open = True
         _trace_stream(self._session, text)
 
     def _stream_end(self) -> None:
-        _trace_stream_end(self._session)
+        if self._stream_open:
+            _trace_stream_end(self._session)
+            self._stream_open = False
 
     @property
     def preview_lines(self) -> int:
@@ -451,6 +609,7 @@ class TurnTracePrinter:
         @return 本步用量
         """
         if usage is not None:
+            self._pending_usage = None
             return usage
         pending = self._pending_usage
         self._pending_usage = None
@@ -469,7 +628,7 @@ class TurnTracePrinter:
             inline = _format_step_usage_inline(usage)
             if inline:
                 return "  " + _c(inline, "35")
-        return "  " + _c("token —", "90")
+        return ""
 
     def _print_step_inline_detail(self, step_id: int) -> None:
         """
@@ -484,7 +643,15 @@ class TurnTracePrinter:
             return
         limit = STEP_INLINE_PREVIEW_LINES
         for line in step.body_lines[:limit]:
-            self._line(_c(f"{_TRACE_L2}│ {_clip_line(line)}", "90"))
+            clipped = _clip_line(line)
+            if clipped.lstrip().startswith("【规划】"):
+                self._line(
+                    _c(f"{_TRACE_L2}│ ", "90")
+                    + _c("规划 ", "35")
+                    + _c(clipped, "37"),
+                )
+            else:
+                self._line(_c(f"{_TRACE_L2}│ {_clip_line(line)}", "90"))
         rest = len(step.body_lines) - min(len(step.body_lines), limit)
         if rest > 0:
             self._line(
@@ -516,8 +683,6 @@ class TurnTracePrinter:
             last = self._steps[-1]
             if last.step_id == step_id:
                 resolved = last.usage
-        if resolved is None:
-            resolved = self._resolve_step_usage(None)
         self._line(
             _c(f"[{_timestamp()}] ", "90")
             + _c(f"▶ #{step_id} {title}", "32")
@@ -531,18 +696,31 @@ class TurnTracePrinter:
         if sink is not None and self._steps:
             sink.step_added(self._steps[-1])
 
-    def on_turn_start(self, user_preview: str) -> None:
+    def on_turn_start(
+        self,
+        user_message: str,
+        *,
+        workspace: Path | None = None,
+        context_session: Any | None = None,
+    ) -> None:
         self._survey_filter.reset()
         if self._session.is_silent():
             return
         if self._session.mode == TraceMode.REPLY:
             return
-        preview = _clip_line(user_preview.replace("\n", " "), 120)
+        preview = _clip_line(user_message.replace("\n", " "), 120)
         self._line(
             _c(f"[{_timestamp()}] ", "90")
             + _c("▶ 用户消息", "1")
             + f"  {preview}",
         )
+        skills_line = _format_turn_skills_line(workspace, context_session, user_message)
+        if skills_line:
+            self._line(
+                _c(f"[{_timestamp()}] ", "90")
+                + _c("▶ 技能", "35")
+                + f"  {skills_line}",
+            )
         self._line(
             _c(f"{_TRACE_L1}提示: 大段文本用 /paste；/trace /rule /skill；/help", "90"),
         )
@@ -573,8 +751,6 @@ class TurnTracePrinter:
         text = _message_text(last.content).strip()
         verbose = self._session.is_verbose()
         step_usage = _extract_usage_from_ai_message(last)
-        if step_usage is not None:
-            self._pending_usage = step_usage
 
         if tool_calls:
             for call in tool_calls:
@@ -590,24 +766,27 @@ class TurnTracePrinter:
             plan_body: list[str] = []
             if text:
                 plan_body.extend(text.splitlines())
-            for call in tool_calls:
-                name = call.get("name", "?")
-                args = call.get("args", {})
-                plan_body.append(
-                    f"调用工具 {name}({_format_tool_args(args, verbose=True)})"
-                )
+            if verbose:
+                for call in tool_calls:
+                    name = call.get("name", "?")
+                    args = call.get("args", {})
+                    plan_body.append(
+                        f"拟调用 {name}({_format_tool_args(args, verbose=True)})"
+                    )
+            plan_summary = _format_planned_tools_summary(tool_calls, verbose=verbose)
+            resolved_usage = self._resolve_step_usage(step_usage)
             step_id = self._register_step(
                 "plan",
-                "模型规划",
+                "模型决策",
                 elapsed,
-                f"{len(tool_calls)} 个工具",
+                plan_summary,
                 body_lines=plan_body,
-                usage=self._resolve_step_usage(step_usage),
+                usage=resolved_usage,
             )
             if verbose:
                 self._line(
                     _c(f"[{_timestamp()}] ", "90")
-                    + _c(f"🤔 模型规划 #{step_id}", "33")
+                    + _c(f"🤔 模型决策 #{step_id}", "33")
                     + _c(f"  ({_format_duration(elapsed)})", "90"),
                 )
                 for call in tool_calls:
@@ -615,17 +794,16 @@ class TurnTracePrinter:
                     args = call.get("args", {})
                     self._line(
                         _c(f"{_TRACE_L2}└ ", "90")
-                        + _c(f"调用工具 {name}", "36")
+                        + _c(f"拟调用 {name}", "36")
                         + f"({_format_tool_args(args, verbose=True)})",
                     )
             else:
-                names = ", ".join(call.get("name", "?") for call in tool_calls)
                 self._print_step_summary(
                     step_id,
-                    "模型规划",
+                    "模型决策",
                     elapsed,
-                    f"→ {names}",
-                    usage=step_usage,
+                    plan_summary,
+                    usage=resolved_usage,
                 )
                 if any(call.get("name") == "web_search" for call in tool_calls):
                     self._line(
@@ -635,6 +813,8 @@ class TurnTracePrinter:
             self._streamed_reply = False
         elif text and not self._streamed_reply:
             self._final_text = text
+            if self._session.shows_process() and not self._session.is_verbose():
+                self._emit_final_reply_block(text)
 
         self._step_start = time.perf_counter()
 
@@ -674,18 +854,19 @@ class TurnTracePrinter:
                 )
                 self._print_preview_block(lines, limit=preview_limit)
             else:
+                output_summary = f"{len(lines)} 行输出"
                 step_id = self._register_step(
                     "tool",
-                    f"工具 {name}",
+                    f"执行 {name}",
                     elapsed,
-                    f"{len(lines)} 行输出",
+                    output_summary,
                     body_lines=lines,
                 )
                 self._print_step_summary(
                     step_id,
-                    f"工具 {name}",
+                    f"执行 {name}",
                     elapsed,
-                    f"→ {name}",
+                    f"· {output_summary}",
                 )
 
         self._step_start = time.perf_counter()
@@ -693,11 +874,40 @@ class TurnTracePrinter:
         if verbose:
             self._printed_final_header = False
 
+    def _emit_final_reply_block(self, text: str) -> None:
+        """
+        steps 折叠模式下整段输出最终回复（中间轮次不走流式，避免与步骤头窜行）。
+
+        @param text 助手最终正文
+        """
+        if not text.strip():
+            return
+        elapsed = time.perf_counter() - self._step_start
+        self._step_index += 1
+        if self._session.shows_process():
+            label = f"💬 #{self._step_index} 助手回复"
+            self._line(
+                _c(f"[{_timestamp()}] ", "90")
+                + _c(label, "1")
+                + _c(f"  ({_format_duration(elapsed)})", "90"),
+            )
+        self._printed_final_header = True
+        self._streamed_reply = True
+        self._survey_filter.reset()
+        visible = self._survey_filter.feed(text)
+        if visible:
+            self._stream(visible)
+        self._stream_end()
+
     def on_text_chunk(self, chunk_text: str) -> None:
         if not self._session.shows_reply_stream():
             self._final_text += chunk_text
             return
         if not chunk_text:
+            return
+        # steps 折叠：中间轮次只累积，最终回复在 on_agent_update 整段输出
+        if self._session.shows_process() and not self._session.is_verbose():
+            self._final_text += chunk_text
             return
         if not self._printed_final_header:
             elapsed = time.perf_counter() - self._step_start
@@ -720,7 +930,7 @@ class TurnTracePrinter:
         if visible:
             self._stream(visible)
 
-    def on_turn_end(self, *, last_step_body: str = "") -> str:
+    def on_turn_end(self, *, last_step_body: str = "") -> tuple[str, str]:
         if (
             self._session.mode == TraceMode.STEPS
             and last_step_body
@@ -765,13 +975,15 @@ class TurnTracePrinter:
                 self._line(_c(hint, "90"))
         from llgraph.survey.survey_prompt import strip_survey_for_display
 
-        self._final_text = strip_survey_for_display(self._final_text)
-        return self._final_text.strip()
+        raw = self._final_text.strip()
+        display = strip_survey_for_display(self._final_text).strip()
+        self._session.last_turn_raw_reply = raw
+        return display, raw
 
 
 def _sum_steps_usage(steps: list[TraceStepRecord]) -> StepUsage | None:
     """
-    汇总本轮各「模型规划」步 token（工具步无独立 LLM 用量）。
+    汇总本轮各「模型决策」步 token（工具步无独立 LLM 用量）。
 
     @param steps 步骤列表
     @return 合计用量
@@ -839,8 +1051,6 @@ def print_trace_step_list(session: TraceSession) -> None:
                 inline = _format_step_usage_inline(step.usage)
                 if inline:
                     token_part = f"  [{inline}]"
-            else:
-                token_part = "  [token —]"
         _trace_line(session, 
             f"  ▶ #{step.step_id} {step.title}  ({_format_duration(step.elapsed)})"
             f"  {step.summary}{token_part}"
@@ -1006,6 +1216,8 @@ def stream_agent_turn(
     trace_session: TraceSession | None = None,
     effective_message: str | None = None,
     write_failure_tracker=None,
+    workspace: Path | str | None = None,
+    context_session: Any | None = None,
 ) -> TurnRunResult:
     """
     流式执行一轮对话并按 TraceMode 展示。
@@ -1014,6 +1226,8 @@ def stream_agent_turn(
     @param effective_message 实际发给模型的消息（含 workspace-context 时传入）
     @param trace_session 展示配置，默认 steps
     @param write_failure_tracker 写工具失败跟踪（可选）
+    @param workspace 工作区根（展示本回合技能）
+    @param context_session Rule/Skill 会话状态
     @return 助手最终文本与本轮指标
     """
     global LAST_TRACE_SESSION
@@ -1040,7 +1254,12 @@ def stream_agent_turn(
 
     config = {"configurable": {"thread_id": thread_id}} if with_memory else None
     printer = TurnTracePrinter(session)
-    printer.on_turn_start(user_message)
+    ws_path = Path(workspace).expanduser().resolve() if workspace is not None else None
+    printer.on_turn_start(
+        user_message,
+        workspace=ws_path,
+        context_session=context_session,
+    )
 
     input_state = {"messages": [{"role": "user", "content": payload}]}
     saw_tool_round = False
@@ -1094,10 +1313,11 @@ def stream_agent_turn(
                 streaming_reply = True
             printer.on_text_chunk(text)
 
-    text = printer.on_turn_end(last_step_body=last_tool_body)
+    display_text, raw_text = printer.on_turn_end(last_step_body=last_tool_body)
     session.last_turn_steps = list(printer._steps)
     return TurnRunResult(
-        text=text,
+        text=display_text,
+        raw_text=raw_text,
         tool_names=list(printer._tool_names),
         duration_sec=time.perf_counter() - turn_start,
     )

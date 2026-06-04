@@ -666,19 +666,17 @@ def main() -> None:
         print(f"配置错误: {exc}", file=sys.stderr)
         sys.exit(1)
     finally:
-        stop_watch = (
-            agent_session.watch_service
-            if agent_session is not None
-            else watch_service
+        from llgraph.runtime.shutdown import shutdown_agent_resources
+
+        shutdown_agent_resources(
+            watch_service=(
+                agent_session.watch_service
+                if agent_session is not None
+                else watch_service
+            ),
+            mcp_registry=mcp_registry,
+            edit_tracker=edit_tracker,
         )
-        if stop_watch is not None:
-            stop_watch.stop()
-        if mcp_registry is not None:
-            mcp_registry.stop()
-        if edit_tracker is not None:
-            summary = edit_tracker.exit_summary()
-            if summary:
-                print(summary)
 
 
 if __name__ == "__main__":

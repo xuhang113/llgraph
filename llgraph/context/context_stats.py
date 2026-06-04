@@ -256,9 +256,18 @@ def collect_context_usage(
 
 def _render_bar(ratio: float, width: int = 28) -> str:
     """简易 ASCII 进度条。"""
+    from llgraph.ui.style import color_enabled, sty
+
     ratio = max(0.0, min(1.0, ratio))
     filled = int(round(ratio * width))
-    return "[" + "#" * filled + "-" * (width - filled) + "]"
+    if not color_enabled():
+        return "[" + "#" * filled + "-" * (width - filled) + "]"
+    return (
+        sty("[", "dim")
+        + sty("#" * filled, "ok")
+        + sty("-" * (width - filled), "dim")
+        + sty("]", "dim")
+    )
 
 
 def format_context_usage_report(
@@ -275,17 +284,23 @@ def format_context_usage_report(
     @param limit_tokens 展示用上下文上限
     @return 多行文本
     """
+    from llgraph.ui.style import sty
+
     settings = resolve_context_settings(workspace)
     limit = limit_tokens or settings.max_tokens_estimate
     total = breakdown.total
     ratio = total / limit if limit > 0 else 0.0
     pct = min(100, int(ratio * 100))
     full_label = f"{pct}% Full" if pct >= 85 else f"{pct}%"
+    pct_style = "warn" if pct >= 85 else "ok"
 
     lines = [
-        "Context",
-        "=======",
-        f"{full_label}    {_format_token_count(total)} / {_format_token_count(limit)} Tokens",
+        sty("Context", "title"),
+        sty("=======", "dim"),
+        f"{sty(full_label, pct_style)}    "
+        f"{sty(_format_token_count(total), 'number')} / "
+        f"{sty(_format_token_count(limit), 'number')} "
+        f"{sty('Tokens', 'hint')}",
         "",
         _render_bar(ratio),
         "",
@@ -305,7 +320,10 @@ def format_context_usage_report(
     for name, tokens in rows:
         if tokens <= 0 and name == "Markdowns index":
             continue
-        lines.append(f"{name.ljust(name_width)}  {_format_token_count(tokens)}")
+        lines.append(
+            f"{sty(name.ljust(name_width), 'label')}  "
+            f"{sty(_format_token_count(tokens), 'number')}"
+        )
 
     from llgraph.core.model_context_window import format_context_budget_note
 
@@ -319,12 +337,24 @@ def format_context_usage_report(
     lines.extend(
         [
             "",
-            f"消息数: {breakdown.message_count}  |  工具: {breakdown.tool_count}"
-            f"（MCP {breakdown.mcp_tool_count}）",
-            budget_note,
-            "说明: token 为字符÷3 粗算；Rules/Skills 为下轮用户消息将注入的估算；",
-            "      历史轮次中已注入的 <workspace-context> 计入 Conversation。",
-            "      上下文预算默认按当前模型上限（/model 切换后下条消息起更新）。",
+            sty(
+                f"消息数: {breakdown.message_count}  |  工具: {breakdown.tool_count}"
+                f"（MCP {breakdown.mcp_tool_count}）",
+                "value",
+            ),
+            sty(budget_note, "accent"),
+            sty(
+                "说明: token 为字符÷3 粗算；Rules/Skills 为下轮用户消息将注入的估算；",
+                "hint",
+            ),
+            sty(
+                "      历史轮次中已注入的 <workspace-context> 计入 Conversation。",
+                "hint",
+            ),
+            sty(
+                "      上下文预算默认按当前模型上限（/model 切换后下条消息起更新）。",
+                "hint",
+            ),
         ]
     )
     return "\n".join(lines)
@@ -358,7 +388,6 @@ def print_context_usage(
         web_search_enabled=web_enabled,
         agent_session=agent_session,
     )
-    print(
-        format_context_usage_report(breakdown, workspace=workspace),
-        flush=True,
-    )
+    from llgraph.ui.output import emit_report
+
+    emit_report(format_context_usage_report(breakdown, workspace=workspace))

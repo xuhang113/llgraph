@@ -111,13 +111,15 @@ def print_current_session_info(workspace: Path, thread_id: str) -> None:
     from llgraph.session.session_meta import resolve_session_display_title
     from llgraph.session.user_storage import format_storage_location_hint
 
+    from llgraph.ui.output import emit, emit_report
+
     title = resolve_session_display_title(workspace, thread_id)
-    print(f"当前会话 thread_id: {thread_id}", flush=True)
+    emit(f"当前会话 thread_id: {thread_id}", colorize=True)
     if title and title != thread_id:
-        print(f"标题: {title}", flush=True)
-    print(format_storage_location_hint(workspace), flush=True)
-    print(f"恢复: {format_resume_cli_command(workspace, thread_id)}", flush=True)
-    print(f"会话内切换: /session use {thread_id}", flush=True)
+        emit(f"标题: {title}", colorize=True)
+    emit_report(format_storage_location_hint(workspace))
+    emit(f"恢复: {format_resume_cli_command(workspace, thread_id)}", colorize=True)
+    emit(f"会话内切换: /session use {thread_id}", colorize=True)
 
 
 def print_session_exit_hint(workspace: Path, thread_id: str) -> None:
@@ -129,11 +131,13 @@ def print_session_exit_hint(workspace: Path, thread_id: str) -> None:
     """
     from llgraph.session.session_meta import resolve_session_display_title
 
+    from llgraph.ui.output import emit
+
     title = resolve_session_display_title(workspace, thread_id)
     title_part = f"（{title}）" if title and title != thread_id else ""
-    print("", flush=True)
-    print(f"当前会话 thread_id: {thread_id} {title_part}".rstrip(), flush=True)
-    print(f"下次恢复: {format_resume_cli_command(workspace, thread_id)}", flush=True)
+    emit()
+    emit(f"当前会话 thread_id: {thread_id} {title_part}".rstrip(), colorize=True)
+    emit(f"下次恢复: {format_resume_cli_command(workspace, thread_id)}", colorize=True)
 
 
 def format_session_command_help(workspace: Path, current_thread_id: str) -> str:

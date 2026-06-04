@@ -407,6 +407,8 @@ def invoke_agent(
         trace_session=trace,
         effective_message=effective,
         write_failure_tracker=write_failure_tracker,
+        workspace=root,
+        context_session=ctx,
     )
     from llgraph.display.execution_log import log_turn_end
 

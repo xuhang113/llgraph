@@ -112,6 +112,10 @@ class _McpServerRuntime:
         """关闭会话与子进程。"""
         if self._loop is None:
             return
+        loop = self._loop
+        thread = self._thread
+        self._loop = None
+        self._thread = None
 
         async def _shutdown() -> None:
             if self._session is not None:
@@ -120,13 +124,16 @@ class _McpServerRuntime:
                 await self._stdio_ctx.__aexit__(None, None, None)
 
         try:
-            fut = asyncio.run_coroutine_threadsafe(_shutdown(), self._loop)
-            fut.result(timeout=5)
+            fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
+            fut.result(timeout=2)
         except Exception:
             pass
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=3)
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.5)
 
 
 class McpToolRegistry:

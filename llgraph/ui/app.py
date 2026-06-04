@@ -207,13 +207,44 @@ class LlgraphApp(App[None]):
         background: $panel;
     }
 
+    #input_column {
+        layout: vertical;
+        height: auto;
+        max-height: 14;
+        border-top: solid $primary-darken-1;
+        background: $surface;
+    }
+
+    #slash_suggest {
+        height: auto;
+        max-height: 8;
+        border: none;
+        background: $panel;
+        padding: 0 1;
+        display: none;
+    }
+
+    #slash_suggest.-show {
+        display: block;
+    }
+
+    #slash_hint {
+        height: 1;
+        padding: 0 2;
+        color: $text-muted;
+        display: none;
+    }
+
+    #slash_hint.-show {
+        display: block;
+    }
+
     #input_bar {
         layout: horizontal;
         height: 3;
         min-height: 3;
         padding: 0 1;
         background: $surface;
-        border-top: solid $primary-darken-1;
         align: left middle;
     }
 
@@ -239,6 +270,9 @@ class LlgraphApp(App[None]):
         Binding("ctrl+c", "quit", "退出", show=True),
         Binding("ctrl+q", "quit", "退出", show=True),
         Binding("ctrl+o", "toggle_steps", "步骤侧栏", show=True),
+        Binding("tab", "slash_complete", "斜杠补全", show=False),
+        Binding("up", "slash_up", "上一条建议", show=False),
+        Binding("down", "slash_down", "下一条建议", show=False),
     ]
 
     def __init__(self, params: TuiSessionParams) -> None:
@@ -250,6 +284,8 @@ class LlgraphApp(App[None]):
         self._last_user_message = ""
         self._steps_visible = False
         self._assistant_stream_open = False
+        self._slash_items: list = []
+        self._slash_active = False
 
     def compose(self) -> ComposeResult:
         session_line = build_session_banner_text(
@@ -279,12 +315,18 @@ class LlgraphApp(App[None]):
                     auto_scroll=True,
                 )
         yield Static("", id="status_bar", markup=True)
-        with Horizontal(id="input_bar"):
-            yield Static("❯", id="prompt_prefix")
-            yield Input(
-                placeholder="询问 llgraph…  /help  /trace  exit 退出",
-                id="prompt_input",
+        with Vertical(id="input_column"):
+            yield ListView(id="slash_suggest")
+            yield Static(
+                "↑↓ 选择 · Tab/Enter 填入 · 继续输入任务描述",
+                id="slash_hint",
             )
+            with Horizontal(id="input_bar"):
+                yield Static("❯", id="prompt_prefix")
+                yield Input(
+                    placeholder="询问 llgraph…  输入 / 查看技能与命令",
+                    id="prompt_input",
+                )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -426,8 +468,64 @@ class LlgraphApp(App[None]):
         else:
             panel.remove_class("-show")
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "prompt_input" or self._running:
+            return
+        self._refresh_slash_suggest(event.value)
+
+    def _refresh_slash_suggest(self, text: str) -> None:
+        from llgraph.ui.slash_suggest import refresh_slash_suggest_list
+
+        lst = self.query_one("#slash_suggest", ListView)
+        hint = self.query_one("#slash_hint", Static)
+        self._slash_items = refresh_slash_suggest_list(
+            lst,
+            self._params.workspace,
+            text,
+        )
+        self._slash_active = bool(self._slash_items)
+        if self._slash_active:
+            lst.add_class("-show")
+            hint.add_class("-show")
+        else:
+            lst.remove_class("-show")
+            hint.remove_class("-show")
+
+    def _apply_slash_selection(self) -> None:
+        if not self._slash_items:
+            return
+        lst = self.query_one("#slash_suggest", ListView)
+        idx = lst.index if lst.index >= 0 else 0
+        idx = min(idx, len(self._slash_items) - 1)
+        item = self._slash_items[idx]
+        inp = self.query_one("#prompt_input", Input)
+        inp.value = item.insert_text.rstrip()
+        inp.cursor_position = len(inp.value)
+        self._refresh_slash_suggest(inp.value)
+
+    def action_slash_complete(self) -> None:
+        if self._slash_active:
+            self._apply_slash_selection()
+
+    def action_slash_up(self) -> None:
+        if not self._slash_active:
+            return
+        lst = self.query_one("#slash_suggest", ListView)
+        if lst.index > 0:
+            lst.index -= 1
+
+    def action_slash_down(self) -> None:
+        if not self._slash_active:
+            return
+        lst = self.query_one("#slash_suggest", ListView)
+        if lst.index < len(self._slash_items) - 1:
+            lst.index += 1
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "prompt_input":
+            return
+        if self._slash_active and self._slash_items:
+            self._apply_slash_selection()
             return
         text = event.value.strip()
         event.input.value = ""
@@ -558,7 +656,8 @@ class LlgraphApp(App[None]):
     def on_turn_finished(self, message: TurnFinished) -> None:
         self.trace_session.trace_sink.stream_end()
         self._set_running(False)
-        self._maybe_survey_followup(message.reply)
+        raw = self.trace_session.last_turn_raw_reply or message.reply
+        self._maybe_survey_followup(message.reply, raw_assistant_text=raw)
         if self._params.single_turn:
             self.exit()
 
@@ -566,11 +665,19 @@ class LlgraphApp(App[None]):
         self._set_running(False)
         self._chat().write(f"[red]● {message.error}[/]")
 
-    def _maybe_survey_followup(self, assistant_text: str) -> None:
+    def _maybe_survey_followup(
+        self,
+        assistant_text: str,
+        *,
+        raw_assistant_text: str | None = None,
+    ) -> None:
         from llgraph.survey.survey_prompt import try_run_survey_followup
 
+        parse_text = (raw_assistant_text or assistant_text or "").strip()
+        if not parse_text:
+            return
         followup = try_run_survey_followup(
-            assistant_text,
+            parse_text,
             workspace=self._params.workspace,
             context_session=self._params.context_session,
         )

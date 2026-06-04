@@ -8,7 +8,7 @@ class ContextSession:
     """
     每轮对话注入模型的规则与技能状态。
 
-    active_skills: 用户通过 /skill 启用的技能名（对应 .llgraph/skills/<name>/）
+    active_skills: 用户通过 /skill 启用的技能名（整会话有效；与自动匹配无关）
     disabled_rules: 用户临时禁用的规则 id（/rule off）
     forced_rules: 用户强制启用的 glob 规则 id（/rule on）
     auto_match_skills: 是否根据用户消息自动匹配技能 description
