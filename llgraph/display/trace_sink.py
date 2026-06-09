@@ -1,4 +1,4 @@
-"""追踪输出 Sink：将 trace 写入 TUI 而非终端 print。"""
+"""追踪输出 Sink：终端 stdout 与静默模式。"""
 
 from __future__ import annotations
 

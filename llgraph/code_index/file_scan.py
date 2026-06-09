@@ -4,18 +4,11 @@ import hashlib
 import os
 from pathlib import Path
 
-from llgraph.core.filesystem_tools import _is_probably_text
+from llgraph.core.text_file_types import is_indexable_path
 from llgraph.core.workspace import WorkspaceContext
 
 # 历史默认上限；现默认 0=不限制，见 embedding.json 的 index.max_files
 MAX_INDEX_FILES = 0
-
-_INDEX_SUFFIXES = frozenset({
-    ".py", ".java", ".kt", ".go", ".rs", ".js", ".ts", ".tsx", ".jsx",
-    ".md", ".txt", ".yaml", ".yml", ".json", ".xml", ".properties",
-    ".sql", ".sh", ".zsh", ".toml", ".ini", ".cfg", ".html", ".css",
-    ".vue", ".gradle", ".mdc",
-})
 
 
 def language_from_path(rel_path: str) -> str:
@@ -89,7 +82,7 @@ def iter_indexable_files(
             full = Path(dirpath) / filename
             if not full.is_file():
                 continue
-            if not _is_probably_text(full) and full.suffix.lower() not in _INDEX_SUFFIXES:
+            if not is_indexable_path(full, ctx.root):
                 continue
             try:
                 rel = full.relative_to(ctx.root).as_posix()

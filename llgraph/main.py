@@ -15,7 +15,6 @@ from llgraph.config.config import load_llgraph_env
 from llgraph.context.context_session import ContextSession
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.display.trace_display import TraceMode, TraceSession, parse_trace_mode
-from llgraph.display.ui_mode import UiMode, parse_ui_mode, resolve_ui_mode
 from llgraph.config.workspace_config import init_user_llgraph, init_workspace_llgraph
 
 
@@ -30,31 +29,12 @@ def _run_once(
     context_session: ContextSession,
     allow_write: bool = False,
     write_failure_tracker: WriteFailureTracker | None = None,
-    ui_mode: UiMode = UiMode.TERMINAL,
 ) -> None:
     """单轮模式：执行一条消息后退出。"""
-    if ui_mode == UiMode.TERMINAL:
-        from llgraph.terminal.session import TerminalSessionParams, run_terminal_session
+    from llgraph.terminal.session import TerminalSessionParams, run_terminal_session
 
-        run_terminal_session(
-            TerminalSessionParams(
-                agent=agent,
-                workspace=workspace,
-                thread_id=thread_id,
-                trace_session=trace_session,
-                context_session=context_session,
-                allow_write=allow_write,
-                write_failure_tracker=write_failure_tracker,
-                opening_message=message,
-                single_turn=True,
-            )
-        )
-        return
-
-    from llgraph.ui.app import TuiSessionParams, run_tui_session
-
-    run_tui_session(
-        TuiSessionParams(
+    run_terminal_session(
+        TerminalSessionParams(
             agent=agent,
             workspace=workspace,
             thread_id=thread_id,
@@ -64,6 +44,7 @@ def _run_once(
             write_failure_tracker=write_failure_tracker,
             opening_message=message,
             single_turn=True,
+            with_memory=with_memory,
         )
     )
 
@@ -85,55 +66,31 @@ def _run_interactive(
     write_failure_tracker: WriteFailureTracker | None = None,
     resume_hint: str = "",
     memory_kind: str = "",
-    ui_mode: UiMode = UiMode.TERMINAL,
 ) -> None:
-    """交互会话（默认经典终端，可选 TUI）。"""
+    """交互会话（经典终端）。"""
     tid = agent_session.thread_id if agent_session is not None else thread_id
 
-    if ui_mode == UiMode.TERMINAL:
-        from llgraph.terminal.session import TerminalSessionParams, run_terminal_session
+    from llgraph.terminal.session import TerminalSessionParams, run_terminal_session
 
-        run_terminal_session(
-            TerminalSessionParams(
-                agent=agent,
-                workspace=workspace,
-                thread_id=tid,
-                trace_session=trace_session,
-                context_session=context_session,
-                allow_write=allow_write,
-                agent_session=agent_session,
-                edit_tracker=edit_tracker,
-                write_failure_tracker=write_failure_tracker,
-                watch_active=watch_active,
-                web_search_enabled=web_search_enabled,
-                mcp_summary=mcp_summary,
-                resume_hint=resume_hint,
-                memory_kind=memory_kind,
-                opening_message=opening_message,
-            )
+    run_terminal_session(
+        TerminalSessionParams(
+            agent=agent,
+            workspace=workspace,
+            thread_id=tid,
+            trace_session=trace_session,
+            context_session=context_session,
+            allow_write=allow_write,
+            agent_session=agent_session,
+            edit_tracker=edit_tracker,
+            write_failure_tracker=write_failure_tracker,
+            watch_active=watch_active,
+            web_search_enabled=web_search_enabled,
+            mcp_summary=mcp_summary,
+            resume_hint=resume_hint,
+            memory_kind=memory_kind,
+            opening_message=opening_message,
         )
-    else:
-        from llgraph.ui.app import TuiSessionParams, run_tui_session
-
-        run_tui_session(
-            TuiSessionParams(
-                agent=agent,
-                workspace=workspace,
-                thread_id=tid,
-                trace_session=trace_session,
-                context_session=context_session,
-                allow_write=allow_write,
-                agent_session=agent_session,
-                edit_tracker=edit_tracker,
-                write_failure_tracker=write_failure_tracker,
-                watch_active=watch_active,
-                web_search_enabled=web_search_enabled,
-                mcp_summary=mcp_summary,
-                resume_hint=resume_hint,
-                memory_kind=memory_kind,
-                opening_message=opening_message,
-            )
-        )
+    )
 
     from llgraph.session.session_switch import print_session_exit_hint
 
@@ -154,13 +111,7 @@ def main() -> None:
         return
 
     parser = argparse.ArgumentParser(
-        description="llgraph — LangGraph Agent（默认经典终端，可用 --ui tui）",
-    )
-    parser.add_argument(
-        "--ui",
-        default=None,
-        metavar="MODE",
-        help="交互界面：terminal（默认）| tui（Textual）；也可用环境变量 LLGRAPH_UI",
+        description="llgraph — LangGraph Agent（经典终端交互）",
     )
     parser.add_argument(
         "message",
@@ -172,12 +123,13 @@ def main() -> None:
         "--once",
         "-1",
         action="store_true",
-        help="单轮模式：执行一条消息后退出（不进入交互循环）",
+        help="单轮模式：执行一条消息后退出（不进入交互循环）；"
+        "配合 --thread-id 可多次调用续聊",
     )
     parser.add_argument(
         "--memory",
         action="store_true",
-        help="单轮模式下启用会话记忆（交互模式默认已开启）",
+        help="单轮模式下启用会话记忆并落盘；指定 --thread-id 时默认开启",
     )
     parser.add_argument(
         "--thread-id",
@@ -285,7 +237,7 @@ def main() -> None:
     parser.add_argument(
         "--no-survey",
         action="store_true",
-        help="禁用交互式 survey（前置向导/助手确认/弹窗；适合长期非交互 Agent）",
+        help="禁用交互式 survey（助手 followup 确认/写前弹窗；适合长期非交互 Agent）",
     )
     parser.add_argument(
         "--model",
@@ -294,14 +246,6 @@ def main() -> None:
         help="启动时使用的 AI 网关模型（等同会话内 /model；默认 LLGRAPH_MODEL 或 agent.json llm.model）",
     )
     args = parser.parse_args()
-
-    if args.ui is not None and parse_ui_mode(args.ui) is None:
-        print(
-            f"错误: 未知 --ui 模式 {args.ui!r}，可选: tui, terminal",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    ui_mode = resolve_ui_mode(args.ui)
 
     load_llgraph_env()
 
@@ -451,14 +395,22 @@ def main() -> None:
     cli_sandbox: bool | None = True if args.sandbox else False if args.no_sandbox else None
     sandbox_settings = resolve_sandbox_settings(workspace)
     sandbox_policy = build_sandbox_policy(
-        workspace, sandbox_settings, cli_enabled=cli_sandbox
+        workspace, sandbox_settings, cli_enabled=cli_sandbox, allow_write=allow_write
     )
     sandbox_warning = sandbox_policy.startup_warning()
     if sandbox_policy.active and sandbox_warning:
         print(f"警告: {sandbox_warning}", file=sys.stderr)
     elif sandbox_policy.enabled:
+        auto_note = ""
+        if (
+            sandbox_settings.auto_enable_on_readonly
+            and not allow_write
+            and not sandbox_settings.enabled
+            and cli_sandbox is not True
+        ):
+            auto_note = "（只读模式自动启用）"
         print(
-            f"沙箱已启用 ({sandbox_policy.backend}, mode={sandbox_policy.mode}, "
+            f"沙箱已启用{auto_note} ({sandbox_policy.backend}, mode={sandbox_policy.mode}, "
             f"network={sandbox_policy.network})",
             flush=True,
         )
@@ -489,13 +441,15 @@ def main() -> None:
 
         mcp_tools, mcp_registry, mcp_summary = load_mcp_tool_bundle(
             workspace,
-            allow_write=allow_write and not sandbox_policy.enabled,
+            allow_write=allow_write,
         )
         from llgraph.session.session_web_search import resolve_initial_web_search_enabled
 
         web_search_enabled = resolve_initial_web_search_enabled(workspace)
         if args.once:
-            thread_id = args.thread_id or "default"
+            explicit_once_thread = (args.thread_id or "").strip()
+            thread_id = explicit_once_thread or "default"
+            with_memory = args.memory or bool(explicit_once_thread)
             context_spill = ContextSpill.create(
                 workspace,
                 session_id=thread_id,
@@ -523,7 +477,7 @@ def main() -> None:
                 EditConfirmGate(workspace) if allow_write else None
             )
             agent = build_agent(
-                with_memory=args.memory,
+                with_memory=with_memory,
                 workspace_root=workspace,
                 allow_write=allow_write,
                 edit_tracker=edit_tracker if allow_write else None,
@@ -542,17 +496,33 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
+            if with_memory:
+                from llgraph.session.session_file_store import (
+                    prepare_resumable_agent_session,
+                )
+
+                msg_count = prepare_resumable_agent_session(
+                    agent,
+                    workspace,
+                    thread_id,
+                    context_session,
+                    user_message=args.message,
+                )
+                if msg_count > 0:
+                    print(
+                        f"已恢复会话 {thread_id}（{msg_count} 条历史）",
+                        file=sys.stderr,
+                    )
             _run_once(
                 agent,
                 args.message,
                 workspace=workspace,
                 thread_id=thread_id,
-                with_memory=args.memory,
+                with_memory=with_memory,
                 trace_session=trace_session,
                 context_session=context_session,
                 allow_write=allow_write,
                 write_failure_tracker=write_failure_tracker,
-                ui_mode=ui_mode,
             )
             return
 
@@ -626,21 +596,20 @@ def main() -> None:
             web_search_enabled=web_search_enabled,
             edit_confirm_gate=edit_confirm_gate,
             sandbox_policy=sandbox_policy,
+            sandbox_cli_enabled=cli_sandbox,
         )
-        from llgraph.session.session_file_store import restore_session_to_agent
-
         if explicit_thread:
-            from llgraph.session.session_manifest import sync_session_manifest_to_agent_state
-
-            sync_session_manifest_to_agent_state(
-                agent,
-                thread_id=thread_id,
-                workspace=workspace,
-                session=context_session,
-                user_message="",
-                with_memory=True,
+            from llgraph.session.session_file_store import (
+                prepare_resumable_agent_session,
             )
-            msg_count = restore_session_to_agent(agent, workspace, thread_id)
+
+            msg_count = prepare_resumable_agent_session(
+                agent,
+                workspace,
+                thread_id,
+                context_session,
+                user_message=args.message or "",
+            )
             if msg_count > 1:
                 suffix = f"已加载 {msg_count} 条历史消息（messages.jsonl）。"
                 resume_hint = f"{resume_hint} {suffix}" if resume_hint else suffix
@@ -660,7 +629,6 @@ def main() -> None:
             write_failure_tracker=write_failure_tracker,
             resume_hint=resume_hint,
             memory_kind=memory_kind,
-            ui_mode=ui_mode,
         )
     except RuntimeError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)

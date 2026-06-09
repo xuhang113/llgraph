@@ -37,8 +37,7 @@
         "dispatch": {
           "expand_parallel_tools": false,
           "patch_reasoning_content": false,
-          "strip_assistant_thinking_blocks": true,
-          "rewrite_tool_history_as_text": true
+          "strip_assistant_thinking_blocks": true
         }
       },
       {
@@ -64,5 +63,60 @@
     "search_depth": "ultra-fast",
     "include_answer": false,
     "timeout_sec": 25
+  },
+  "context": {
+    "outbound_redact": {
+      "enabled": true,
+      "placeholder": "[REDACTED]",
+      "regex_rules": [
+        {
+          "id": "pem_private_key",
+          "enabled": true,
+          "pattern": "-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----[\\s\\S]*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+          "replacement": "[REDACTED]"
+        },
+        {
+          "id": "url_with_creds",
+          "enabled": true,
+          "pattern": "(?i)\\b(?:jdbc|mysql|postgresql|redis|mongodb)(?:\\+[\\w]+)?://[^\\s\"']+",
+          "replacement": "[REDACTED]"
+        },
+        {
+          "id": "kv_secret",
+          "enabled": true,
+          "pattern": "(?i)(password|passwd|pass|secret|api[_-]?key|access[_-]?key|private[_-]?key|token|authorization)\\s*[:=]\\s*[^\\s,\"']+",
+          "replacement": "$1=[REDACTED]",
+          "replacement_uses_groups": true
+        },
+        {
+          "id": "bearer_token",
+          "enabled": true,
+          "pattern": "(?i)\\bBearer\\s+[A-Za-z0-9._\\-+/=]{8,}\\b",
+          "replacement": "Bearer [REDACTED]"
+        },
+        {
+          "id": "ak_sk",
+          "enabled": true,
+          "pattern": "(?i)\\b(?:AKIA|ASIA)[0-9A-Z]{16}\\b|(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?secret)\\s*[:=]\\s*\\S+",
+          "replacement": "[REDACTED]"
+        },
+        {
+          "id": "ipv4",
+          "enabled": true,
+          "pattern": "\\b(?:(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|[01]?\\d?\\d)\\b",
+          "replacement": "[REDACTED]"
+        }
+      ],
+      "domain_rules": {
+        "enabled": false,
+        "match_urls": true,
+        "match_hostnames": true,
+        "suffixes": []
+      },
+      "path_rules": {
+        "enabled": false,
+        "prefixes": []
+      }
+    }
   }
 }

@@ -11,6 +11,7 @@ from pathlib import Path
 from llgraph.code_index.chunker import CodeChunk, chunk_file_path
 from llgraph.code_index.embedder import embed_texts
 from llgraph.code_index.file_scan import file_sha256
+from llgraph.code_index.index_progress import IndexProgressDisplay
 from llgraph.code_index.index_settings import IndexSettings
 from llgraph.code_index.index_write_session import IndexWriteSession
 

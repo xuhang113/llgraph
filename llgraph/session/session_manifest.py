@@ -12,20 +12,22 @@ from langchain_core.messages import BaseMessage, SystemMessage
 
 from llgraph.config.catalog_paths import format_catalog_path, scope_label
 from llgraph.context.context_session import ContextSession
-from llgraph.loaders.rules_loader import RuleEntry, discover_rules, select_rules_for_turn
-from llgraph.loaders.skills_loader import SkillEntry, discover_skills, resolve_active_skills
+from llgraph.loaders.rules_loader import discover_rules
+from llgraph.loaders.skills_loader import SkillEntry, discover_skills
 from llgraph.context.message_normalize import reorder_pinned_system_messages
-from llgraph.session.user_storage import user_sessions_root
+from llgraph.session.user_storage import session_messages_path, user_sessions_root
 
 SESSION_MANIFEST_TAG = "<session-manifest>"
 _MANIFEST_VERSION = 1
 
 _CATALOG_READ_HINT = (
-    "Skills/Rules 目录提供描述与路径；⭐ 推荐技能正文已注入 workspace-context。"
-    "其余条目用 `read_file <path>`（path 可为工作区相对路径或 ~/.llgraph 下绝对路径）。"
+    "Skills/Rules **全量目录**（描述+路径）；正文不在上下文中，需要时用 `read_file <path>` "
+    "（path 可为工作区相对路径或 ~/.llgraph 下绝对路径）。"
+    "⭐ 仅表示 /skill 手动置顶；不自动匹配、不注入 SKILL.md 正文。"
+    "Rule 是否 alwaysApply/glob 见备注；模型自行判断 read_file 哪些规则。"
     "长文用 `start_line`/`end_line` 分段。"
     "压缩/换模型后远早对话不在每轮上下文：先看 <conversation-anchor>，"
-    "细节用 `search_session_history(query=关键词)` 检索 archive/messages；全文再 read_file 归档路径。"
+    "细节用 `search_session_history(query=关键词)` 或 read_file archive_path；勿 cat 全量 messages.jsonl。"
 )
 
 
@@ -109,21 +111,6 @@ def is_session_manifest_message(msg: BaseMessage) -> bool:
     return SESSION_MANIFEST_TAG in content
 
 
-def _rule_status_lines(rule: RuleEntry, session: ContextSession, user_message: str) -> str:
-    tags: list[str] = []
-    if rule.always_apply:
-        tags.append("always")
-    if rule.rule_id in session.disabled_rules:
-        tags.append("disabled")
-    elif rule.rule_id in session.forced_rules:
-        tags.append("forced")
-    elif rule.globs and user_message:
-        from llgraph.context.context_builder import glob_matches_message_for_rule
-
-        if glob_matches_message_for_rule(rule, user_message):
-            tags.append("glob-hit")
-    return ",".join(tags) if tags else "off"
-
 
 def build_catalog_entries(
     workspace: Path,
@@ -131,23 +118,15 @@ def build_catalog_entries(
     user_message: str,
 ) -> tuple[list[CatalogEntry], list[CatalogEntry]]:
     """
-    构建 Skill / Rule 目录项（全量 Skill + 本回合适用 Rule）。
+    构建 Skill / Rule 全量目录（对齐 Cursor：仅描述+路径，正文 read_file）。
 
     @param workspace 工作区根
     @param session 会话状态
-    @param user_message 用户消息
+    @param user_message 用户消息（用于 Rule 状态标注 glob 命中）
     @return (skill_entries, rule_entries)
     """
     all_skills = discover_skills(workspace)
-    recommended = {
-        s.name.lower()
-        for s in resolve_active_skills(
-            all_skills,
-            session_active=session.active_skills,
-            user_message=user_message,
-            auto_match=session.auto_match_skills,
-        )
-    }
+    recommended = {name.strip().lower() for name in session.active_skills if name.strip()}
     skill_entries: list[CatalogEntry] = []
     for skill in all_skills:
         skill_entries.append(
@@ -164,28 +143,33 @@ def build_catalog_entries(
         )
 
     all_rules = discover_rules(workspace)
-    active_rules = select_rules_for_turn(
-        all_rules,
-        user_message=user_message,
-        session_disabled=session.disabled_rules,
-        session_forced=session.forced_rules,
-    )
-    active_ids = {r.rule_id for r in active_rules}
     rule_entries: list[CatalogEntry] = []
     for rule in all_rules:
-        if rule.rule_id not in active_ids:
-            continue
-        extra = _rule_status_lines(rule, session, user_message)
-        if rule.globs and not rule.always_apply:
-            extra = f"{extra};glob={rule.globs}" if extra else f"glob={rule.globs}"
+        if rule.rule_id in session.disabled_rules:
+            status = "disabled"
+        elif rule.always_apply:
+            status = "always"
+        elif rule.rule_id in session.forced_rules:
+            status = "forced"
+        elif rule.globs and user_message:
+            from llgraph.context.context_builder import glob_matches_message_for_rule
+
+            status = "glob-hit" if glob_matches_message_for_rule(rule, user_message) else "glob"
+        elif rule.globs:
+            status = "glob"
+        else:
+            status = "off"
+        extra_parts = [scope_label(rule.scope), status]
+        if rule.globs:
+            extra_parts.append(f"glob={rule.globs}")
         rule_entries.append(
             CatalogEntry(
                 kind="rule",
                 id=rule.rule_id,
                 description=rule.description,
                 path=format_catalog_path(workspace, rule.source_path, rule.scope),
-                recommended=True,
-                extra=f"{scope_label(rule.scope)};{extra}" if extra else scope_label(rule.scope),
+                recommended=status in ("always", "forced", "glob-hit"),
+                extra=";".join(extra_parts),
             )
         )
     return skill_entries, rule_entries
@@ -239,15 +223,19 @@ def build_session_manifest_payload(
         anchor_file = conversation_anchor_json_path(workspace, thread_id)
         if anchor_file.is_file():
             anchor = _rel_workspace_path(workspace, anchor_file)
+    messages_file = session_messages_path(workspace, thread_id)
+    messages_path: str | None = None
+    if messages_file.is_file():
+        messages_path = str(messages_file.resolve())
     return {
         "version": _MANIFEST_VERSION,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "thread_id": thread_id,
         "manifest_path": manifest_rel,
         "archive_path": archive,
+        "messages_path": messages_path,
         "anchor_path": anchor,
         "spill_dir": spill_dir or ".llgraph/context/tool-results",
-        "auto_match_skills": session.auto_match_skills,
         "active_skills_manual": list(session.active_skills),
         "skills": [
             {
@@ -336,6 +324,9 @@ def build_session_manifest_message_content(
     archive = payload.get("archive_path")
     if archive:
         parts.append(f"对话归档: `{archive}`（可用 search_session_history / read_file）")
+    messages = payload.get("messages_path")
+    if messages:
+        parts.append(f"会话落盘: `{messages}`（search_session_history 优先；勿 cat 全文件）")
     anchor = payload.get("anchor_path")
     if anchor:
         parts.append(f"结构化锚点: `{anchor}`")
@@ -347,9 +338,18 @@ def build_session_manifest_message_content(
     skills_sec = _format_catalog_section("技能目录（Skills）", skill_entries)
     if skills_sec:
         parts.append(skills_sec)
-    rules_sec = _format_catalog_section("本回合适用规则（Rules）", rule_entries)
+    rules_sec = _format_catalog_section("规则目录（Rules）", rule_entries)
     if rules_sec:
         parts.append(rules_sec)
+    parts.append("## 文档目录\n")
+    parts.append(
+        "新业务梳理落盘: `docs/`（工作区 `docs/{业务域}/`、各仓 `{repo}/docs/`）；"
+        "tmp 模式（不覆盖）时工作区与各仓**全部**写 `{原名}.tmp.md`，即使该仓原先无 doc。"
+    )
+    parts.append(
+        "历史参考（只读，禁止落盘）: `markdowns/`（按需 list_directory / read_file；不内联索引正文）"
+    )
+    parts.append("")
     parts.append("</session-manifest>")
     return "\n".join(parts).strip()
 

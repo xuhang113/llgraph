@@ -1,114 +1,40 @@
-"""按 Rule / Skill 目录 + 文档索引组装每轮注入的上下文块（正文按需 read_file）。"""
+"""按 Rule / Skill 目录 + 文档索引组装上下文（目录在 session-manifest；此处仅每轮 ephemeral 提示）。"""
 
 from pathlib import Path
 
 from llgraph.context.context_session import ContextSession
-from llgraph.cli.markdowns_index import build_markdowns_index
+from llgraph.config.catalog_paths import format_catalog_path, scope_label
 from llgraph.loaders.rules_loader import (
     RuleEntry,
     discover_rules,
     glob_matches_message,
     select_rules_for_turn,
 )
-from llgraph.config.catalog_paths import format_catalog_path, scope_label
-from llgraph.session.session_manifest import _CATALOG_READ_HINT
-from llgraph.loaders.skills_loader import discover_skills, resolve_active_skills
-
-DEFAULT_CATALOG_MAX_CHARS = 8_000
-DEFAULT_TOTAL_MAX_CHARS = 12_000
+from llgraph.loaders.skills_loader import discover_skills
 
 
-def _truncate(text: str, limit: int, label: str) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 40] + f"\n\n…（{label} 已截断，共 {len(text)} 字符；完整目录见 <session-manifest>）"
-
-
-DEFAULT_SKILL_BODY_MAX_CHARS = 6_000
-
-
-def _format_recommended_skill_bodies(
-    workspace: Path,
-    session: ContextSession,
-    user_message: str,
-) -> str:
+def _format_manual_skill_pin_hint(workspace: Path, session: ContextSession) -> str:
     """
-    本回合 ⭐ 推荐技能的正文（避免 read_file 无法读 ~/.llgraph 时卡住）。
+    /skill 手动启用的技能：仅路径指针，不注入 SKILL.md 正文。
 
     @param workspace 工作区根
     @param session 会话 skill 状态
-    @param user_message 用户消息
-    @return Markdown 块；无推荐时空串
+    @return Markdown 块；无手动启用时空串
     """
-    all_skills = discover_skills(workspace)
-    active = resolve_active_skills(
-        all_skills,
-        session_active=session.active_skills,
-        user_message=user_message,
-        auto_match=session.auto_match_skills,
-    )
-    if not active:
+    if not session.active_skills:
         return ""
-    lines = ["## 本回合推荐技能（正文）", ""]
-    for skill in active:
-        path = format_catalog_path(workspace, skill.skill_dir / "SKILL.md", skill.scope)
-        body = skill.body.strip()
-        if not body:
+    by_name = {s.name.lower(): s for s in discover_skills(workspace)}
+    lines = ["## 本会话已启用技能（/skill）", ""]
+    for name in session.active_skills:
+        skill = by_name.get(name.strip().lower())
+        if skill is None:
+            lines.append(f"- **{name}**（未找到目录，请 /skill list）")
             continue
-        lines.append(f"### {skill.name}")
-        lines.append(f"- 路径: `{path}`")
-        lines.append("")
-        lines.append(body)
-        lines.append("")
-    text = "\n".join(lines).strip()
-    if not text:
-        return ""
-    return _truncate(text, DEFAULT_SKILL_BODY_MAX_CHARS, "推荐技能正文")
-
-
-def _format_skill_catalog(workspace: Path, session: ContextSession, user_message: str) -> str:
-    """技能目录：全量列出，⭐ 标记本回合推荐。"""
-    all_skills = discover_skills(workspace)
-    if not all_skills:
-        return ""
-    recommended = {
-        s.name.lower()
-        for s in resolve_active_skills(
-            all_skills,
-            session_active=session.active_skills,
-            user_message=user_message,
-            auto_match=session.auto_match_skills,
-        )
-    }
-    lines = ["## 技能目录（Skills）", "", _CATALOG_READ_HINT, ""]
-    for skill in all_skills:
-        flag = "⭐ " if skill.name.lower() in recommended else ""
         path = format_catalog_path(workspace, skill.skill_dir / "SKILL.md", skill.scope)
         origin = scope_label(skill.scope)
-        lines.append(f"- {flag}**{skill.name}** [{origin}]: {skill.description}")
-        lines.append(f"  - 路径: `{path}`")
+        lines.append(f"- **{skill.name}** [{origin}]: {skill.description}")
+        lines.append(f"  - 路径: `{path}`（需要时用 read_file 读取正文）")
     lines.append("")
-    return "\n".join(lines)
-
-
-def _format_rule_catalog(
-    workspace: Path,
-    active_rules: list[RuleEntry],
-    session: ContextSession,
-    user_message: str,
-) -> str:
-    """本回合适用规则目录（仅路径+描述）。"""
-    if not active_rules:
-        return ""
-    lines = ["## 本回合适用规则（Rules）", ""]
-    for rule in active_rules:
-        path = format_catalog_path(workspace, rule.source_path, rule.scope)
-        origin = scope_label(rule.scope)
-        lines.append(f"- **[{rule.rule_id}]** [{origin}] {rule.description}")
-        lines.append(f"  - 路径: `{path}`")
-        if rule.globs and not rule.always_apply:
-            lines.append(f"  - glob: {rule.globs}")
-        lines.append("")
     return "\n".join(lines).strip()
 
 
@@ -116,43 +42,24 @@ def build_workspace_context_block(
     workspace: Path,
     session: ContextSession,
     user_message: str,
-    *,
-    catalog_max_chars: int = DEFAULT_CATALOG_MAX_CHARS,
-    total_max_chars: int = DEFAULT_TOTAL_MAX_CHARS,
 ) -> str:
     """
-    构建每轮拼入用户消息前的 <workspace-context>（Skill/Rule 仅目录，不含正文）。
+    构建每轮拼入用户消息前的 <workspace-context>（仅 ephemeral 提示）。
+
+    Skills/Rules 全量目录与简介在置顶 <session-manifest>；模型按需 read_file。
+    不自动匹配 skill、不注入 SKILL.md 正文（对齐 Cursor 目录 + 按需读取）。
 
     @param workspace 工作区根
     @param session 会话 rule/skill 状态
-    @param user_message 当前用户消息（glob 规则匹配、技能推荐）
+    @param user_message 当前用户消息（保留参数供 /context 等调用方）
     @return 上下文 Markdown，可为空
     """
+    _ = user_message
     sections: list[str] = []
 
-    skill_catalog = _format_skill_catalog(workspace, session, user_message)
-    if skill_catalog:
-        sections.append(_truncate(skill_catalog.strip(), catalog_max_chars, "Skills 目录"))
-
-    skill_bodies = _format_recommended_skill_bodies(workspace, session, user_message)
-    if skill_bodies:
-        sections.append(skill_bodies)
-
-    all_rules = discover_rules(workspace)
-    active_rules = select_rules_for_turn(
-        all_rules,
-        user_message=user_message,
-        session_disabled=session.disabled_rules,
-        session_forced=session.forced_rules,
-    )
-    rule_catalog = _format_rule_catalog(workspace, active_rules, session, user_message)
-    if rule_catalog:
-        sections.append(_truncate(rule_catalog, catalog_max_chars, "Rules 目录"))
-
-    if session.include_markdowns_index:
-        index = build_markdowns_index(workspace)
-        if index:
-            sections.append(index)
+    manual_hint = _format_manual_skill_pin_hint(workspace, session)
+    if manual_hint:
+        sections.append(manual_hint)
 
     hint = session.write_failure_hint.strip()
     if hint:
@@ -160,10 +67,7 @@ def build_workspace_context_block(
 
     if not sections:
         return ""
-
-    body = "\n\n".join(sections)
-    body = _truncate(body, total_max_chars, "workspace-context")
-    return body
+    return "\n\n".join(sections)
 
 
 def wrap_user_message_with_context(user_message: str, context_block: str) -> str:
@@ -222,7 +126,7 @@ def format_rules_list(workspace: Path, session: ContextSession, user_message: st
         lines.append(f"      路径: {path}")
     lines.append("")
     lines.append("命令: /rule list | /rule on <id> | /rule off <id> | /rule reset")
-    lines.append("正文请 read_file 上述路径，不会自动注入对话。")
+    lines.append("全量规则目录见 <session-manifest>；正文 read_file，不会自动注入对话。")
     return "\n".join(lines)
 
 

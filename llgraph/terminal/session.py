@@ -10,16 +10,16 @@ from typing import Any
 from llgraph.context.context_session import ContextSession
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.display.trace_display import TraceSession
-from llgraph.ui.banner import print_terminal_session_banner
-from llgraph.ui.keys import MSG_GOODBYE, MSG_INTERRUPT_EXIT, is_exit_command
-from llgraph.ui.output import emit, emit_error, emit_milestone, emit_ok, emit_warn, write_dialog_line
-from llgraph.ui.sink import StdoutTraceSink
+from llgraph.terminal.banner import print_terminal_session_banner
+from llgraph.terminal.keys import MSG_GOODBYE, MSG_INTERRUPT_EXIT, is_exit_command
+from llgraph.terminal.output import emit, emit_error, emit_milestone, emit_ok, emit_warn, write_dialog_line
+from llgraph.display.trace_sink import StdoutTraceSink
 from llgraph.core.write_failure_tracker import WriteFailureTracker
 
 
 @dataclass
 class TerminalSessionParams:
-    """终端会话参数（与 TuiSessionParams 对齐）。"""
+    """终端会话参数。"""
 
     agent: Any
     workspace: Path
@@ -37,6 +37,7 @@ class TerminalSessionParams:
     memory_kind: str = ""
     opening_message: str | None = None
     single_turn: bool = False
+    with_memory: bool = True
 
 
 def _active_thread_id(params: TerminalSessionParams) -> str:
@@ -95,7 +96,7 @@ def _run_turn(params: TerminalSessionParams, user_input: str) -> str | None:
             user_input,
             workspace_root=params.workspace,
             thread_id=_active_thread_id(params),
-            with_memory=True,
+            with_memory=params.with_memory,
             trace_session=params.trace_session,
             context_session=params.context_session,
             write_failure_tracker=wft,
@@ -188,7 +189,7 @@ def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
     from llgraph.commands.meta_commands import is_registered_meta_command
 
     if is_registered_meta_command(text, params.workspace):
-        from llgraph.ui.style import sty
+        from llgraph.terminal.style import sty
 
         preview = text.split("\n", 1)[0]
         emit(sty(f"❯ {preview}", "prompt"))
@@ -199,22 +200,7 @@ def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
             emit_warn(f"未知命令 {preview}，输入 /help 查看。")
         return True
 
-    effective = text
-    ctx = params.context_session
-    if ctx is not None:
-        from llgraph.survey.survey_prompt import maybe_preflight_survey_for_user_message
-
-        preflight = maybe_preflight_survey_for_user_message(
-            text,
-            preflight_done=ctx.organize_preflight_done,
-            workspace=params.workspace,
-            context_session=ctx,
-        )
-        if preflight is not None:
-            effective, ctx.organize_preflight_done = preflight
-            write_dialog_line(f"（确认后） {effective}")
-
-    reply = _run_turn(params, effective)
+    reply = _run_turn(params, text)
     if reply is None:
         return True
     if params.agent_session is not None:

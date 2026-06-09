@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "bindWriteMode": true,
+  "autoEnableOnReadonly": true,
+  "mode": "workspace_readwrite",
+  "network": "deny",
+  "additionalReadonlyPaths": [],
+  "additionalReadwritePaths": [],
+  "allowTmpWrite": true
+}

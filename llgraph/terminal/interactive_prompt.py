@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import sys
 
-from llgraph.ui.output import emit
-from llgraph.ui.style import sty
+from llgraph.terminal.redraw import redraw_tty_block, reset_tty_redraw_slot
+from llgraph.terminal.output import emit
+from llgraph.terminal.menu_option import MenuOption
+from llgraph.terminal.style import sty
 
 _ANSI_HIDE_CURSOR = "\033[?25l"
 _ANSI_SHOW_CURSOR = "\033[?25h"

@@ -23,9 +23,12 @@ def create_code_index_tools(workspace_root: Path) -> list:
         path_prefix: str = ".",
     ) -> str:
         """
-        按语义在工作区代码索引中检索（需先 llgraph index）。
+        语义向量检索（需先 llgraph index）。用于自然语言描述、业务概念、脚本职责反查代码。
 
-        @param query 自然语言或概念描述
+        适用：不知道精确类名/文件名，问「XX 定时任务在哪实现」「谁同步 OA 组织」等。
+        不适用：已知精确符号请用 grep_files。
+
+        @param query 自然语言或概念描述（可含中英文、服务名、业务词）
         @param top_k 返回条数，默认 15
         @param path_prefix 限定相对子目录，默认 .
         """
@@ -44,11 +47,14 @@ def create_code_index_tools(workspace_root: Path) -> list:
         path_prefix: str = ".",
     ) -> str:
         """
-        Hybrid 检索：ripgrep 字面匹配 + 向量语义，RRF 融合（推荐）。
+        Hybrid 检索（索引已启用时**首选**）：路径/文件名 + 内容 grep + 向量语义，RRF 融合。
 
-        @param query 问题、类名、错误信息或概念描述
+        已内聚 search_files 的路径匹配能力；找 crontab 脚本、Java Job、Python 实现时直接用本工具，
+        勿再单独调用 search_files。
+
+        @param query 脚本名、业务描述、类名、错误信息或概念（可中英文组合）
         @param top_k 最终返回条数，默认 10
-        @param path_prefix 限定相对子目录
+        @param path_prefix 限定相对子目录，如 queryplatform-backend-service
         """
         return search_hybrid(
             root,

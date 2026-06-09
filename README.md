@@ -17,6 +17,21 @@
 ## 环境
 
 - Python **3.12+**
+- **[ripgrep](https://github.com/BurntSushi/ripgrep)**（`rg` 命令，需在 PATH 中）— `glob_files` / `grep_files` 及 hybrid 检索的 grep 路依赖它；未安装时会降级为慢速 Python 遍历，且 `glob_files` 不可用
+
+```bash
+# macOS (Homebrew)
+brew install ripgrep
+
+# Debian / Ubuntu
+sudo apt install ripgrep
+
+# Fedora / RHEL
+sudo dnf install ripgrep
+
+# 验证
+which rg && rg --version
+```
 
 ## 配置 API 凭据
 
@@ -145,7 +160,7 @@ llgraph -C <工作区> --purge-sessions --including-current   # 全量删除
 
 | 能力 | 说明 |
 |------|------|
-| **文件工具** | `read_file`、`grep_files`、`search_workspace`；沙箱在工作区内 |
+| **文件工具** | `glob_files`、`grep_files`（ripgrep）、`read_file`、`search_workspace`；沙箱在工作区内 |
 | **代码索引** | `llgraph index` + `search_code_hybrid`（RRF） |
 | **Rules / Skills** | `.llgraph` + `~/.llgraph` 双源，个人优先；`/rule`、`/skill` |
 | **局部改代码** | `-w`：`search_replace`、`write_file`；`/changes`、`/undo` |

@@ -254,6 +254,9 @@ def run_index(
         sync_files=len(manifest),
         sync_complete=not hit_file_cap,
     )
+    from llgraph.code_index.store import record_index_suffixes
+
+    record_index_suffixes(workspace)
     emit(
         f"同步结束: 遍历 {files_scanned} 文件, 写入/更新 {files_updated}, "
         f"跳过 {files_skipped}, chunks {chunks_written}"
@@ -371,6 +374,9 @@ def run_index_paths(
         vector_dim=vector_dim,
         sync_files=len(manifest),
     )
+    from llgraph.code_index.store import record_index_suffixes
+
+    record_index_suffixes(workspace)
     if files_updated:
         emit(
             f"watch 增量: 处理 {files_scanned} 路径, 更新 {files_updated}, "

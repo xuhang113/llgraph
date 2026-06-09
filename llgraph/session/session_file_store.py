@@ -128,6 +128,37 @@ def restore_session_to_agent(
     return len(messages)
 
 
+def prepare_resumable_agent_session(
+    agent: Any,
+    workspace: Path,
+    thread_id: str,
+    context_session: ContextSession,
+    *,
+    user_message: str = "",
+) -> int:
+    """
+    非交互/交互续聊前：刷新 manifest 并从 messages.jsonl 恢复到 Agent 状态。
+
+    @param agent LangGraph agent
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @param context_session Rule/Skill 会话
+    @param user_message 当前用户消息（manifest 目录用）
+    @return 恢复的消息条数；无历史为 0
+    """
+    from llgraph.session.session_manifest import sync_session_manifest_to_agent_state
+
+    sync_session_manifest_to_agent_state(
+        agent,
+        thread_id=thread_id,
+        workspace=workspace,
+        session=context_session,
+        user_message=user_message,
+        with_memory=True,
+    )
+    return restore_session_to_agent(agent, workspace, thread_id)
+
+
 def persist_agent_session(
     agent: Any,
     workspace: Path,

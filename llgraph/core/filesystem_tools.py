@@ -1,6 +1,5 @@
 """工作区文件检索、读写的 LangChain 工具（工厂方法按只读/可写模式注册）。"""
 
-import fnmatch
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -11,6 +10,10 @@ from llgraph.config.catalog_paths import resolve_catalog_read_path
 from llgraph.survey.edit_confirm import EditConfirmGate
 from llgraph.config.edit_settings import resolve_edit_settings
 from llgraph.cli.search_terms import build_search_terms
+from llgraph.code_index.index_ready import code_index_is_ready
+from llgraph.code_index.path_hits import match_paths_by_keyword
+from llgraph.core.ripgrep_search import ripgrep_available, ripgrep_content, ripgrep_files
+from llgraph.core.text_file_types import is_probably_text_path, read_path_rejection_reason
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.core.write_failure_tracker import WriteFailureTracker
 from llgraph.core.workspace import (
@@ -24,21 +27,208 @@ from llgraph.core.workspace import (
 # 多词检索时每个词最多贡献的文件名匹配数
 _MAX_MATCHES_PER_TERM = 40
 
-# 参与内容检索的文本扩展名
-_TEXT_SUFFIXES = frozenset({
-    ".py", ".java", ".kt", ".go", ".rs", ".js", ".ts", ".tsx", ".jsx",
-    ".md", ".txt", ".yaml", ".yml", ".json", ".xml", ".properties",
-    ".sql", ".sh", ".zsh", ".toml", ".ini", ".cfg", ".html", ".css",
-    ".vue", ".gradle", ".pom", ".mdc",
-})
+# path 超过该深度且 glob 未命中时，尝试扩大到仓库根（第一段路径）再搜一次
+_AUTO_WIDEN_PATH_MIN_DEPTH = 3
+
+# 单次 batch 读取上限
+_MAX_BATCH_READ_FILES = 8
+_MAX_BATCH_READ_TOTAL_BYTES = 400_000
 
 
-def _is_probably_text(path: Path) -> bool:
-    if path.suffix.lower() in _TEXT_SUFFIXES:
-        return True
-    if path.name in ("Dockerfile", "Makefile", "Jenkinsfile", ".gitignore"):
-        return True
-    return path.suffix == ""
+def _normalize_path_prefix(path: str) -> str:
+    """规范化相对工作区的 path 前缀。"""
+    raw = (path or ".").strip().strip("/")
+    return raw if raw else "."
+
+
+def _repo_root_prefix(path: str) -> str:
+    """
+    取相对路径的第一段（通常为仓库目录名）。
+
+    @param path 相对工作区 path
+    @return 第一段或 .
+    """
+    norm = _normalize_path_prefix(path)
+    if norm == ".":
+        return "."
+    return norm.split("/")[0]
+
+
+def _path_depth(path: str) -> int:
+    """相对 path 的目录深度（. 为 0）。"""
+    norm = _normalize_path_prefix(path)
+    if norm == ".":
+        return 0
+    return len(norm.split("/"))
+
+
+def _glob_pattern_has_package_segments(glob_pattern: str) -> bool:
+    """glob 是否含包路径片段（不仅是末尾 **/*.ext）。"""
+    pattern = (glob_pattern or "").strip()
+    if "/" not in pattern:
+        return False
+    trimmed = pattern.replace("**/", "").replace("**\\", "").strip("/")
+    return "/" in trimmed
+
+
+def _format_path_scope_hint(path: str, *, glob_pattern: str = "") -> str:
+    """
+    glob/grep 未命中时的 path 作用域说明与纠正建议。
+
+    @param path 当前搜索根
+    @param glob_pattern 可选 glob，用于判断是否跨包搜索
+    @return 多行提示
+    """
+    lines = [
+        f"说明: 仅在 path={path!r} 的**子树**内搜索，不包含兄弟目录。",
+        'path 相对工作区根，无 cwd；**禁止** path 含 "../"。',
+    ]
+    root = _repo_root_prefix(path)
+    if _glob_pattern_has_package_segments(glob_pattern) or _path_depth(path) >= 4:
+        lines.append(
+            f"若 glob/关键词指向其它 feature 包，请改用 path=\".\" 或 path=\"{root}\"，"
+            "不要沿用 list_directory 后的深层 path。"
+        )
+    return "\n".join(lines)
+
+
+def _format_empty_glob_message(
+    path: str,
+    glob_pattern: str,
+    *,
+    index_ready: bool,
+) -> str:
+    """
+    glob 0 命中时的完整提示。
+
+    @param path 搜索根
+    @param glob_pattern glob 模式
+    @param index_ready 索引是否就绪
+    @return 工具返回文案
+    """
+    scope = _format_path_scope_hint(path, glob_pattern=glob_pattern)
+    if index_ready:
+        next_tools = "grep_files(pattern=...) 或 search_code_hybrid(query=...)"
+    else:
+        next_tools = "grep_files、search_files 或 search_workspace"
+    return (
+        f"未找到匹配文件: glob={glob_pattern!r} path={path!r}。\n"
+        f"{scope}\n"
+        "也可能源文件不在工作区（仅 markdowns/docs/远程路径引用）。\n"
+        f"请换更宽的 path 后重试，或改用 {next_tools}。\n"
+        "禁止同 path 重复 glob。"
+    )
+
+
+def _format_empty_grep_message(
+    path: str,
+    pattern: str,
+    *,
+    index_ready: bool,
+) -> str:
+    """
+    grep 0 命中时的完整提示。
+
+    @param path 搜索根
+    @param pattern 搜索模式
+    @param index_ready 索引是否就绪
+    @return 工具返回文案
+    """
+    scope = _format_path_scope_hint(path)
+    if index_ready:
+        tail = "可改用 search_code_hybrid(query=...) 做语义检索。"
+    else:
+        tail = "可扩大 path=\".\" 或换 search_workspace。"
+    return (
+        f"未找到匹配内容: pattern={pattern!r} path={path!r}。\n"
+        f"{scope}\n"
+        f"{tail}\n"
+        "禁止同 path 重复 grep；须换更宽的 path 或换工具。"
+    )
+
+
+def _reject_unsafe_relative_path(path: str) -> str | None:
+    """
+    禁止 read/glob 使用含 ../ 的相对路径（无 cwd，易越界或猜错）。
+
+    @param path 用户传入路径
+    @return 错误文案；合法则 None
+    """
+    raw = (path or "").strip()
+    if not raw:
+        return "path 不能为空"
+    if raw == ".":
+        return None
+    normalized = raw.replace("\\", "/")
+    if normalized.startswith("../") or "/../" in normalized or normalized.endswith("/.."):
+        return (
+            f"路径非法: {path!r}（禁止 ../；请使用 search_code_hybrid/glob_files "
+            "返回的完整相对路径，勿拼接猜测）。"
+        )
+    return None
+
+
+def _read_file_content(
+    ctx: WorkspaceContext,
+    path: str,
+    *,
+    start_line: int = 1,
+    end_line: int = 0,
+) -> tuple[str | None, str | None]:
+    """
+    读取单个文件并格式化为带行号正文。
+
+    @param ctx 工作区上下文
+    @param path 文件路径
+    @param start_line 起始行
+    @param end_line 结束行，0 表示到末尾
+    @return (正文, 错误文案)；成功时错误为 None
+    """
+    unsafe = _reject_unsafe_relative_path(path)
+    if unsafe:
+        return None, unsafe
+    try:
+        target = resolve_catalog_read_path(
+            ctx.root, path, sandbox=ctx.sandbox_policy
+        )
+    except ValueError as exc:
+        return None, str(exc)
+    if not target.is_file():
+        return None, f"文件不存在: {path}"
+
+    read_reject = read_path_rejection_reason(target, ctx.root)
+    if read_reject:
+        return None, read_reject
+
+    size = target.stat().st_size
+    if size > MAX_READ_BYTES:
+        return None, (
+            f"文件过大 ({size} 字节)，上限 {MAX_READ_BYTES}。"
+            "请用 start_line/end_line 分段读取，或缩小范围。"
+        )
+
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return None, f"读取失败: {exc}"
+
+    lines = text.splitlines()
+    if len(lines) == 0:
+        return (
+            f"--- {path} (空文件，0 行) ---\n"
+            "（文件存在但无内容；请改读 src/ 下业务源码或其它非空文件。）",
+            None,
+        )
+
+    start = max(1, start_line)
+    end = len(lines) if end_line <= 0 else min(end_line, len(lines))
+    if start > len(lines):
+        return None, f"文件共 {len(lines)} 行，start_line 超出范围。"
+
+    selected = lines[start - 1 : end]
+    header = f"--- {path} (行 {start}-{end} / 共 {len(lines)} 行) ---\n"
+    body = "\n".join(f"{start + i}| {line}" for i, line in enumerate(selected))
+    return header + body, None
 
 
 SEARCH_REPLACE_TOOL_DESC = (
@@ -202,7 +392,10 @@ def create_filesystem_tools(
 
     def list_directory(path: str = ".") -> str:
         """
-        列出目录下的文件和子目录（相对工作区路径）。
+        列出目录下的文件和子目录（相对工作区路径；**列目录首选，勿用 run_shell_command ls**）。
+
+        对齐 Cursor 目录浏览：自动跳过 node_modules 等；单次最多 200 项。
+        示例：path=\"docs\"、path=\".llgraph/context/tool-results\"
 
         @param path 相对工作区的目录路径，默认 .
         """
@@ -239,52 +432,81 @@ def create_filesystem_tools(
         glob_pattern: str,
         limit: int,
     ) -> list[str]:
-        """
-        按关键字匹配路径：先扫工作区顶层目录（monorepo 项目名），再深度遍历文件。
-        """
-        matches: list[str] = []
-        seen: set[str] = set()
-        base = ctx.resolve_path(path)
+        """按关键字匹配路径（委托 path_hits 模块）。"""
+        return match_paths_by_keyword(
+            ctx,
+            keyword_lower,
+            path,
+            glob_pattern,
+            limit,
+        )
 
-        def add(rel: str) -> bool:
-            if rel in seen:
-                return len(matches) >= limit
-            if glob_pattern and glob_pattern not in ("**/*", "*"):
-                name = Path(rel.rstrip("/")).name
-                if not fnmatch.fnmatch(name, glob_pattern.lstrip("**/")):
-                    if not fnmatch.fnmatch(rel, glob_pattern):
-                        return len(matches) >= limit
-            seen.add(rel)
-            matches.append(rel)
-            return len(matches) >= limit
+    index_ready = code_index_is_ready(ctx.root)
+    skip_dirs = ctx._extra_skip_dirs
 
-        if keyword_lower and base.is_dir():
-            try:
-                entries = sorted(
-                    base.iterdir(),
-                    key=lambda p: (not p.is_dir(), p.name.lower()),
+    def glob_files(
+        glob_pattern: str,
+        path: str = ".",
+    ) -> str:
+        """
+        按 glob 快速列出工作区文件（ripgrep --files）。
+
+        path 是**搜索根（子树边界）**，相对工作区根，无 cwd；只在 path 子树内匹配，不含兄弟目录。
+        默认 path=\".\" 或 \"<仓库名>\"；**禁止** path 含 \"../\"；**禁止**沿用 list_directory 深层 path
+        去 glob 其它 feature 包（如 path=.../activity 却 glob **/basic/**）。
+
+        示例：glob_pattern=\"**/collect_alert.sh\", path=\".\"；
+        glob_pattern=\"**/infra/dao/*.java\", path=\"auth-api\"
+
+        @param glob_pattern 路径/文件名 glob，如 **/*.sh
+        @param path 搜索根相对目录，默认 .（全工作区）
+        """
+        if not ripgrep_available():
+            return (
+                "错误: 未安装 ripgrep (rg)。请安装后重试，或改用 search_files / search_code_hybrid。"
+            )
+        paths, err = ripgrep_files(
+            ctx.root,
+            glob_pattern,
+            path_prefix=path,
+            limit=MAX_SEARCH_RESULTS,
+            skip_dirs=skip_dirs,
+        )
+        if err:
+            return f"glob_files 失败: {err}"
+        if not paths:
+            norm_path = _normalize_path_prefix(path)
+            wider = _repo_root_prefix(path)
+            if (
+                wider != "."
+                and wider != norm_path
+                and _path_depth(path) >= _AUTO_WIDEN_PATH_MIN_DEPTH
+            ):
+                wider_paths, widen_err = ripgrep_files(
+                    ctx.root,
+                    glob_pattern,
+                    path_prefix=wider,
+                    limit=MAX_SEARCH_RESULTS,
+                    skip_dirs=skip_dirs,
                 )
-            except OSError:
-                entries = []
-            for entry in entries:
-                if entry.is_dir() and ctx.should_skip_dir(entry.name):
-                    continue
-                try:
-                    rel = entry.relative_to(ctx.root).as_posix()
-                except ValueError:
-                    continue
-                if entry.is_dir():
-                    rel = f"{rel}/"
-                if keyword_lower in rel.lower():
-                    if add(rel):
-                        return matches
-
-        for rel in ctx.iter_files(path):
-            if keyword_lower and keyword_lower not in rel.lower():
-                continue
-            if add(rel):
-                return matches
-        return matches
+                if widen_err:
+                    return f"glob_files 失败: {widen_err}"
+                if wider_paths:
+                    return (
+                        f"在 path={path!r} 下未命中；已自动扩大到 path={wider!r}，"
+                        f"找到 {len(wider_paths)} 个文件:\n"
+                        + "\n".join(wider_paths)
+                        + "\n\n"
+                        + _format_path_scope_hint(path, glob_pattern=glob_pattern)
+                        + "\n下次请直接使用更宽的 path，避免先窄后扩。"
+                    )
+            return _format_empty_glob_message(
+                path, glob_pattern, index_ready=index_ready
+            )
+        return (
+            f"匹配 {len(paths)} 个文件（glob={glob_pattern}, path={path}）:\n"
+            + "\n".join(paths)
+        )
 
     def search_files(
         keyword: str,
@@ -292,7 +514,9 @@ def create_filesystem_tools(
         glob_pattern: str = "**/*",
     ) -> str:
         """
-        按单个关键字在文件名/路径中查找（不读内容）。多词或业务主题请用 search_workspace。
+        按单个关键字在文件名/路径中查找（不读内容）。
+
+        本工作区已向量化索引时**不注册此工具**；请用 search_code_hybrid（已含路径匹配）。
 
         @param keyword 一个关键字（不区分大小写）
         @param path 起始相对目录，默认 .
@@ -306,7 +530,7 @@ def create_filesystem_tools(
             MAX_SEARCH_RESULTS,
         )
         if not matches:
-            return "未找到匹配文件。建议改用 search_workspace 并填写 topic/keywords。"
+            return "未找到匹配文件（路径/文件名）。"
         return "匹配文件（相对工作区）:\n" + "\n".join(matches)
 
     def search_workspace(
@@ -318,6 +542,7 @@ def create_filesystem_tools(
         """
         多关键词并集检索工作区（文件名 + 可选内容 grep）。
 
+        索引已启用时请用 search_code_hybrid，勿用本工具做探索性检索。
         同义词、英文路径、项目缩写等须由你在 keywords 中一次给出多个（5～12 个为宜），
         工具不做业务词典映射。topic 仅作补充切分（整句、去「业务/服务」等后缀、提取英文词）。
 
@@ -375,6 +600,7 @@ def create_filesystem_tools(
         if not all_paths:
             lines.append("（无文件名匹配，尝试 include_content 或补充 keywords）")
 
+        content_hits: list[str] = []
         if include_content and terms:
             # 内容检索：多词 OR，限制单次上限
             escaped = [re.escape(t) for t in terms if t.strip()]
@@ -385,10 +611,9 @@ def create_filesystem_tools(
                 except re.error:
                     regex = re.compile(re.escape(terms[0]), re.IGNORECASE)
 
-                content_hits: list[str] = []
                 for rel in ctx.iter_files(path):
                     full = ctx.resolve_path(rel)
-                    if not full.is_file() or not _is_probably_text(full):
+                    if not full.is_file() or not is_probably_text_path(full, ctx.root):
                         continue
                     try:
                         if full.stat().st_size > MAX_READ_BYTES:
@@ -422,12 +647,36 @@ def create_filesystem_tools(
         file_glob: str = "",
     ) -> str:
         """
-        在工作区文本文件中搜索内容（正则或普通子串）。
+        在工作区文本文件中搜索内容（ripgrep）。
 
-        @param pattern 搜索模式（按正则解析；失败则按子串）
-        @param path 起始相对目录
-        @param file_glob 可选，限制文件名，如 *.java
+        path 是**搜索根（子树边界）**，相对工作区根，无 cwd；只在 path 子树内匹配。
+        跨模块/跨 feature 搜索时用 path=\".\" 或 \"<仓库名>\"；**禁止** path 含 \"../\"。
+
+        @param pattern 搜索模式（优先正则；非法则按字面量）
+        @param path 搜索根相对目录，默认 .
+        @param file_glob 可选文件名 glob 限制，如 *.md
         """
+        if ripgrep_available():
+            hits, err = ripgrep_content(
+                ctx.root,
+                pattern,
+                path_prefix=path,
+                file_glob=file_glob,
+                limit=MAX_GREP_MATCHES,
+                skip_dirs=skip_dirs,
+            )
+            if err:
+                return f"grep_files 失败: {err}"
+            if not hits:
+                return _format_empty_grep_message(
+                    path, pattern, index_ready=index_ready
+                )
+            header = "匹配结果（ripgrep）:\n" if len(hits) >= MAX_GREP_MATCHES else "匹配结果:\n"
+            if len(hits) >= MAX_GREP_MATCHES:
+                header = "匹配结果（已达上限）:\n"
+            return header + "\n".join(hits)
+
+        # 无 rg 时降级：Python 逐文件（仅小目录）
         try:
             regex = re.compile(pattern)
         except re.error:
@@ -436,7 +685,7 @@ def create_filesystem_tools(
         results: list[str] = []
         for rel in ctx.iter_files(path, name_glob=file_glob or None):
             full = ctx.resolve_path(rel)
-            if not full.is_file() or not _is_probably_text(full):
+            if not full.is_file() or not is_probably_text_path(full, ctx.root):
                 continue
             try:
                 if full.stat().st_size > MAX_READ_BYTES:
@@ -453,11 +702,17 @@ def create_filesystem_tools(
                     results.append(f"{rel}:{line_no}: {snippet}")
                     if len(results) >= MAX_GREP_MATCHES:
                         return (
-                            "匹配结果（已达上限）:\n" + "\n".join(results)
+                            "匹配结果（已达上限，建议安装 ripgrep）:\n"
+                            + "\n".join(results)
                         )
 
         if not results:
-            return "未找到匹配内容。"
+            if index_ready:
+                return (
+                    _format_empty_grep_message(path, pattern, index_ready=True)
+                    + "（未安装 rg，遍历范围受限；建议安装 ripgrep。）"
+                )
+            return _format_empty_grep_message(path, pattern, index_ready=False)
         return "匹配结果:\n" + "\n".join(results)
 
     def read_file(
@@ -466,45 +721,86 @@ def create_filesystem_tools(
         end_line: int = 0,
     ) -> str:
         """
-        读取文本文件（可指定行号范围）。
+        读取单个文本文件（可指定行号范围）。
 
-        path 可为工作区相对路径，或目录中给出的 ~/.llgraph/skills|rules 绝对路径。
+        已知**多个**完整路径时**优先 read_files 一次批量读**，减少 I/O 与 ReAct 轮次，
+        勿逐个 read_file 各占一轮。
+
+        path 可为工作区相对路径，或 ~/.llgraph/skills|rules 绝对路径；**禁止**含 ../。
+        仅读源码/配置/文档；**不支持** lib/、target/、.so/.jar 等库与二进制文件。
 
         @param path 文件路径
         @param start_line 起始行号，从 1 开始
         @param end_line 结束行号（含）；0 表示读到文件末尾
         """
-        try:
-            target = resolve_catalog_read_path(
-                ctx.root, path, sandbox=ctx.sandbox_policy
-            )
-        except ValueError as exc:
-            return str(exc)
-        if not target.is_file():
-            return f"文件不存在: {path}"
+        body, err = _read_file_content(
+            ctx, path, start_line=start_line, end_line=end_line
+        )
+        if err:
+            return err
+        return body or ""
 
-        size = target.stat().st_size
-        if size > MAX_READ_BYTES:
+    def read_files(
+        paths: list[str],
+        start_line: int = 1,
+        end_line: int = 0,
+    ) -> str:
+        """
+        一次批量读取多个文件（对齐 Cursor：规划后一次取数，减少 I/O 与 ReAct 轮次）。
+
+        适用：search_code_hybrid / glob_files / grep_files 已给出多个**完整相对路径**，
+        需要对比或梳理多个类/模块时。**能批量就批量**，单次最多 8 个路径；**禁止** path 含 ../。
+        结果全文进上下文（不落盘 spill）；超大文件请 read_file 分段。
+
+        @param paths 工作区相对路径列表（完整路径，从检索结果复制）
+        @param start_line 每个文件的起始行号，从 1 开始
+        @param end_line 每个文件的结束行号（含）；0 表示到末尾
+        """
+        if not paths:
+            return "paths 不能为空"
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw in paths:
+            p = (raw or "").strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            cleaned.append(p)
+        if not cleaned:
+            return "paths 无有效路径"
+        if len(cleaned) > _MAX_BATCH_READ_FILES:
             return (
-                f"文件过大 ({size} 字节)，上限 {MAX_READ_BYTES}。"
-                "请用 start_line/end_line 分段读取，或缩小范围。"
+                f"一次最多读取 {_MAX_BATCH_READ_FILES} 个文件（当前 {len(cleaned)} 个）。"
+                "请分批调用 read_files，或对大文件用 start_line/end_line。"
             )
 
-        try:
-            text = target.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            return f"读取失败: {exc}"
+        blocks: list[str] = []
+        errors: list[str] = []
+        total_bytes = 0
+        for path in cleaned:
+            body, err = _read_file_content(
+                ctx, path, start_line=start_line, end_line=end_line
+            )
+            if err:
+                errors.append(f"[失败] {path}: {err}")
+                continue
+            if body:
+                total_bytes += len(body.encode("utf-8", errors="replace"))
+                if total_bytes > _MAX_BATCH_READ_TOTAL_BYTES:
+                    errors.append(
+                        f"[截断] 批量读取总输出已超过 {_MAX_BATCH_READ_TOTAL_BYTES} 字节上限；"
+                        f"已读 {len(blocks)} 个文件，剩余未读。请减少 paths 或使用 start_line/end_line。"
+                    )
+                    break
+                blocks.append(body)
 
-        lines = text.splitlines()
-        start = max(1, start_line)
-        end = len(lines) if end_line <= 0 else min(end_line, len(lines))
-        if start > len(lines):
-            return f"文件共 {len(lines)} 行，start_line 超出范围。"
-
-        selected = lines[start - 1 : end]
-        header = f"--- {path} (行 {start}-{end} / 共 {len(lines)} 行) ---\n"
-        body = "\n".join(f"{start + i}| {line}" for i, line in enumerate(selected))
-        return header + body
+        if not blocks and errors:
+            return "批量读取全部失败:\n" + "\n".join(errors)
+        header = f"批量读取 {len(blocks)}/{len(cleaned)} 个文件:\n\n"
+        out = header + "\n\n".join(blocks)
+        if errors:
+            out += "\n\n--- 部分失败 ---\n" + "\n".join(errors)
+        return out
 
     def write_file(path: str, content: str = "") -> str:
         """
@@ -638,15 +934,25 @@ def create_filesystem_tools(
             description=list_directory.__doc__ or "",
         ),
         StructuredTool.from_function(
+            func=glob_files,
+            name="glob_files",
+            description=glob_files.__doc__ or "",
+        ),
+        StructuredTool.from_function(
             func=search_workspace,
             name="search_workspace",
             description=search_workspace.__doc__ or "",
         ),
-        StructuredTool.from_function(
-            func=search_files,
-            name="search_files",
-            description=search_files.__doc__ or "",
-        ),
+    ]
+    if not index_ready:
+        tools.append(
+            StructuredTool.from_function(
+                func=search_files,
+                name="search_files",
+                description=search_files.__doc__ or "",
+            ),
+        )
+    tools.extend([
         StructuredTool.from_function(
             func=grep_files,
             name="grep_files",
@@ -657,7 +963,12 @@ def create_filesystem_tools(
             name="read_file",
             description=read_file.__doc__ or "",
         ),
-    ]
+        StructuredTool.from_function(
+            func=read_files,
+            name="read_files",
+            description=read_files.__doc__ or "",
+        ),
+    ])
 
     if ctx.allow_write:
         tools.extend([

@@ -308,3 +308,17 @@ def touch_index_meta(
     if sync_complete is not None:
         meta["sync_complete"] = sync_complete
     _save_meta(workspace, meta)
+
+
+def record_index_suffixes(workspace: Path) -> None:
+    """
+    将当前 embedding.json 中的索引后缀写入 index_meta.json（便于排查与对齐）。
+
+    @param workspace 工作区根
+    """
+    from llgraph.core.text_file_types import resolve_grep_suffixes, resolve_index_suffixes
+
+    meta = _load_meta(workspace)
+    meta["include_suffixes"] = list(resolve_index_suffixes(workspace))
+    meta["grep_include_suffixes"] = list(resolve_grep_suffixes(workspace))
+    _save_meta(workspace, meta)

@@ -73,7 +73,7 @@ def parse_trace_mode(name: str) -> TraceMode | None:
     return aliases.get(key)
 
 
-from llgraph.ui.style import indent_line, sty, sty_sgr as _c
+from llgraph.terminal.style import indent_line, sty, sty_sgr as _c
 
 _TRACE_L1 = indent_line(1)
 _TRACE_L2 = indent_line(2)
@@ -122,6 +122,30 @@ def _format_tool_args(args: Any, *, verbose: bool = False) -> str:
     return raw
 
 
+_PATH_TRACE_MAX_LEN = 48
+
+
+def _short_path_for_trace(path_text: str, *, max_len: int = _PATH_TRACE_MAX_LEN) -> str:
+    """
+    Trace 摘要中的 path 缩短：保留仓库名前缀 + 末段，避免 …/b 与 ../b 混淆。
+
+    @param path_text 完整 path
+    @param max_len 超过则缩短
+    @return 缩短后的 path
+    """
+    text = path_text.strip()
+    if len(text) <= max_len:
+        return text
+    normalized = text.replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    if not parts:
+        return text[: max_len - 1] + "…"
+    name = parts[-1]
+    if len(parts) >= 2:
+        return f"{parts[0]}/…/{name}"
+    return f"…/{name}"
+
+
 def _short_tool_target(args: Any) -> str:
     """
     工具调用摘要中的关键参数（路径、查询等）。
@@ -136,10 +160,10 @@ def _short_tool_target(args: Any) -> str:
         if not isinstance(val, str) or not val.strip():
             continue
         text = val.strip()
-        if key == "path" and len(text) > 48:
-            name = Path(text).name
-            if name:
-                return f"…/{name}"
+        if key == "path" and len(text) > _PATH_TRACE_MAX_LEN:
+            shortened = _short_path_for_trace(text)
+            if shortened:
+                return shortened
         if len(text) > 48:
             return text[:45] + "…"
         return text
@@ -180,36 +204,19 @@ def _format_turn_skills_line(
     user_message: str,
 ) -> str:
     """
-    本回合生效技能一行摘要（/skill 会话启用 或 消息自动匹配）。
+    本回合 /skill 手动启用技能一行摘要。
 
     @param workspace 工作区根
     @param context_session Rule/Skill 会话状态
-    @param user_message 用户消息（自动匹配用）
-    @return 如 ⭐ 本回合技能: tracking（自动）；无则空串
+    @param user_message 保留参数（自动匹配已默认关闭）
+    @return 如 ⭐ 本回合技能: tracking（/skill）；无则空串
     """
     if workspace is None or context_session is None:
         return ""
-    from llgraph.loaders.skills_loader import discover_skills, resolve_active_skills
-
-    all_skills = discover_skills(workspace)
-    active = resolve_active_skills(
-        all_skills,
-        session_active=context_session.active_skills,
-        user_message=user_message,
-        auto_match=context_session.auto_match_skills,
-    )
-    if not active:
+    if not context_session.active_skills:
         return ""
-    session_pinned = {s.lower() for s in context_session.active_skills}
-    labels: list[str] = []
-    for skill in active:
-        key = skill.name.lower()
-        if key in session_pinned:
-            origin = "会话启用"
-        else:
-            origin = "自动"
-        labels.append(f"{skill.name}（{origin}）")
-    return "⭐ 本回合技能: " + ", ".join(labels)
+    labels = [f"{name}（/skill）" for name in context_session.active_skills]
+    return "⭐ 本会话技能: " + ", ".join(labels)
 
 
 def _short_tool_target(args: Any) -> str:
@@ -226,10 +233,10 @@ def _short_tool_target(args: Any) -> str:
         if not isinstance(val, str) or not val.strip():
             continue
         text = val.strip()
-        if key == "path" and len(text) > 44:
-            name = Path(text).name
-            if name:
-                return f"…/{name}"
+        if key == "path" and len(text) > _PATH_TRACE_MAX_LEN:
+            shortened = _short_path_for_trace(text)
+            if shortened:
+                return shortened
         if len(text) > 44:
             return text[:41] + "…"
         return text
@@ -450,7 +457,7 @@ def _trace_sink_is_terminal(session: TraceSession) -> bool:
 
 def _trace_line(session: TraceSession, text: str) -> None:
     """
-    输出一行到 trace sink（终端保留 ANSI，TUI 剥离后写入 RichLog）。
+    输出一行到 trace sink（终端保留 ANSI）。
 
     @param session 追踪会话
     @param text 文本
@@ -458,12 +465,12 @@ def _trace_line(session: TraceSession, text: str) -> None:
     sink = session.trace_sink
     payload = text
     if sink is not None and not getattr(sink, "preserves_ansi", False):
-        from llgraph.ui.sink import strip_ansi
+        from llgraph.display.trace_sink import strip_ansi
 
         payload = strip_ansi(text)
     if sink is None:
-        from llgraph.ui.style import color_enabled
-        from llgraph.ui.terminal_theme import _has_ansi, colorize_terminal_text
+        from llgraph.terminal.style import color_enabled
+        from llgraph.terminal.terminal_theme import _has_ansi, colorize_terminal_text
 
         if color_enabled() and payload.strip() and not _has_ansi(payload):
             payload = colorize_terminal_text(payload)
@@ -474,20 +481,19 @@ def _trace_line(session: TraceSession, text: str) -> None:
 
 def _step_expand_hint(session: TraceSession, step_id: int) -> str:
     """
-    步骤行末尾展开提示（终端与 TUI 文案不同）。
+    步骤行末尾展开提示。
 
     @param session 追踪会话
     @param step_id 步骤编号
     @return 带 ANSI 的提示片段
     """
-    if _trace_sink_is_terminal(session):
-        return _c(f"  · /trace step {step_id}", "90")
-    return _c("  · 点击左侧步骤展开", "90")
+    del session
+    return _c(f"  · /trace step {step_id}", "90")
 
 
 def _trace_stream(session: TraceSession, text: str) -> None:
     """
-    流式输出到 TUI sink。
+    流式输出到 trace sink。
 
     @param session 追踪会话
     @param text 文本块
@@ -535,6 +541,7 @@ class TurnTracePrinter:
         self._step_start = time.perf_counter()
         self._step_index = 0
         self._final_text: str = ""
+        self._last_thinking_text: str = ""
         self._printed_final_header = False
         self._streamed_reply = False
         self._tool_names: list[str] = []
@@ -815,6 +822,11 @@ class TurnTracePrinter:
             self._final_text = text
             if self._session.shows_process() and not self._session.is_verbose():
                 self._emit_final_reply_block(text)
+        elif not tool_calls and not text:
+            # 最终轮 thinking-only：暂存，on_turn_end 无正文时降级展示
+            thinking_only = _extract_thinking_from_message_chunk(last)
+            if thinking_only:
+                self._last_thinking_text = thinking_only
 
         self._step_start = time.perf_counter()
 
@@ -975,6 +987,19 @@ class TurnTracePrinter:
                 self._line(_c(hint, "90"))
         from llgraph.survey.survey_prompt import strip_survey_for_display
 
+        if not self._final_text.strip() and self._last_thinking_text.strip():
+            fallback = self._last_thinking_text.strip()
+            wrapped = (
+                "（模型未输出可见正文，以下为 thinking 降级展示）\n\n"
+                + fallback
+            )
+            self._final_text = wrapped
+            if (
+                not self._session.is_silent()
+                and not self._printed_final_header
+            ):
+                self._emit_final_reply_block(wrapped)
+
         raw = self._final_text.strip()
         display = strip_survey_for_display(self._final_text).strip()
         self._session.last_turn_raw_reply = raw
@@ -1114,6 +1139,35 @@ def _extract_text_from_message_chunk(chunk: Any) -> str:
             if isinstance(block, dict) and block.get("type") == "text":
                 parts.append(str(block.get("text", "")))
         return "".join(parts)
+    return ""
+
+
+def _extract_thinking_from_message_chunk(chunk: Any) -> str:
+    """从流式 chunk 提取 thinking 文本（仅作正文为空时的降级展示）。"""
+    content = getattr(chunk, "content", None)
+    extra = getattr(chunk, "additional_kwargs", None) or {}
+    meta = extra.get("llgraph") if isinstance(extra, dict) else None
+    if isinstance(meta, dict):
+        stored = meta.get("thinking_text")
+        if isinstance(stored, str) and stored.strip():
+            return stored.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = str(block.get("type", "")).lower()
+            if kind not in ("thinking", "reasoning", "reasoning_text", "redacted_thinking"):
+                continue
+            text = (
+                block.get("thinking")
+                or block.get("reasoning")
+                or block.get("text")
+                or block.get("data")
+            )
+            if text:
+                parts.append(str(text))
+        return "\n".join(parts).strip()
     return ""
 
 
@@ -1295,6 +1349,22 @@ def stream_agent_turn(
                     if write_failure_tracker is not None:
                         write_failure_tracker.inspect_tool_messages(messages)
                     printer.on_tools_update(messages)
+                    if with_memory and ws_path is not None:
+                        from llgraph.context.context_compressor import (
+                            format_compress_report,
+                            maybe_compress_during_react,
+                        )
+                        from llgraph.terminal.ops_notice import ops_notice
+
+                        react_compress = maybe_compress_during_react(
+                            agent,
+                            thread_id=thread_id,
+                            workspace=ws_path,
+                        )
+                        if react_compress is not None:
+                            ops_notice(
+                                "ReAct 中途压缩: " + format_compress_report(react_compress)
+                            )
 
         elif mode == "messages" and isinstance(payload, tuple) and len(payload) == 2:
             msg_chunk, metadata = payload
@@ -1303,6 +1373,9 @@ def stream_agent_turn(
                 continue
             if isinstance(msg_chunk, (AIMessage, AIMessageChunk)):
                 printer.absorb_usage_from_chunk(msg_chunk)
+            thinking = _extract_thinking_from_message_chunk(msg_chunk)
+            if thinking:
+                printer._last_thinking_text = thinking
             if getattr(msg_chunk, "tool_calls", None) or []:
                 streaming_reply = False
                 continue

@@ -7,8 +7,8 @@ import sys
 from llgraph.survey.survey_prompt import SurveySpec, SurveyQuestion
 from llgraph.terminal.interactive_prompt import prompt_menu_tty
 from llgraph.terminal.redraw import redraw_tty_block, reset_tty_redraw_slot
-from llgraph.ui.prompts import MenuOption
-from llgraph.ui.style import color_enabled, sty
+from llgraph.terminal.menu_option import MenuOption
+from llgraph.terminal.style import color_enabled, sty
 
 # --- TTY 控制（ANSI 转义序列，见 ECMA-48 / xterm DECSCUSR）---
 # 向导在原地重绘菜单时隐藏光标，避免光标停在中间一行闪烁；结束或输入补充说明时再显示。
@@ -18,7 +18,7 @@ _ANSI_SHOW_CURSOR = "\033[?25h"  # DECSCUSR: 显示文本光标
 # redraw_tty_block 的槽位 id：与 trace、其它菜单的 "default" 槽位分开，各自记录「上一帧占几行」。
 _SURVEY_SLOT = "llgraph_survey"
 
-# --- 按键 raw 读入后的返回值（与 TUI SurveyModal 的 Binding 对齐）---
+# --- 按键 raw 读入后的返回值 ---
 _KEY_ESC = "\x1b"           # Esc 单独按下
 _KEY_ENTER = "\r"           # Enter（raw 模式下也可能是 \n）
 _KEY_TAB = "\t"             # Tab → 下一题
@@ -26,6 +26,28 @@ _KEY_SHIFT_TAB = "\x1b[Z"   # Shift+Tab → 上一题
 _KEY_ARROW_UP = "\x1b[A"
 _KEY_ARROW_DOWN = "\x1b[B"
 _KEY_ARROW_LEFT = "\x1b[D"
+_KEY_SPACE = " "
+
+
+def _is_select_all_option(option: str) -> bool:
+    """选项是否为「全部」类快捷项。"""
+    text = option.strip()
+    return text == "全部" or text.startswith("全部（") or text.startswith("全部(")
+
+
+def _format_multi_answer(question: SurveyQuestion, picked_indices: set[int]) -> str:
+    """
+    多选答案序列化。
+
+    @param question 题目
+    @param picked_indices 选中下标集合
+    @return 答案字符串
+    """
+    if not picked_indices:
+        return ""
+    ordered = sorted(picked_indices)
+    labels = [question.options[idx] for idx in ordered]
+    return "、".join(labels)
 _KEY_ARROW_RIGHT = "\x1b[C"
 
 
@@ -81,7 +103,7 @@ def _step_label(question: SurveyQuestion, idx: int) -> str:
 
 
 def _tab_current(text: str) -> str:
-    """当前步骤 Tab：粗体 + 反色（1;7;36），模拟 TUI 的 [bold reverse]。"""
+    """当前步骤 Tab：粗体 + 反色（1;7;36）。"""
     if not color_enabled():
         return text
     return f"\033[1;7;36m{text}\033[0m"
@@ -133,6 +155,7 @@ def _render_survey_frame(
     *,
     step: int,
     selections: list[int],
+    multi_selections: list[set[int]],
     answers: dict[str, str],
     option_index: int,
 ) -> str:
@@ -171,22 +194,37 @@ def _render_survey_frame(
     lines.append(sty(question.prompt, "label"))
     lines.append("")
     hints = getattr(question, "option_hints", None)
+    picked_multi = multi_selections[step] if step < len(multi_selections) else set()
     for idx, opt in enumerate(question.options):
-        mark = sty("›", "brand") if idx == option_index else " "
-        label = sty(opt, "brand") if idx == option_index else sty(opt, "value")
-        if "推荐" in opt and idx != option_index:
-            label = sty(opt, "ok")
+        if question.multi_select:
+            box = sty("☑", "ok") if idx in picked_multi else sty("☐", "dim")
+            cursor = sty("›", "brand") if idx == option_index else " "
+            label = sty(opt, "brand") if idx == option_index else sty(opt, "value")
+            if "推荐" in opt and idx != option_index:
+                label = sty(opt, "ok")
+        else:
+            box = ""
+            cursor = sty("›", "brand") if idx == option_index else " "
+            label = sty(opt, "brand") if idx == option_index else sty(opt, "value")
+            if "推荐" in opt and idx != option_index:
+                label = sty(opt, "ok")
         hint = ""
         if isinstance(hints, tuple) and idx < len(hints) and hints[idx]:
             hint = sty(f"  ({hints[idx]})", "hint")
-        lines.append(f" {mark} {label}{hint}")
+        prefix = f" {cursor} {box} " if question.multi_select else f" {cursor} "
+        lines.append(f"{prefix}{label}{hint}")
     lines.append("")
-    lines.append(
-        sty(
-            "Enter 确认/下一题 · Tab/→ 下一题 · ←/Shift+Tab 上一题 · ↑↓ 移动 · Esc 取消",
-            "hint",
-        ),
-    )
+    if question.multi_select:
+        footer = (
+            "Space 勾选/取消 · Enter 确认/下一题 · Tab/→ 下一题 · "
+            "←/Shift+Tab 上一题 · ↑↓ 移动 · Esc 取消"
+        )
+    else:
+        footer = (
+            "Enter 确认/下一题 · Tab/→ 下一题 · ←/Shift+Tab 上一题 · "
+            "↑↓ 移动 · Esc 取消"
+        )
+    lines.append(sty(footer, "hint"))
     return "\n".join(lines)
 
 
@@ -194,6 +232,7 @@ def _commit_step(
     spec: SurveySpec,
     step: int,
     selections: list[int],
+    multi_selections: list[set[int]],
     answers: dict[str, str],
 ) -> None:
     """
@@ -202,13 +241,45 @@ def _commit_step(
     @param spec 问卷
     @param step 步骤下标
     @param selections 各题选中下标
+    @param multi_selections 各题多选集合
     @param answers 答案 dict（就地更新）
     """
     if step >= len(spec.questions):
         return
     question = spec.questions[step]
+    if question.multi_select:
+        answers[question.question_id] = _format_multi_answer(
+            question,
+            multi_selections[step],
+        )
+        return
     picked = selections[step]
     answers[question.question_id] = question.options[picked]
+
+
+def _toggle_multi_selection(question: SurveyQuestion, picked: set[int], idx: int) -> None:
+    """
+    切换多选勾选项；「全部」与其它项互斥。
+
+    @param question 题目
+    @param picked 当前选中集合（就地更新）
+    @param idx 选项下标
+    """
+    option = question.options[idx]
+    if _is_select_all_option(option):
+        if idx in picked:
+            picked.clear()
+        else:
+            picked.clear()
+            picked.add(idx)
+        return
+    if idx in picked:
+        picked.discard(idx)
+        return
+    for other_idx, other in enumerate(question.options):
+        if other_idx in picked and _is_select_all_option(other):
+            picked.discard(other_idx)
+    picked.add(idx)
 
 
 def _maybe_free_text(question: SurveyQuestion, choice: str) -> str:
@@ -223,14 +294,17 @@ def _maybe_free_text(question: SurveyQuestion, choice: str) -> str:
         return choice
     if "其他" not in choice and "手动" not in choice:
         return choice
-    # 需要用户打字：先退出原地重绘并恢复光标，否则看不见 input 光标
-    reset_tty_redraw_slot(_SURVEY_SLOT)
+    # 需要用户打字：恢复光标；勿 reset slot，否则下一帧无法擦除本屏
+    sys.stdout.write("\n")
     sys.stdout.write(_ANSI_SHOW_CURSOR)
     sys.stdout.flush()
     try:
         extra = input(sty("补充说明（可回车跳过）: ", "hint")).strip()
     except EOFError:
         return choice
+    finally:
+        sys.stdout.write(_ANSI_HIDE_CURSOR)
+        sys.stdout.flush()
     if extra:
         return f"{choice}：{extra}"
     return choice
@@ -250,6 +324,15 @@ def _run_survey_wizard_tty(spec: SurveySpec) -> dict[str, str] | None:
         return _run_survey_linear_fallback(spec)
 
     selections = [q.default_index for q in spec.questions]
+    multi_selections: list[set[int]] = []
+    for question in spec.questions:
+        if question.multi_select:
+            if question.default_indices:
+                multi_selections.append(set(question.default_indices))
+            else:
+                multi_selections.append(set())
+        else:
+            multi_selections.append(set())
     answers: dict[str, str] = {}
     step = 0  # 0..total-1 为题目，total 为 Submit 汇总屏
     option_index = selections[0]
@@ -267,6 +350,7 @@ def _run_survey_wizard_tty(spec: SurveySpec) -> dict[str, str] | None:
                 spec,
                 step=step,
                 selections=selections,
+                multi_selections=multi_selections,
                 answers=answers,
                 option_index=option_index,
             )
@@ -282,12 +366,23 @@ def _run_survey_wizard_tty(spec: SurveySpec) -> dict[str, str] | None:
                     # Submit 屏：补齐未 Tab 跳过的题，再返回
                     for idx, question in enumerate(spec.questions):
                         if question.question_id not in answers:
-                            _commit_step(spec, idx, selections, answers)
+                            _commit_step(
+                                spec,
+                                idx,
+                                selections,
+                                multi_selections,
+                                answers,
+                            )
                     reset_tty_redraw_slot(slot)
                     return dict(answers)
                 question = spec.questions[step]
-                selections[step] = option_index
-                choice = question.options[option_index]
+                if question.multi_select:
+                    if not multi_selections[step]:
+                        continue
+                    choice = _format_multi_answer(question, multi_selections[step])
+                else:
+                    selections[step] = option_index
+                    choice = question.options[option_index]
                 choice = _maybe_free_text(question, choice)
                 answers[question.question_id] = choice
                 step = min(step + 1, total)
@@ -297,7 +392,16 @@ def _run_survey_wizard_tty(spec: SurveySpec) -> dict[str, str] | None:
             if key in (_KEY_TAB, _KEY_ARROW_RIGHT):
                 # 下一题：暂存当前选项（不触发「其他」补充输入）
                 if step < total:
-                    _commit_step(spec, step, selections, answers)
+                    question = spec.questions[step]
+                    if question.multi_select and not multi_selections[step]:
+                        continue
+                    _commit_step(
+                        spec,
+                        step,
+                        selections,
+                        multi_selections,
+                        answers,
+                    )
                 step = min(step + 1, total)
                 if step < total:
                     option_index = selections[step]
@@ -313,10 +417,17 @@ def _run_survey_wizard_tty(spec: SurveySpec) -> dict[str, str] | None:
                 continue
             if step < total:
                 opt_count = len(spec.questions[step].options)
+                question = spec.questions[step]
                 if key == _KEY_ARROW_UP:
                     option_index = (option_index - 1) % opt_count
                 elif key == _KEY_ARROW_DOWN:
                     option_index = (option_index + 1) % opt_count
+                elif key == _KEY_SPACE and question.multi_select:
+                    _toggle_multi_selection(
+                        question,
+                        multi_selections[step],
+                        option_index,
+                    )
     finally:
         # 无论确认、取消还是异常，都要恢复光标
         sys.stdout.write(_ANSI_SHOW_CURSOR)

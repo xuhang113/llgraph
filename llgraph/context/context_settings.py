@@ -25,6 +25,7 @@ class ContextSettings:
     tool_result_preview_lines: int
     spill_dir: str
     spill_enabled: bool
+    spill_exempt_tools: tuple[str, ...]
     budget_source: str
     context_model_id: str
     context_fallback_max_tokens: int
@@ -34,6 +35,9 @@ class ContextSettings:
     session_history_search_enabled: bool
     session_history_search_top_k: int
     dispatch_keep_user_turns: int
+    compress_strategy: str
+    compress_during_react: bool
+    compress_summary_chunk_chars: int
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,24 @@ class SpillSettings:
     tool_result_max_chars: int
     tool_result_preview_lines: int
     spill_dir: str
+    spill_exempt_tools: tuple[str, ...]
+
+
+_DEFAULT_SPILL_EXEMPT_TOOLS = ("read_file", "read_files")
+
+
+def _parse_spill_exempt_tools(ctx: dict) -> tuple[str, ...]:
+    """
+    解析不参与落盘的工具名列表。
+
+    @param ctx agent.json context 段
+    @return 工具名元组
+    """
+    raw = ctx.get("spill_exempt_tools", list(_DEFAULT_SPILL_EXEMPT_TOOLS))
+    if not isinstance(raw, list):
+        return _DEFAULT_SPILL_EXEMPT_TOOLS
+    names = tuple(str(item).strip() for item in raw if str(item).strip())
+    return names if names else _DEFAULT_SPILL_EXEMPT_TOOLS
 
 
 def resolve_context_settings(workspace: Path) -> ContextSettings:
@@ -98,13 +120,23 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         )
         effective_source = "model"
 
-    ratio = ctx.get("auto_compress_ratio", 0.65)
+    strategy_raw = ctx.get("compress_strategy", "cursor")
+    if isinstance(strategy_raw, str):
+        compress_strategy = strategy_raw.strip().lower()
+    else:
+        compress_strategy = "cursor"
+    if compress_strategy not in ("cursor", "legacy"):
+        compress_strategy = "cursor"
+
+    default_ratio = 0.85 if compress_strategy == "cursor" else 0.65
+    ratio = ctx.get("auto_compress_ratio", default_ratio)
     try:
         ratio = min(0.95, max(0.4, float(ratio)))
     except (TypeError, ValueError):
-        ratio = 0.65
+        ratio = default_ratio
 
-    keep = ctx.get("keep_recent_turns", 4)
+    default_keep = 1 if compress_strategy == "cursor" else 4
+    keep = ctx.get("keep_recent_turns", default_keep)
     try:
         keep = max(2, int(keep))
     except (TypeError, ValueError):
@@ -123,11 +155,11 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     if isinstance(archive, str):
         archive = archive.strip().lower() not in ("0", "false", "no")
 
-    max_tool_chars = ctx.get("tool_result_max_chars", 10_000)
+    max_tool_chars = ctx.get("tool_result_max_chars", 40_000)
     try:
         max_tool_chars = max(500, int(max_tool_chars))
     except (TypeError, ValueError):
-        max_tool_chars = 10_000
+        max_tool_chars = 40_000
 
     preview_lines = ctx.get("tool_result_preview_lines", 40)
     try:
@@ -142,6 +174,8 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     spill_on = ctx.get("spill_enabled", True)
     if isinstance(spill_on, str):
         spill_on = spill_on.strip().lower() not in ("0", "false", "no")
+
+    spill_exempt_tools = _parse_spill_exempt_tools(ctx)
 
     retrieval_on = ctx.get("compress_retrieval_enabled", True)
     if isinstance(retrieval_on, str):
@@ -187,11 +221,24 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     except (TypeError, ValueError):
         history_top_k = 8
 
-    dispatch_keep = ctx.get("dispatch_keep_user_turns", 4)
+    default_dispatch_keep = 2 if compress_strategy == "cursor" else 4
+    dispatch_keep = ctx.get("dispatch_keep_user_turns", default_dispatch_keep)
     try:
         dispatch_keep = max(0, min(32, int(dispatch_keep)))
     except (TypeError, ValueError):
-        dispatch_keep = 4
+        dispatch_keep = default_dispatch_keep
+
+    during_react = ctx.get("compress_during_react", compress_strategy == "cursor")
+    if isinstance(during_react, str):
+        compress_during_react = during_react.strip().lower() not in ("0", "false", "no")
+    else:
+        compress_during_react = bool(during_react)
+
+    chunk_raw = ctx.get("compress_summary_chunk_chars", 120_000)
+    try:
+        compress_summary_chunk_chars = max(20_000, int(chunk_raw))
+    except (TypeError, ValueError):
+        compress_summary_chunk_chars = 120_000
 
     return ContextSettings(
         max_tokens_estimate=max_tokens,
@@ -207,6 +254,7 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         tool_result_preview_lines=preview_lines,
         spill_dir=spill_dir,
         spill_enabled=bool(spill_on),
+        spill_exempt_tools=spill_exempt_tools,
         budget_source=effective_source,
         context_model_id=model_id,
         context_fallback_max_tokens=context_fallback,
@@ -216,6 +264,9 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         session_history_search_enabled=bool(history_search_on),
         session_history_search_top_k=history_top_k,
         dispatch_keep_user_turns=dispatch_keep,
+        compress_strategy=compress_strategy,
+        compress_during_react=compress_during_react,
+        compress_summary_chunk_chars=compress_summary_chunk_chars,
     )
 
 
@@ -232,4 +283,5 @@ def resolve_spill_settings(workspace: Path) -> SpillSettings:
         tool_result_max_chars=ctx.tool_result_max_chars,
         tool_result_preview_lines=ctx.tool_result_preview_lines,
         spill_dir=ctx.spill_dir,
+        spill_exempt_tools=ctx.spill_exempt_tools,
     )

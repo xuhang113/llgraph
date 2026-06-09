@@ -17,11 +17,11 @@ def load_manifest(workspace: Path) -> dict[str, str]:
     if not path.is_file():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
         files = data.get("files", {})
         if isinstance(files, dict):
             return {str(k): str(v) for k, v in files.items()}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeError):
         pass
     return {}
 

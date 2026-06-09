@@ -104,6 +104,28 @@ def resolve_model_context_window(
     return fallback, "fallback"
 
 
+def format_context_window_label(tokens: int | None) -> str:
+    """
+    将 context 上限格式化为简短可读标签（用于 /model 列表等）。
+
+    @param tokens token 数
+    @return 如 262K、1M；None 或无效时返回空串
+    """
+    if tokens is None or tokens <= 0:
+        return ""
+    if tokens >= 1_000_000:
+        whole = tokens // 1_000_000
+        if tokens % 1_000_000 == 0:
+            return f"{whole}M"
+        return f"{tokens / 1_000_000:.1f}M"
+    if tokens >= 1000:
+        whole = tokens // 1000
+        if tokens % 1000 == 0:
+            return f"{whole}K"
+        return f"{tokens / 1000:.0f}K"
+    return str(tokens)
+
+
 def format_context_budget_note(
     workspace: Path,
     *,

@@ -88,3 +88,82 @@ def split_messages_for_compress(
     to_compress = list(messages[:split_index])
     to_keep = list(messages[split_index:])
     return to_compress, to_keep
+
+
+def _last_human_index(messages: list[BaseMessage]) -> int:
+    """
+    最后一条 HumanMessage 下标；无则 -1。
+
+    @param messages 消息列表
+    @return 下标
+    """
+    last = -1
+    for i, msg in enumerate(messages):
+        if isinstance(msg, HumanMessage):
+            last = i
+    return last
+
+
+def split_messages_cursor_style(
+    messages: list[BaseMessage],
+    *,
+    preserve_current_turn: bool,
+) -> tuple[list[BaseMessage], list[BaseMessage]]:
+    """
+    Cursor 对齐切分：摘要由 LLM 生成，不做固定轮数 tail 裁剪。
+
+    - preserve_current_turn=False（用户新消息前）：远早对话全部进摘要，换窗后仅 manifest+anchor
+    - preserve_current_turn=True（ReAct 中途）：保留当前 user 轮（含完整 tool 链），更早进摘要
+
+    @param messages 待切分消息（已去掉置顶 manifest/anchor）
+    @param preserve_current_turn 是否保留当前 user 轮
+    @return (to_compress, to_keep)
+    """
+    if not messages:
+        return [], []
+
+    if not preserve_current_turn:
+        return list(messages), []
+
+    last_human = _last_human_index(messages)
+    if last_human <= 0:
+        return [], list(messages)
+
+    to_compress = list(messages[:last_human])
+    to_keep = list(messages[last_human:])
+    if not to_compress:
+        return [], list(messages)
+    return to_compress, to_keep
+
+
+def split_messages_for_compress_strategy(
+    messages: list[BaseMessage],
+    *,
+    strategy: str,
+    preserve_current_turn: bool,
+    token_budget: int,
+    min_user_turns: int,
+    estimate_tokens,
+) -> tuple[list[BaseMessage], list[BaseMessage]]:
+    """
+    按压缩策略切分消息。
+
+    @param messages 待切分消息
+    @param strategy cursor | legacy
+    @param preserve_current_turn cursor 策略下是否保留当前 user 轮
+    @param token_budget legacy 保留段 token 上限
+    @param min_user_turns legacy 至少保留 user 轮数
+    @param estimate_tokens token 估算函数
+    @return (to_compress, to_keep)
+    """
+    if strategy == "cursor":
+        return split_messages_cursor_style(
+            messages,
+            preserve_current_turn=preserve_current_turn,
+        )
+    return split_messages_for_compress(
+        messages,
+        token_budget=token_budget,
+        min_user_turns=min_user_turns,
+        estimate_tokens=estimate_tokens,
+    )

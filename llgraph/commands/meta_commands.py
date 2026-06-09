@@ -20,7 +20,7 @@ from llgraph.display.trace_display import (
     print_trace_step_list,
     set_trace_step_tokens,
 )
-from llgraph.ui.output import emit, emit_error, emit_ok, emit_report, emit_warn
+from llgraph.terminal.output import emit, emit_error, emit_ok, emit_report, emit_warn
 
 
 def _print_trace_stats(
@@ -256,7 +256,7 @@ def _handle_survey_command(
     context_session: ContextSession | None = None,
 ) -> bool:
     """
-    处理 /survey：off|on|status 或打开确认向导。
+    处理 /survey：off | on | status（无固定问卷向导）。
 
     @param line 用户输入
     @param workspace 工作区根
@@ -266,7 +266,6 @@ def _handle_survey_command(
     """
     from llgraph.config.survey_settings import (
         format_survey_status,
-        survey_command_enabled,
         survey_interactive_enabled,
     )
 
@@ -302,47 +301,11 @@ def _handle_survey_command(
         emit_report(format_survey_status(workspace, context_session))
         return True
 
-    if not survey_command_enabled(workspace, context_session):
-        emit_warn(
-            "Survey 已禁用（--no-survey / agent.json survey.enabled=false / /survey off）。"
-        )
-        emit_report(format_survey_status(workspace, context_session))
-        return True
-
-    from llgraph.survey.survey_prompt import (
-        default_project_organize_survey,
-        format_survey_answers_for_agent,
-        run_survey_interactive,
+    emit_warn(
+        "无固定问卷。确认须由 Agent 在回复末尾输出 <<<llgraph-survey>>> JSON；"
+        "可用 /survey on|off|status 控制 followup 渲染。"
     )
-
-    spec = default_project_organize_survey()
-    answers = run_survey_interactive(spec)
-    if answers is None:
-        return True
-    payload = format_survey_answers_for_agent(answers)
-    emit("\n--- 确认结果 ---\n", colorize=True)
-    emit(payload, colorize=True)
-    if agent_session is None:
-        emit("\n（无 Agent 会话，请复制以上内容作为下一条消息发送）", colorize=True)
-        return True
-    from llgraph.core.agent import invoke_agent
-
-    try:
-        emit("\n▶ 正在将确认结果提交给 Agent…\n", colorize=True)
-        invoke_agent(
-            agent_session.agent,
-            payload,
-            workspace_root=workspace,
-            thread_id=agent_session.thread_id,
-            with_memory=agent_session.with_memory,
-            trace_session=agent_session.trace_session,
-            context_session=agent_session.context_session,
-            write_failure_tracker=agent_session.write_failure_tracker,
-            context_spill=agent_session.context_spill,
-        )
-        emit()
-    except Exception as exc:
-        emit(f"运行失败: {exc}", colorize=True)
+    emit_report(format_survey_status(workspace, context_session))
     return True
 
 
@@ -458,7 +421,7 @@ def _handle_write_command(
 
     if sub in ("off", "false", "0", "disable", "ro", "readonly"):
         if set_session_write_mode(agent_session, enabled=False, context_session=context_session):
-            emit("已切换为只读模式（禁止写文件；/changes · /undo 仍可用）。", colorize=True)
+            emit("已切换为只读模式（禁止 Agent 写文件；/changes · /undo 仍可用）。", colorize=True)
         else:
             emit("当前已是只读模式。", colorize=True)
         return True
@@ -836,16 +799,14 @@ def _print_skills_usage(workspace: Path, session: ContextSession) -> None:
             origin = scope_label(skill.scope)
             emit(f"  [{active}] {skill.name} [{origin}] — {skill.description}", colorize=True)
     active = ", ".join(session.active_skills) if session.active_skills else "（无）"
-    emit(f"当前启用: {active}", colorize=True)
-    emit("自动匹配: " + ("开" if session.auto_match_skills else "关"), colorize=True)
+    emit(f"当前 /skill 置顶: {active}", colorize=True)
     emit("", colorize=True)
     emit("命令:", colorize=True)
     emit("  /skill              列出技能", colorize=True)
-    emit("  /skill <name>       启用技能（可多次）", colorize=True)
+    emit("  /skill <name>       置顶技能（manifest ⭐，正文 read_file）", colorize=True)
     emit("  /skill off <name>   关闭指定技能", colorize=True)
-    emit("  /skill clear        清空已启用技能", colorize=True)
-    emit("  /skill auto on|off  开关按消息自动匹配", colorize=True)
-    emit("  说明: 仅注入描述+路径，正文须 read_file；会话锚点 <session-manifest>", colorize=True)
+    emit("  /skill clear        清空已置顶技能", colorize=True)
+    emit("  说明: 全量目录在 <session-manifest>；不自动匹配、不注入 SKILL 正文", colorize=True)
 
 
 def handle_meta_command(
@@ -1178,11 +1139,16 @@ def _handle_compress(workspace: Path, agent_session: AgentSessionContext | None)
     if agent_session is None or not agent_session.with_memory:
         emit("当前无会话历史（交互模式默认有 memory；/compress 需多轮对话）。", colorize=True)
         return True
+    from llgraph.context.context_settings import resolve_context_settings
+
+    settings = resolve_context_settings(workspace)
+    preserve = False if settings.compress_strategy == "cursor" else None
     report = apply_compress_to_agent_state(
         agent_session.agent,
         thread_id=agent_session.thread_id,
         workspace=workspace,
         force=True,
+        preserve_current_turn=preserve,
     )
     if report is None:
         emit("无需压缩或消息为空。", colorize=True)
@@ -1378,19 +1344,29 @@ def _handle_undo_command(
     if edit_tracker is None:
         emit("请使用 llgraph -w 启动以启用 /undo。", colorize=True)
         return True
-    if not allow_write:
-        emit("当前为只读模式，无法写回文件。请使用 llgraph -w 启动。", colorize=True)
-        return True
 
     parts = stripped.split(maxsplit=1)
     if len(parts) < 2:
         emit_report(edit_tracker.format_undo_usage())
+        if not allow_write:
+            emit(
+                "说明: 只读模式下可查看与 /undo 还原；Agent 写工具仍禁用。",
+                colorize=True,
+            )
         return True
 
     target = parts[1].strip()
     if not target:
         emit_report(edit_tracker.format_undo_usage())
+        if not allow_write:
+            emit(
+                "说明: 只读模式下可查看与 /undo 还原；Agent 写工具仍禁用。",
+                colorize=True,
+            )
         return True
+
+    if not allow_write:
+        emit("正在只读模式下从快照还原（Agent 写工具仍禁用）…", colorize=True)
 
     if target.lower() == "all":
         results = edit_tracker.restore_all()
@@ -1470,19 +1446,11 @@ def _handle_skill_subcommand(stripped: str, workspace: Path, session: ContextSes
 
     if sub == "clear":
         session.clear_skills()
-        emit("已清空启用的技能", colorize=True)
+        emit("已清空置顶技能", colorize=True)
         return True
 
-    if sub == "auto" and len(parts) >= 3:
-        flag = parts[2].lower()
-        if flag in ("on", "1", "true"):
-            session.auto_match_skills = True
-            emit("已开启技能自动匹配", colorize=True)
-        elif flag in ("off", "0", "false"):
-            session.auto_match_skills = False
-            emit("已关闭技能自动匹配", colorize=True)
-        else:
-            emit("用法: /skill auto on|off", colorize=True)
+    if sub == "auto":
+        emit("已移除 /skill auto；技能全量在 manifest，模型按需 read_file", colorize=True)
         return True
 
     if sub == "off" and len(parts) >= 3:
@@ -1501,5 +1469,5 @@ def _handle_skill_subcommand(stripped: str, workspace: Path, session: ContextSes
         emit(f"未找到技能: {skill_name!r}（见 /skill 列表）", colorize=True)
         return True
     session.activate_skill(known[key])
-    emit(f"已启用技能: {known[key]}（下一条消息起注入）", colorize=True)
+    emit(f"已置顶技能: {known[key]}（下一条消息 manifest ⭐；正文 read_file）", colorize=True)
     return True

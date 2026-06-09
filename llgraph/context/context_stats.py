@@ -13,7 +13,6 @@ from llgraph.core.agent import build_system_prompt
 from llgraph.core.agent_session import AgentSessionContext
 from llgraph.context.context_session import ContextSession
 from llgraph.context.context_settings import resolve_context_settings
-from llgraph.cli.markdowns_index import build_markdowns_index
 from llgraph.context.context_builder import build_workspace_context_block
 from llgraph.core.tools import get_agent_tools
 
@@ -125,31 +124,23 @@ def _measure_catalog_tokens(
     user_message: str,
 ) -> tuple[int, int]:
     """
-    估算下轮 workspace-context 中 Rules / Skills 目录 token（不含正文）。
+    估算下轮 workspace-context 中 ephemeral 提示 token（Skills/Rules 目录在 manifest）。
 
-    @return (rules_tokens, skills_tokens) 粗分；实际为合并块，skills 含全量技能目录
+    @return (rules_tokens, skills_tokens) 粗分；现多为 /skill 指针或写失败 hint
     """
     block = build_workspace_context_block(workspace, session, user_message)
     if not block:
         return 0, 0
     total = estimate_text_tokens(block)
-    if "## 技能目录" in block and "## 本回合" in block:
-        return total // 3, total * 2 // 3
-    if "## 技能目录" in block:
+    if "## 本会话已启用技能" in block:
         return 0, total
-    if "## 本回合" in block:
-        return total, 0
-    return 0, 0
+    return 0, total
 
 
 def _measure_markdowns_tokens(workspace: Path, session: ContextSession) -> int:
-    """估算下轮将注入的文档索引 token。"""
-    if not session.include_markdowns_index:
-        return 0
-    index = build_markdowns_index(workspace)
-    if not index:
-        return 0
-    return estimate_text_tokens(index)
+    """Markdowns 不内联索引，仅 manifest 指针。"""
+    _ = workspace, session
+    return 0
 
 
 def _message_content_chars(msg: BaseMessage) -> int:
@@ -256,7 +247,7 @@ def collect_context_usage(
 
 def _render_bar(ratio: float, width: int = 28) -> str:
     """简易 ASCII 进度条。"""
-    from llgraph.ui.style import color_enabled, sty
+    from llgraph.terminal.style import color_enabled, sty
 
     ratio = max(0.0, min(1.0, ratio))
     filled = int(round(ratio * width))
@@ -284,7 +275,7 @@ def format_context_usage_report(
     @param limit_tokens 展示用上下文上限
     @return 多行文本
     """
-    from llgraph.ui.style import sty
+    from llgraph.terminal.style import sty
 
     settings = resolve_context_settings(workspace)
     limit = limit_tokens or settings.max_tokens_estimate
@@ -344,11 +335,12 @@ def format_context_usage_report(
             ),
             sty(budget_note, "accent"),
             sty(
-                "说明: token 为字符÷3 粗算；Rules/Skills 为下轮用户消息将注入的估算；",
+                "说明: token 为字符÷3 粗算；Skills/Rules 目录在 manifest；"
+                "下轮 workspace-context 仅 /skill 指针等 ephemeral 提示；",
                 "hint",
             ),
             sty(
-                "      历史轮次中已注入的 <workspace-context> 计入 Conversation。",
+                "      历史 human 中旧版 workspace-context 仍计入 Conversation。",
                 "hint",
             ),
             sty(
@@ -388,6 +380,6 @@ def print_context_usage(
         web_search_enabled=web_enabled,
         agent_session=agent_session,
     )
-    from llgraph.ui.output import emit_report
+    from llgraph.terminal.output import emit_report
 
     emit_report(format_context_usage_report(breakdown, workspace=workspace))

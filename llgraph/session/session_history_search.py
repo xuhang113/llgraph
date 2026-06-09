@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,10 @@ from llgraph.session.user_storage import session_messages_path
 
 _EXCERPT_MAX = 900
 _TOOL_EXCERPT_MAX = 500
+_SHELL_QUERY_RE = re.compile(
+    r"(shell|find\b|wc\b|git\b|command|run_shell|工具|命令|历史|刚才|之前|archive|messages\.jsonl)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +36,41 @@ class HistoryHit:
     role: str
     score: int
     excerpt: str
+    source_path: str | None = None
+
+
+def _query_wants_tool_results(query: str) -> bool:
+    """
+    检索 shell/命令/历史类问题时，默认纳入 tool 长输出与 tool_calls。
+
+    @param query 检索问句
+    @return 是否扩展 tool 命中
+    """
+    return bool(_SHELL_QUERY_RE.search(query or ""))
+
+
+def _append_tool_calls_text(parts: list[str], tool_calls: object) -> None:
+    """
+    将 tool_calls 参数拼入可检索正文（shell 命令常在 AI 的 tool_calls 而非 tool 结果里）。
+
+    @param parts 正文片段列表
+    @param tool_calls 消息中的 tool_calls 字段
+    """
+    if not isinstance(tool_calls, list):
+        return
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        name = call.get("name")
+        if not name and isinstance(call.get("function"), dict):
+            name = call["function"].get("name")
+        args = call.get("args")
+        if args is None and isinstance(call.get("function"), dict):
+            args = call["function"].get("arguments")
+        if name:
+            parts.append(f"tool_call:{name}")
+        if args is not None:
+            parts.append(str(args))
 
 
 def _resolve_path(workspace: Path, raw: str | None) -> Path | None:
@@ -92,21 +132,23 @@ def _message_text_from_record(record: dict[str, Any]) -> tuple[str, str]:
     if "role" in record:
         role = str(record.get("role") or "unknown")
         content = record.get("content", "")
+        parts: list[str] = []
         if isinstance(content, list):
-            parts: list[str] = []
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
                     parts.append(str(block.get("text", "")))
                 elif isinstance(block, str):
                     parts.append(block)
-            return role, "".join(parts).strip()
-        return role, str(content or "").strip()
+        elif content:
+            parts.append(str(content))
+        _append_tool_calls_text(parts, record.get("tool_calls"))
+        return role, "\n".join(parts).strip()
 
     if "type" in record and "data" in record:
         data = record.get("data")
         if isinstance(data, dict):
             role = str(record.get("type") or "unknown")
-            parts: list[str] = []
+            parts = []
             content = data.get("content", "")
             if isinstance(content, str) and content.strip():
                 parts.append(content.strip())
@@ -117,6 +159,7 @@ def _message_text_from_record(record: dict[str, Any]) -> tuple[str, str]:
                     thinking = llgraph.get("thinking_text")
                     if isinstance(thinking, str) and thinking.strip():
                         parts.append(thinking.strip())
+            _append_tool_calls_text(parts, data.get("tool_calls"))
             meta = data.get("response_metadata")
             if isinstance(meta, dict):
                 model_name = meta.get("model_name")
@@ -130,8 +173,12 @@ def _message_text_from_record(record: dict[str, Any]) -> tuple[str, str]:
                 m = msgs[0]
                 role = getattr(m, "type", "unknown")
                 content = getattr(m, "content", "")
-                if isinstance(content, str):
-                    return str(role), content.strip()
+                parts = []
+                if isinstance(content, str) and content.strip():
+                    parts.append(content.strip())
+                _append_tool_calls_text(parts, getattr(m, "tool_calls", None))
+                if parts:
+                    return str(role), "\n".join(parts)
                 return str(role), str(content)
         except Exception:
             pass
@@ -265,6 +312,9 @@ def search_session_history(
     if not terms:
         terms = [query]
 
+    if not include_tool_results and _query_wants_tool_results(query):
+        include_tool_results = True
+
     sources = _history_source_paths(workspace, thread_id)
     if not sources:
         return (
@@ -291,6 +341,8 @@ def search_session_history(
             if score <= 0:
                 continue
             cap = _TOOL_EXCERPT_MAX if role == "tool" else _EXCERPT_MAX
+            if role in ("ai", "assistant") and _query_wants_tool_results(query):
+                cap = max(cap, 1400)
             hits.append(
                 HistoryHit(
                     source=label,
@@ -298,6 +350,7 @@ def search_session_history(
                     role=role,
                     score=score,
                     excerpt=_excerpt(text, cap),
+                    source_path=str(path.resolve()),
                 )
             )
 
@@ -314,7 +367,8 @@ def search_session_history(
 
     lines = [
         f"会话历史检索 thread={thread_id} query={query!r} 命中 {len(selected)}/{len(hits)} 条",
-        "说明：以下为按需片段，非全量对话；需要全文请 read_file 对应文件与行号。",
+        "说明：以下为按需片段（已含 tool_calls/ tool 输出时自动扩展）。",
+        "若仍不足：用各命中下方的 read_file 行段精读；禁止 search_files/cat 整文件 messages.jsonl。",
         "",
     ]
     for idx, hit in enumerate(selected, start=1):
@@ -323,8 +377,15 @@ def search_session_history(
             loc += f":{hit.line_no}"
         lines.append(f"--- 命中 {idx} [{loc}] {hit.role} (score={hit.score}) ---")
         lines.append(hit.excerpt)
+        if hit.source_path and hit.line_no is not None:
+            lines.append(
+                f"read_file: `{hit.source_path}` start_line={hit.line_no} end_line={hit.line_no}"
+            )
         lines.append("")
 
+    messages_path = session_messages_path(workspace, thread_id)
+    if messages_path.is_file():
+        lines.append(f"messages: {messages_path}")
     manifest_rel = session_manifest_json_path(workspace, thread_id)
     if manifest_rel.is_file():
         lines.append(f"manifest: {manifest_rel}")

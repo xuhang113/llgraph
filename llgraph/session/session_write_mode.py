@@ -8,8 +8,10 @@ from llgraph.core.agent import rebuild_agent_preserving_memory
 from llgraph.core.agent_session import AgentSessionContext
 from llgraph.context.context_session import ContextSession
 from llgraph.config.edit_settings import resolve_edit_settings
+from llgraph.config.sandbox_settings import resolve_sandbox_settings
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.core.write_failure_tracker import WriteFailureTracker
+from llgraph.sandbox.policy import build_sandbox_policy
 
 
 def format_write_mode_status(agent_session: AgentSessionContext) -> str:
@@ -22,11 +24,16 @@ def format_write_mode_status(agent_session: AgentSessionContext) -> str:
     if agent_session.allow_write:
         mode = "可写（search_replace / write_file / append_file 已启用）"
     else:
-        mode = "只读（禁止写文件与受限 shell）"
+        mode = "只读（禁止 Agent 写文件；/changes · /undo 仍可用）"
     lines = [
         f"文件写入: {mode}",
         "命令: /write on  |  /write off",
     ]
+    policy = agent_session.sandbox_policy
+    if policy is not None and policy.enabled:
+        lines.append(
+            f"OS 沙箱: {policy.mode}（{policy.backend}；随 /write 与 -w 联动）"
+        )
     if agent_session.allow_write and agent_session.edit_tracker is not None:
         paths = agent_session.edit_tracker.unique_paths()
         if paths:
@@ -77,11 +84,22 @@ def set_session_write_mode(
     if enabled:
         on_changed = agent_session.on_file_changed
 
+    sandbox_settings = resolve_sandbox_settings(workspace)
+    cli_sandbox = getattr(agent_session, "sandbox_cli_enabled", None)
+    sandbox_policy = build_sandbox_policy(
+        workspace,
+        sandbox_settings,
+        cli_enabled=cli_sandbox,
+        allow_write=enabled,
+    )
+    agent_session.sandbox_policy = sandbox_policy
+
     rebuild_agent_preserving_memory(
         agent_session,
         allow_write=enabled,
         mcp_tools=mcp_tools,
         on_file_changed=on_changed,
+        sandbox_policy=sandbox_policy,
     )
     agent_session.allow_write = enabled
     return True

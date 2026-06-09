@@ -209,7 +209,7 @@ def _embed_batch_remote(texts: list[str], profile: EmbeddingProfile) -> list[lis
     )
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+            payload = json.loads(resp.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
         raise RuntimeError(f"Embedding API 失败 HTTP {exc.code}: {detail}") from exc

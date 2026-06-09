@@ -260,6 +260,8 @@ class SurveyQuestion:
     allow_free_text: bool
     step_label: str = ""
     option_hints: tuple[str, ...] = ()
+    multi_select: bool = False
+    default_indices: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -320,15 +322,31 @@ def extract_survey_block(text: str) -> SurveySpec | None:
         if len(options) < 2:
             continue
         default = 0
+        default_indices: tuple[int, ...] = ()
+        multi_select = bool(item.get("multi_select") or item.get("multiple"))
         if "default" in item:
-            try:
-                default = max(0, int(item["default"]) - 1)
-            except (TypeError, ValueError):
-                default = 0
+            raw_default = item["default"]
+            if multi_select and isinstance(raw_default, list):
+                picked: list[int] = []
+                for entry in raw_default:
+                    try:
+                        idx = int(entry) - 1
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= idx < len(options):
+                        picked.append(idx)
+                default_indices = tuple(dict.fromkeys(picked))
+            else:
+                try:
+                    default = max(0, int(raw_default) - 1)
+                except (TypeError, ValueError):
+                    default = 0
         default = min(default, len(options) - 1)
         allow_free = bool(item.get("allow_free_text")) or any(
             "其他" in o or "手动" in o for o in options
         )
+        if multi_select and not default_indices and default >= 0:
+            default_indices = (default,)
         hints_raw = item.get("option_hints")
         hints: tuple[str, ...] = ()
         if isinstance(hints_raw, list):
@@ -347,6 +365,8 @@ def extract_survey_block(text: str) -> SurveySpec | None:
                 allow_free_text=allow_free,
                 step_label=step_label,
                 option_hints=hints,
+                multi_select=multi_select,
+                default_indices=default_indices,
             )
         )
     if not questions:
@@ -356,14 +376,14 @@ def extract_survey_block(text: str) -> SurveySpec | None:
 
 def run_survey_interactive(spec: SurveySpec) -> dict[str, str] | None:
     """
-    TUI 问卷向导。
+    终端问卷向导。
 
     @param spec 问卷
     @return 题 id → 答案；取消返回 None
     """
-    from llgraph.ui.prompts import run_survey_wizard
+    from llgraph.terminal.survey_wizard import run_survey_tty
 
-    return run_survey_wizard(spec)
+    return run_survey_tty(spec)
 
 
 def format_survey_answers_for_agent(answers: dict[str, str]) -> str:
@@ -457,151 +477,22 @@ def try_run_survey_followup(
     spec = resolve_survey_from_assistant(assistant_text)
     if spec is None:
         if has_block:
-            from llgraph.ui.context import ui_notify
+            from llgraph.terminal.notify import notify
 
-            ui_notify(
+            notify(
                 "survey",
                 "JSON 格式无法解析，请用对话说明选择",
             )
         return None
-    from llgraph.ui.context import ui_notify
+    from llgraph.terminal.notify import notify
 
-    ui_notify("survey", "请在下方菜单中确认（已隐藏选项正文）")
+    notify("survey", "请在下方菜单中确认（已隐藏选项正文）")
     answers = run_survey_interactive(spec)
     if answers is None:
-        from llgraph.ui.output import emit_hint
+        from llgraph.terminal.output import emit_hint
 
         emit_hint(
-            "[survey] 已取消确认。输入 /survey 重新打开向导，"
-            "或直接说明你的选择继续对话。"
+            "[survey] 已取消确认。直接说明你的选择继续对话。"
         )
         return None
     return format_survey_answers_for_agent(answers)
-
-
-_ORGANIZE_USER_PATTERN = re.compile(
-    r"(梳理|整理|整理下|帮我.*?整理|帮我.*?梳理|看看.*?业务)",
-    re.IGNORECASE,
-)
-
-
-def user_message_needs_organize_preflight(user_message: str) -> bool:
-    """
-    是否像 project-organize 的「梳理/整理业务」首轮请求。
-
-    @param user_message 用户输入
-    @return 是否建议先走确认向导
-    """
-    text = user_message.strip()
-    if len(text) > 120:
-        return False
-    if _ORGANIZE_USER_PATTERN.search(text):
-        return True
-    return False
-
-
-def build_organize_preflight_survey(user_message: str) -> SurveySpec:
-    """
-    根据用户消息生成 project-organize 默认向导（顶栏三题 + Submit）。
-
-    @param user_message 用户原始输入
-    @return 问卷规格
-    """
-    title = "业务梳理 — 请确认"
-    if "优惠券" in user_message:
-        title = "优惠券业务梳理 — 请确认"
-    elif "charbi" in user_message.lower():
-        title = "charbi 业务梳理 — 请确认"
-    spec = default_project_organize_survey()
-    return SurveySpec(title=title, questions=spec.questions)
-
-
-def maybe_preflight_survey_for_user_message(
-    user_message: str,
-    *,
-    preflight_done: bool,
-    workspace: Path | None = None,
-    context_session: object | None = None,
-) -> tuple[str, bool] | None:
-    """
-    梳理类请求在调用 Agent 前先走向导（对齐 Claude：先确认再搜代码）。
-
-    @param user_message 用户输入
-    @param preflight_done 本会话是否已做过前置确认
-    @param workspace 工作区根
-    @param context_session 会话状态
-    @return (增强后的用户消息, 已确认标记)；无需前置时 None
-    """
-    from llgraph.config.survey_settings import survey_preflight_enabled
-
-    if not survey_preflight_enabled(workspace, context_session):
-        return None
-    if preflight_done or not user_message_needs_organize_preflight(user_message):
-        return None
-    spec = build_organize_preflight_survey(user_message)
-    answers = run_survey_interactive(spec)
-    if answers is None:
-        from llgraph.ui.output import emit_hint
-
-        emit_hint(
-            "[survey] 已取消前置确认。可重新发送原问题，或输入 /survey 打开向导。"
-        )
-        return None
-    payload = format_survey_answers_for_agent(answers)
-    merged = f"{user_message.strip()}\n\n{payload}"
-    # 不在此 persist activate_skill：本回合由 auto_match + 用户消息触发 project-organize 即可
-    return merged, True
-
-
-def default_project_organize_survey() -> SurveySpec:
-    """
-    project-organize 技能默认三项确认（/survey 无参数时使用）。
-
-    @return 问卷规格
-    """
-    return SurveySpec(
-        title="业务梳理 — 请确认",
-        questions=(
-            SurveyQuestion(
-                question_id="mode",
-                prompt="梳理业务时按哪种方式？",
-                options=(
-                    "按现有文档梳理",
-                    "结合代码重新梳理（推荐）",
-                    "其他（手动输入）",
-                ),
-                default_index=1,
-                allow_free_text=True,
-                step_label="梳理方式",
-                option_hints=(
-                    "以 docs 已有文档为主，必要时核对代码",
-                    "重读相关代码，文档作参考",
-                    "",
-                ),
-            ),
-            SurveyQuestion(
-                question_id="write_docs",
-                prompt="是否落盘到 docs？",
-                options=(
-                    "仅对话，不落盘",
-                    "落盘到 docs/（工作区 + 各仓 docs）",
-                    "两者都落（工作区总览 + 各仓 docs）",
-                ),
-                default_index=1,
-                allow_free_text=False,
-                step_label="是否落盘",
-            ),
-            SurveyQuestion(
-                question_id="edit_existing",
-                prompt="是否修改已有 doc？",
-                options=(
-                    "否，仅新增",
-                    "是，可覆盖/补充已有文档",
-                    "不适用（尚无 doc）",
-                ),
-                default_index=0,
-                allow_free_text=False,
-                step_label="改已有 doc",
-            ),
-        ),
-    )

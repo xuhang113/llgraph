@@ -1,4 +1,4 @@
-"""会话 Banner 文本（TUI Header / 终端启动面板）。"""
+"""会话 Banner 文本（终端启动面板）。"""
 
 from __future__ import annotations
 
@@ -8,82 +8,11 @@ from llgraph.loaders.rules_loader import discover_rules
 from llgraph.loaders.skills_loader import discover_skills
 from llgraph.loaders.thought_loader import thought_summary
 from llgraph.display.trace_display import TRACE_MODE_LABELS, TraceSession
-from llgraph.ui.keys import BANNER_SHORTCUT_HINT
 
 _BANNER_COMMANDS = (
     "/help · /config · /sessions · /paste · /trace · /compress · "
     "/tools · /rule · /skill · /index · exit"
 )
-
-
-def build_session_banner_text(
-    *,
-    workspace: Path,
-    allow_write: bool,
-    thread_id: str,
-    trace_session: TraceSession,
-    watch_active: bool = False,
-    web_search_enabled: bool = False,
-    mcp_summary: str = "",
-    resume_hint: str = "",
-    memory_kind: str = "",
-) -> str:
-    """
-    生成启动 Banner 纯文本（TUI RichLog 用）。
-
-    @param workspace 工作区
-    @param allow_write 是否可写
-    @param thread_id 线程 ID
-    @param trace_session 追踪配置
-    @param watch_active 索引监听
-    @param web_search_enabled 联网搜索
-    @param mcp_summary MCP 摘要
-    @param resume_hint 恢复提示
-    @param memory_kind 记忆类型
-    @return 多行文本
-    """
-    mode = "可读写" if allow_write else "只读"
-    rule_n = len(discover_rules(workspace))
-    skill_n = len(discover_skills(workspace))
-    try:
-        from llgraph.code_index.store import get_index_status
-        from llgraph.config.logging_settings import level_name, resolve_log_level
-        from llgraph.core.llm_settings import format_model_banner_suffix
-
-        idx = get_index_status(workspace)
-        idx_hint = f"{idx.chunk_count} chunks" if idx.exists else "未索引"
-        log_hint = level_name(resolve_log_level(workspace))
-        model_hint = format_model_banner_suffix(workspace)
-    except RuntimeError:
-        idx_hint = "未安装 index extra"
-        log_hint = "—"
-        model_hint = "—"
-
-    ws = str(workspace)
-    if len(ws) > 56:
-        ws = "…" + ws[-53:]
-    extras: list[str] = []
-    if watch_active:
-        extras.append("watch")
-    if web_search_enabled:
-        extras.append("web")
-    if memory_kind:
-        extras.append(memory_kind)
-    extra_suffix = f" · {' · '.join(extras)}" if extras else ""
-    hint = resume_hint[:40] + "…" if len(resume_hint) > 40 else resume_hint
-    lines = [
-        f"[bold cyan]llgraph[/] · {mode} · [dim]{thread_id}[/]",
-        f"[dim]{ws}[/]",
-        (
-            f"Rules {rule_n} · Skills {skill_n} · "
-            f"{TRACE_MODE_LABELS[trace_session.mode]} · {model_hint} · {log_hint}"
-            f"{extra_suffix}"
-        ),
-        f"[dim]{BANNER_SHORTCUT_HINT} · 底部输入框发送 · /help[/]",
-    ]
-    if hint:
-        lines.insert(2, f"[yellow]{hint}[/]")
-    return "\n".join(lines)
 
 
 def _resolve_banner_metrics(
@@ -185,7 +114,7 @@ def print_terminal_session_banner(
     @param memory_kind 记忆后端说明
     """
     from llgraph.display.terminal_style import print_section, print_section_rows
-    from llgraph.ui.style import indent_line, sty
+    from llgraph.terminal.style import indent_line, sty
     from llgraph.session.user_storage import format_storage_location_hint
 
     metrics = _resolve_banner_metrics(

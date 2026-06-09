@@ -7,6 +7,7 @@ from langchain_anthropic import chat_models as anthropic_chat_models
 
 from llgraph.config.config import get_llgraph_settings
 from llgraph.core.llm_settings import resolve_llm_settings
+from llgraph.core.model_thinking import resolve_model_thinking_payload
 
 _USAGE_PATCHED = False
 
@@ -58,10 +59,17 @@ def create_gateway_llm(workspace: Path | None = None) -> ChatAnthropic:
     settings = get_llgraph_settings()
     ws = _Path(workspace).expanduser().resolve() if workspace is not None else None
     llm_cfg = resolve_llm_settings(ws)
+    thinking_payload = resolve_model_thinking_payload(ws, llm_cfg.model)
     # 不显式传 temperature：部分网关对 temperature=0.2 会返回 400
-    return ChatAnthropic(
-        model=llm_cfg.model,
-        api_key=settings["api_key"],
-        base_url=settings["base_url"],
-        max_tokens=llm_cfg.max_tokens,
-    )
+    llm_kwargs: dict = {
+        "model": llm_cfg.model,
+        "api_key": settings["api_key"],
+        "base_url": settings["base_url"],
+        "max_tokens": llm_cfg.max_tokens,
+    }
+    if thinking_payload is not None:
+        llm_kwargs["thinking"] = thinking_payload
+    llm = ChatAnthropic(**llm_kwargs)
+    # 供 gateway reasoning 注入读取 agent.json dispatch profile
+    object.__setattr__(llm, "llgraph_workspace", ws)
+    return llm

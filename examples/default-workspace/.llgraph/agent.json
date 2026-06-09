@@ -33,10 +33,11 @@
     "compress_retrieval_enabled": true,
     "compress_retrieval_top_k": 5,
     "compress_tool_mask_max_chars": 2000,
-    "tool_result_max_chars": 10000,
+    "tool_result_max_chars": 40000,
     "tool_result_preview_lines": 40,
     "spill_dir": ".llgraph/context/tool-results",
-    "spill_enabled": true
+    "spill_enabled": true,
+    "spill_exempt_tools": ["read_file", "read_files"]
   },
   "shell": {
     "enabled": true,

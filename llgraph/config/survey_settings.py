@@ -42,9 +42,7 @@ class SurveySettings:
     """Survey 默认配置（agent.json → survey）。"""
 
     enabled: bool
-    preflight: bool
     followup: bool
-    command: bool
 
 
 def resolve_survey_settings(workspace: Path | None) -> SurveySettings:
@@ -55,15 +53,11 @@ def resolve_survey_settings(workspace: Path | None) -> SurveySettings:
     @return SurveySettings
     """
     enabled = True
-    preflight = True
     followup = True
-    command = True
     if workspace is None:
         return SurveySettings(
             enabled=enabled,
-            preflight=preflight,
             followup=followup,
-            command=command,
         )
 
     cfg = load_agent_config(workspace)
@@ -75,23 +69,15 @@ def resolve_survey_settings(workspace: Path | None) -> SurveySettings:
                 enabled = val.strip().lower() not in ("0", "false", "no", "off")
             else:
                 enabled = bool(val)
-        if "preflight" in raw:
-            preflight = bool(raw.get("preflight"))
         if "followup" in raw:
             followup = bool(raw.get("followup"))
-        if "command" in raw:
-            command = bool(raw.get("command"))
 
     if not enabled:
-        preflight = False
         followup = False
-        command = False
 
     return SurveySettings(
         enabled=enabled,
-        preflight=preflight,
         followup=followup,
-        command=command,
     )
 
 
@@ -100,7 +86,7 @@ def survey_interactive_enabled(
     context_session: ContextSession | None = None,
 ) -> bool:
     """
-    当前是否启用交互式 survey（前置向导 / 助手 followup / 弹窗）。
+    当前是否启用交互式 survey（助手 followup / 写前弹窗）。
 
     优先级：CLI/环境变量 > 会话 /survey off|on > agent.json。
 
@@ -113,22 +99,6 @@ def survey_interactive_enabled(
     if context_session is not None and context_session.survey_enabled is not None:
         return context_session.survey_enabled
     return resolve_survey_settings(workspace).enabled
-
-
-def survey_preflight_enabled(
-    workspace: Path | None,
-    context_session: ContextSession | None = None,
-) -> bool:
-    """
-    是否启用「梳理/整理」类请求的前置 survey。
-
-    @param workspace 工作区根
-    @param context_session 会话状态
-    @return 是否启用
-    """
-    if not survey_interactive_enabled(workspace, context_session):
-        return False
-    return resolve_survey_settings(workspace).preflight
 
 
 def survey_followup_enabled(
@@ -145,22 +115,6 @@ def survey_followup_enabled(
     if not survey_interactive_enabled(workspace, context_session):
         return False
     return resolve_survey_settings(workspace).followup
-
-
-def survey_command_enabled(
-    workspace: Path | None,
-    context_session: ContextSession | None = None,
-) -> bool:
-    """
-    是否允许 /survey 命令打开向导。
-
-    @param workspace 工作区根
-    @param context_session 会话状态
-    @return 是否启用
-    """
-    if not survey_interactive_enabled(workspace, context_session):
-        return False
-    return resolve_survey_settings(workspace).command
 
 
 def format_survey_status(
@@ -188,11 +142,8 @@ def format_survey_status(
     else:
         lines.append("  本会话覆盖: （无，跟随配置）")
     if effective:
-        lines.append(
-            f"  子项: preflight={'开' if settings.preflight else '关'}"
-            f" · followup={'开' if settings.followup else '关'}"
-            f" · command={'开' if settings.command else '关'}",
-        )
+        lines.append(f"  followup（Agent <<<llgraph-survey>>>）: {'开' if settings.followup else '关'}")
     lines.append("  命令: /survey on | off | status")
+    lines.append("  确认问卷须由 Agent 在回复末尾输出 <<<llgraph-survey>>> JSON")
     lines.append("  启动: llgraph --no-survey  或  LLGRAPH_SURVEY=0")
     return "\n".join(lines)

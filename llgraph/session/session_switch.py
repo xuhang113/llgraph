@@ -111,7 +111,7 @@ def print_current_session_info(workspace: Path, thread_id: str) -> None:
     from llgraph.session.session_meta import resolve_session_display_title
     from llgraph.session.user_storage import format_storage_location_hint
 
-    from llgraph.ui.output import emit, emit_report
+    from llgraph.terminal.output import emit, emit_report
 
     title = resolve_session_display_title(workspace, thread_id)
     emit(f"当前会话 thread_id: {thread_id}", colorize=True)
@@ -131,7 +131,7 @@ def print_session_exit_hint(workspace: Path, thread_id: str) -> None:
     """
     from llgraph.session.session_meta import resolve_session_display_title
 
-    from llgraph.ui.output import emit
+    from llgraph.terminal.output import emit
 
     title = resolve_session_display_title(workspace, thread_id)
     title_part = f"（{title}）" if title and title != thread_id else ""

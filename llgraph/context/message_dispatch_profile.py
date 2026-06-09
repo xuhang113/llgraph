@@ -21,7 +21,6 @@ class MessageDispatchProfile:
     expand_parallel_tool_rounds: bool = False
     patch_tool_ai_reasoning: bool = False
     strip_assistant_thinking_blocks: bool = False
-    rewrite_tool_history_as_text: bool = False
     label: str = "default"
 
     def summary(self) -> str:
@@ -37,8 +36,6 @@ class MessageDispatchProfile:
             parts.append("补 reasoning")
         if self.strip_assistant_thinking_blocks:
             parts.append("剥离 thinking 块")
-        if self.rewrite_tool_history_as_text:
-            parts.append("工具轮转文本摘要")
         if not parts:
             parts.append("宽松 tool 链")
         return f"{self.label}: {'、'.join(parts)}"
@@ -90,7 +87,6 @@ def _dispatch_from_mapping(
     thinking_raw = raw.get("strip_assistant_thinking_blocks")
     if thinking_raw is None:
         thinking_raw = raw.get("strip_thinking_blocks")
-    rewrite_raw = raw.get("rewrite_tool_history_as_text")
     return MessageDispatchProfile(
         expand_parallel_tool_rounds=_parse_dispatch_bool(
             expand_raw,
@@ -102,10 +98,6 @@ def _dispatch_from_mapping(
         ),
         strip_assistant_thinking_blocks=_parse_dispatch_bool(
             thinking_raw,
-            False,
-        ),
-        rewrite_tool_history_as_text=_parse_dispatch_bool(
-            rewrite_raw,
             False,
         ),
         label=label,
@@ -153,20 +145,19 @@ def _heuristic_dispatch_profile(model_id: str) -> MessageDispatchProfile:
             strip_assistant_thinking_blocks=False,
             label=f"{model_id}(heuristic:kimi-k2)",
         )
-    if re.search(r"^(glm|minimax|deepseek)", mid, re.I):
-        return MessageDispatchProfile(
-            expand_parallel_tool_rounds=True,
-            patch_tool_ai_reasoning=False,
-            strip_assistant_thinking_blocks=False,
-            label=f"{model_id}(heuristic:strict-tool)",
-        )
     if re.search(r"^(gpt|claude|o1|o3|o4)", mid, re.I):
         return MessageDispatchProfile(
             expand_parallel_tool_rounds=False,
             patch_tool_ai_reasoning=False,
             strip_assistant_thinking_blocks=True,
-            rewrite_tool_history_as_text=True,
-            label=f"{model_id}(heuristic:openai-style)",
+            label=f"{model_id}(heuristic:anthropic-openai)",
+        )
+    if re.search(r"^(glm|minimax|deepseek)", mid, re.I):
+        return MessageDispatchProfile(
+            expand_parallel_tool_rounds=True,
+            patch_tool_ai_reasoning=False,
+            strip_assistant_thinking_blocks=True,
+            label=f"{model_id}(heuristic:strict-tool)",
         )
     if re.search(r"kimi", mid, re.I):
         return MessageDispatchProfile(

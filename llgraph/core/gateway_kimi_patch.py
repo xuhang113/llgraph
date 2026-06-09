@@ -1,7 +1,8 @@
-"""Kimi 等网关：assistant tool 消息 reasoning_content + thinking 块注入。"""
+"""网关出站：按 dispatch profile 注入 assistant reasoning_content（Kimi 另需 content.thinking）。"""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage
@@ -139,6 +140,26 @@ def _ensure_thinking_block_in_content(
     block["content"] = content
 
 
+def _apply_tool_assistant_reasoning_fields(
+    block: dict[str, Any],
+    reasoning: str,
+    source: AIMessage | None,
+    *,
+    include_thinking_block: bool,
+) -> None:
+    """
+    写入 tool assistant 的 reasoning_content；Kimi 等另补 content.thinking。
+
+    @param block formatted assistant
+    @param reasoning 思考文本
+    @param source 原始 AIMessage
+    @param include_thinking_block 是否在 content 内补 thinking 块
+    """
+    block["reasoning_content"] = reasoning.strip() or _REASONING_PLACEHOLDER
+    if include_thinking_block:
+        _ensure_thinking_block_in_content(block, block["reasoning_content"], source)
+
+
 def _apply_kimi_tool_assistant_fields(
     block: dict[str, Any],
     reasoning: str,
@@ -151,19 +172,26 @@ def _apply_kimi_tool_assistant_fields(
     @param reasoning 思考文本
     @param source 原始 AIMessage
     """
-    block["reasoning_content"] = reasoning.strip() or _REASONING_PLACEHOLDER
-    _ensure_thinking_block_in_content(block, block["reasoning_content"], source)
+    _apply_tool_assistant_reasoning_fields(
+        block,
+        reasoning,
+        source,
+        include_thinking_block=True,
+    )
 
 
 def inject_reasoning_into_formatted_messages(
     source_messages: list[BaseMessage],
     formatted_messages: list[dict[str, Any]],
+    *,
+    include_thinking_block: bool = True,
 ) -> int:
     """
-    为 formatted assistant 消息补上 reasoning_content 与 thinking 块。
+    为 formatted assistant 消息补上 reasoning_content（可选 content.thinking）。
 
     @param source_messages 原始 LangChain 消息（出站修链后）
     @param formatted_messages Anthropic 格式 messages
+    @param include_thinking_block 是否补 content.thinking（Kimi 必填）
     @return 注入条数
     """
     tool_ai_messages = [
@@ -196,18 +224,26 @@ def inject_reasoning_into_formatted_messages(
                 else _REASONING_PLACEHOLDER
             )
 
-        _apply_kimi_tool_assistant_fields(block, reasoning, source)
+        _apply_tool_assistant_reasoning_fields(
+            block,
+            reasoning,
+            source,
+            include_thinking_block=include_thinking_block,
+        )
         injected += 1
     return injected
 
 
 def missing_reasoning_on_formatted_tool_assistants(
     formatted_messages: list[dict[str, Any]],
+    *,
+    require_thinking_block: bool = True,
 ) -> list[int]:
     """
-    列出 formatted messages 中缺 reasoning_content 的 tool assistant 下标。
+    列出 formatted messages 中缺 reasoning 的 tool assistant 下标。
 
     @param formatted_messages Anthropic 格式 messages
+    @param require_thinking_block 是否要求 content 内含 thinking 块（Kimi）
     @return 缺失的 message 索引列表
     """
     missing: list[int] = []
@@ -219,6 +255,8 @@ def missing_reasoning_on_formatted_tool_assistants(
         raw = block.get("reasoning_content")
         if not isinstance(raw, str) or not raw.strip():
             missing.append(idx)
+            continue
+        if not require_thinking_block:
             continue
         content = block.get("content")
         if not isinstance(content, list):
@@ -243,12 +281,12 @@ def resolve_kimi_thinking_payload() -> dict[str, str]:
     return {"type": "enabled", "keep": "all"}
 
 
-def model_requires_kimi_reasoning_payload(model_id: str | None) -> bool:
+def is_kimi_thinking_model(model_id: str | None) -> bool:
     """
-    是否需在 HTTP payload 注入 reasoning_content。
+    是否为 Kimi k2 系列（需 payload.thinking 与 content.thinking 块）。
 
     @param model_id 模型 id
-    @return 是否 Kimi k2 等
+    @return 是否 Kimi thinking 模型
     """
     if not model_id:
         return False
@@ -256,9 +294,36 @@ def model_requires_kimi_reasoning_payload(model_id: str | None) -> bool:
     return "kimi" in mid or "k2.5" in mid or "k2.6" in mid or "k2-" in mid
 
 
+def model_requires_kimi_reasoning_payload(model_id: str | None) -> bool:
+    """
+    兼容旧名：是否 Kimi k2 模型。
+
+    @param model_id 模型 id
+    @return 是否 Kimi
+    """
+    return is_kimi_thinking_model(model_id)
+
+
+def should_inject_reasoning_payload(
+    workspace: Path | None,
+    model_id: str | None,
+) -> bool:
+    """
+    是否按 agent.json dispatch 在 HTTP 层注入 reasoning_content。
+
+    @param workspace 工作区根（读 agent.json profile）
+    @param model_id 模型 id
+    @return 是否注入
+    """
+    from llgraph.context.message_dispatch_profile import resolve_dispatch_profile
+
+    profile = resolve_dispatch_profile(workspace, model_id)
+    return profile.patch_tool_ai_reasoning
+
+
 def patch_gateway_kimi_reasoning_payload() -> None:
     """
-    包装 ChatAnthropic._get_request_payload，向 Kimi 网关写入 reasoning 相关字段。
+    包装 ChatAnthropic._get_request_payload，按 profile 写入 reasoning 相关字段。
     """
     global _PATCHED
     if _PATCHED:
@@ -277,7 +342,9 @@ def patch_gateway_kimi_reasoning_payload() -> None:
     ) -> dict:
         payload = original(self, input_, stop=stop, **kwargs)
         model_id = getattr(self, "model", None) or payload.get("model")
-        if not model_requires_kimi_reasoning_payload(str(model_id or "")):
+        model_text = str(model_id or "")
+        workspace = getattr(self, "llgraph_workspace", None)
+        if not should_inject_reasoning_payload(workspace, model_text):
             return payload
         formatted = payload.get("messages")
         if not isinstance(formatted, list):
@@ -286,20 +353,39 @@ def patch_gateway_kimi_reasoning_payload() -> None:
             source = self._convert_input(input_).to_messages()
         except Exception:
             source = []
-        inject_reasoning_into_formatted_messages(source, formatted)
-        still_missing = missing_reasoning_on_formatted_tool_assistants(formatted)
+        include_thinking_block = is_kimi_thinking_model(model_text)
+        inject_reasoning_into_formatted_messages(
+            source,
+            formatted,
+            include_thinking_block=include_thinking_block,
+        )
+        still_missing = missing_reasoning_on_formatted_tool_assistants(
+            formatted,
+            require_thinking_block=include_thinking_block,
+        )
         if still_missing:
             for idx in still_missing:
                 block = formatted[idx]
                 if not isinstance(block, dict) or block.get("role") != "assistant":
                     continue
-                _apply_kimi_tool_assistant_fields(
+                _apply_tool_assistant_reasoning_fields(
                     block,
                     _REASONING_PLACEHOLDER,
                     None,
+                    include_thinking_block=include_thinking_block,
                 )
-        if payload.get("thinking") is None:
-            payload["thinking"] = resolve_kimi_thinking_payload()
+        from llgraph.core.model_thinking import (
+            merge_payload_thinking,
+            resolve_model_thinking_payload,
+        )
+
+        desired_thinking = resolve_model_thinking_payload(workspace, model_text)
+        if desired_thinking is not None:
+            payload["thinking"] = merge_payload_thinking(
+                payload.get("thinking"),
+                desired_thinking,
+                model_id=model_text,
+            )
         return payload
 
     anthropic_chat_models.ChatAnthropic._get_request_payload = _patched_get_request_payload

@@ -1,4 +1,4 @@
-"""写文件前 TUI 确认。"""
+"""写文件前终端确认。"""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from llgraph.config.edit_settings import resolve_edit_settings
-from llgraph.ui.prompts import MenuOption, prompt_menu_blocking
+from llgraph.terminal.menu import MenuOption, prompt_menu_blocking
 
 
 @dataclass

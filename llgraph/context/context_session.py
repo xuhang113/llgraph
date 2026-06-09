@@ -8,21 +8,16 @@ class ContextSession:
     """
     每轮对话注入模型的规则与技能状态。
 
-    active_skills: 用户通过 /skill 启用的技能名（整会话有效；与自动匹配无关）
+    active_skills: 用户通过 /skill 启用的技能名（整会话有效；manifest 中 ⭐ 标记）
     disabled_rules: 用户临时禁用的规则 id（/rule off）
     forced_rules: 用户强制启用的 glob 规则 id（/rule on）
-    auto_match_skills: 是否根据用户消息自动匹配技能 description
-    include_markdowns_index: 是否在上下文中附带 markdowns/ 索引
     write_failure_hint: 写工具连续失败后注入下一轮的提醒（由 WriteFailureTracker 设置）
   """
 
     active_skills: list[str] = field(default_factory=list)
     disabled_rules: set[str] = field(default_factory=set)
     forced_rules: set[str] = field(default_factory=set)
-    auto_match_skills: bool = True
-    include_markdowns_index: bool = True
     write_failure_hint: str = ""
-    organize_preflight_done: bool = False
     survey_enabled: bool | None = None
 
     def activate_skill(self, name: str) -> None:

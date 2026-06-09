@@ -89,6 +89,22 @@ def _default_config() -> dict[str, Any]:
             "prepare_workers": 4,
             "embed_accumulate_chunks": 128,
             "use_embed_cache": False,
+            "include_suffixes": [
+                ".py", ".java", ".kt", ".kts", ".go", ".rs",
+                ".js", ".ts", ".tsx", ".jsx", ".md", ".mdc", ".txt",
+                ".yaml", ".yml", ".json", ".xml", ".properties", ".sql",
+                ".sh", ".zsh", ".toml", ".ini", ".cfg", ".html", ".css",
+                ".vue", ".gradle", ".pom", ".csv", ".proto",
+            ],
+            "grep": {
+                "include_suffixes": [
+                    ".py", ".java", ".kt", ".kts", ".go", ".rs",
+                    ".js", ".ts", ".tsx", ".jsx", ".md", ".mdc", ".txt",
+                    ".yaml", ".yml", ".json", ".xml", ".properties", ".sql",
+                    ".sh", ".zsh", ".toml", ".ini", ".cfg", ".html", ".css",
+                    ".vue", ".gradle", ".pom", ".csv", ".proto",
+                ]
+            },
         },
     }
 

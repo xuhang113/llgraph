@@ -38,6 +38,7 @@ class ModelCatalogEntry:
     hint: str = ""
     context_window: int | None = None
     dispatch: dict[str, object] | None = None
+    thinking: object | None = None
 
 
 def _load_llm_display_settings(workspace: Path | None) -> ModelCatalogSettings:
@@ -114,12 +115,17 @@ def _parse_catalog_item(item: object) -> ModelCatalogEntry | None:
         dispatch: dict[str, object] | None = None
         if isinstance(dispatch_raw, dict):
             dispatch = dict(dispatch_raw)
+        thinking_raw = item.get("thinking")
+        thinking: object | None = None
+        if thinking_raw is not None:
+            thinking = thinking_raw
         return ModelCatalogEntry(
             model_id=mid.strip(),
             rate=rate,
             hint=hint_s,
             context_window=ctx_window,
             dispatch=dispatch,
+            thinking=thinking,
         )
     return None
 
@@ -261,6 +267,89 @@ def list_available_models(
     return [], "empty"
 
 
+def _format_catalog_entry_remark(
+    entry: ModelCatalogEntry,
+    workspace: Path | None,
+) -> str:
+    """
+    拼装模型目录行的备注：hint（人工描述）+ context_window（上下文上限）。
+
+    @param entry 目录项
+    @param workspace 工作区根（无 context_window 时走启发式）
+    @return 备注文本，可能为空
+    """
+    parts: list[str] = []
+    if entry.hint.strip():
+        parts.append(entry.hint.strip())
+
+    from llgraph.core.model_context_window import (
+        format_context_window_label,
+        resolve_model_context_window,
+    )
+
+    if entry.context_window is not None:
+        ctx_label = format_context_window_label(entry.context_window)
+    else:
+        window, source = resolve_model_context_window(workspace, entry.model_id)
+        if source.startswith("fallback"):
+            ctx_label = ""
+        else:
+            ctx_label = format_context_window_label(window)
+    if ctx_label:
+        parts.append(f"上下文 {ctx_label}")
+    return " · ".join(parts)
+
+
+def _format_models_catalog_table(
+    catalog: list[ModelCatalogEntry],
+    workspace: Path | None,
+    current: str,
+    *,
+    rate_label: str,
+) -> list[str]:
+    """
+    格式化 agent.json 模型目录表格（模型 / 倍率 / 备注，不含网关列）。
+
+    @param catalog 目录项
+    @param workspace 工作区根
+    @param current 当前模型 id
+    @param rate_label 倍率列标题
+    @return 表头与数据行（不含首尾空行）
+    """
+    has_rate = any(e.rate is not None for e in catalog)
+    rows: list[tuple[str, str, str]] = []
+    for entry in catalog:
+        rate_s = f"{entry.rate:g}" if entry.rate is not None else "-"
+        remark = _format_catalog_entry_remark(entry, workspace)
+        if entry.model_id == current:
+            if remark:
+                remark = f"← 当前  {remark}"
+            else:
+                remark = "← 当前"
+        rows.append((entry.model_id, rate_s, remark))
+
+    model_w = max(max(len(r[0]) for r in rows), len("模型"), 18)
+    rate_w = 0
+    if has_rate:
+        rate_w = max(max(len(r[1]) for r in rows), len(rate_label), 4)
+
+    lines: list[str] = []
+    if has_rate:
+        lines.append(f"  {'模型':<{model_w}}  {rate_label:>{rate_w}}  备注")
+        lines.append("-" * (model_w + rate_w + len("  备注") + 4))
+        for model_id, rate_s, remark in rows:
+            lines.append(f"  {model_id:<{model_w}}  {rate_s:>{rate_w}}  {remark}")
+    else:
+        lines.append(f"  {'模型':<{model_w}}  备注")
+        lines.append("-" * (model_w + len("  备注") + 4))
+        for model_id, _rate_s, remark in rows:
+            lines.append(f"  {model_id:<{model_w}}  {remark}")
+
+    if current and current not in {e.model_id for e in catalog}:
+        lines.append(f"  {current:<{model_w}}  ← 当前（不在官方目录，仍可试用）")
+    return lines
+
+
 def format_models_list(
     workspace: Path,
     *,
@@ -272,12 +361,10 @@ def format_models_list(
 
     @param workspace 工作区根
     @param current 当前模型
-    @param force_refresh 是否刷新网关
+    @param force_refresh 是否刷新网关缓存（仅无目录配置时使用）
     @return 多行文本
     """
     catalog, settings = load_model_catalog(workspace)
-    gateway = fetch_gateway_models(force_refresh=force_refresh)
-    gateway_set = set(gateway)
 
     lines = [
         f"支持模型（{settings.provider_label}）",
@@ -288,31 +375,17 @@ def format_models_list(
     lines.append("")
 
     if catalog:
-        has_rate = any(e.rate is not None for e in catalog)
-        if has_rate:
-            lines.append(
-                f"模型                          {settings.rate_label}  网关  备注"
+        lines.extend(
+            _format_models_catalog_table(
+                catalog,
+                workspace,
+                current,
+                rate_label=settings.rate_label,
             )
-        else:
-            lines.append("模型                                    网关  备注")
-        lines.append("-" * 72)
-        for entry in catalog:
-            mark = " ← 当前" if entry.model_id == current else ""
-            rate_s = f"{entry.rate:g}" if entry.rate is not None else "-"
-            on_gw = "✓" if entry.model_id in gateway_set else "?"
-            hint_s = f"  {entry.hint}" if entry.hint else ""
-            if has_rate:
-                lines.append(
-                    f"  {entry.model_id:<28} {rate_s:>8}{'':8}{on_gw:>4}{mark}{hint_s}"
-                )
-            else:
-                lines.append(f"  {entry.model_id:<28} {'':16}{on_gw:>4}{mark}{hint_s}")
-        if current and current not in {e.model_id for e in catalog}:
-            lines.append(f"  {current:<28}        ?   ← 当前（不在官方目录，仍可试用）")
+        )
         lines.extend(
             [
                 "",
-                "「?」表示本次未在网关 /v1/models 中见到，可能未开通或需 /model refresh",
                 "切换: /model <模型名>  例: /model kimi-k2.6",
                 "恢复默认: /model reset",
             ]

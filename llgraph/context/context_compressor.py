@@ -9,7 +9,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
-from llgraph.context.context_message_split import split_messages_for_compress
+from llgraph.context.context_message_split import split_messages_for_compress_strategy
 from llgraph.context.context_settings import resolve_context_settings
 from llgraph.context.context_spill import compact_tool_messages_for_compress
 from llgraph.context.conversation_anchor import (
@@ -144,12 +144,14 @@ class ContextCompressor:
         messages: list[BaseMessage],
         *,
         force: bool = False,
+        preserve_current_turn: bool | None = None,
     ) -> tuple[list[BaseMessage], CompressReport | None]:
         """
         压缩消息列表（Tier1~3）。
 
         @param messages 原始消息
         @param force 强制压缩（忽略阈值）
+        @param preserve_current_turn cursor 策略：True 保留当前 user 轮；False 换窗仅 manifest+anchor；None 按策略默认
         @return (新消息列表, 报告)；无需压缩时返回原列表与 None
         """
         before_tokens = estimate_tokens(messages)
@@ -162,11 +164,16 @@ class ContextCompressor:
         unpinned = _strip_ephemeral_system_messages(messages)
         unpinned = [m for m in unpinned if not is_session_manifest_message(m)]
 
+        if preserve_current_turn is None:
+            preserve_current_turn = self.settings.compress_strategy != "cursor"
+
         token_budget = int(
             self.settings.max_tokens_estimate * self.settings.keep_recent_token_ratio
         )
-        to_compress, to_keep = split_messages_for_compress(
+        to_compress, to_keep = split_messages_for_compress_strategy(
             unpinned,
+            strategy=self.settings.compress_strategy,
+            preserve_current_turn=preserve_current_turn,
             token_budget=token_budget,
             min_user_turns=self.settings.keep_recent_turns,
             estimate_tokens=estimate_tokens,
@@ -197,6 +204,7 @@ class ContextCompressor:
             compress_model=self.settings.compress_model,
             retrieval_enabled=self.settings.compress_retrieval_enabled,
             retrieval_top_k=self.settings.compress_retrieval_top_k,
+            summary_chunk_chars=self.settings.compress_summary_chunk_chars,
         )
         anchor_msg = build_conversation_anchor_system_message(
             self.workspace,
@@ -239,6 +247,7 @@ def apply_compress_to_agent_state(
     thread_id: str,
     workspace: Path,
     force: bool = False,
+    preserve_current_turn: bool | None = None,
 ) -> CompressReport | None:
     """
     从 agent 状态读取、压缩并写回 messages.jsonl。
@@ -247,6 +256,7 @@ def apply_compress_to_agent_state(
     @param thread_id 线程 ID
     @param workspace 工作区
     @param force 是否强制压缩
+    @param preserve_current_turn cursor 策略切分参数；None 为 invoke 前换窗（False）
     @return 压缩报告
     """
     config = {"configurable": {"thread_id": thread_id}}
@@ -259,7 +269,14 @@ def apply_compress_to_agent_state(
         return None
 
     compressor = ContextCompressor(workspace, session_id=thread_id)
-    new_messages, report = compressor.compress(messages, force=force)
+    if preserve_current_turn is None:
+        preserve_current_turn = compressor.settings.compress_strategy != "cursor"
+
+    new_messages, report = compressor.compress(
+        messages,
+        force=force,
+        preserve_current_turn=preserve_current_turn,
+    )
     if report is None:
         return None
 
@@ -280,6 +297,32 @@ def apply_compress_to_agent_state(
         anchor_path=report.anchor_path,
     )
     return report
+
+
+def maybe_compress_during_react(
+    agent: Any,
+    *,
+    thread_id: str,
+    workspace: Path,
+) -> CompressReport | None:
+    """
+    ReAct 循环中途接近上下文上限时压缩（cursor 策略：保留当前 user 轮，远早段 LLM 摘要）。
+
+    @param agent LangGraph agent
+    @param thread_id 线程 ID
+    @param workspace 工作区根
+    @return 压缩报告；未触发时 None
+    """
+    settings = resolve_context_settings(workspace)
+    if not settings.compress_during_react:
+        return None
+    return apply_compress_to_agent_state(
+        agent,
+        thread_id=thread_id,
+        workspace=workspace,
+        force=False,
+        preserve_current_turn=True,
+    )
 
 
 def format_compress_report(report: CompressReport) -> str:

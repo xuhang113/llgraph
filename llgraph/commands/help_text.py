@@ -8,7 +8,7 @@ from llgraph.context.context_session import ContextSession
 from llgraph.display.trace_display import TRACE_MODE_LABELS, TraceSession
 from llgraph.loaders.rules_loader import discover_rules
 from llgraph.loaders.skills_loader import discover_skills
-from llgraph.ui.keys import HELP_SHORTCUT_LINES
+from llgraph.terminal.keys import HELP_SHORTCUT_LINES
 
 def print_interactive_help(
     *,
@@ -63,7 +63,7 @@ llgraph 交互帮助
   /log tail          最近执行日志（token/压缩/工具/索引缓存摘要）
   /log purge         按 retention_days 清理过期日志文件
   /config            查看 agent.json 用户/工作区配置路径与合并规则
-  /survey            确认向导；/survey off|on|status；--no-survey 禁用
+  /survey            followup 开关；/survey off|on|status；--no-survey 禁用
   /sessions          列出会话（标题 + thread_id，类似 Cursor 历史）
   /session           同 /sessions；use/new/title 子命令见 /session
   /session current   显示当前 thread_id 与恢复命令（/session id、/sessionid 同）
@@ -89,7 +89,7 @@ llgraph 交互帮助
   /skill             列出技能（项目 + 个人 ~/.llgraph/skills/，同名个人优先）
   /skill <name>      启用技能（下一条消息起生效）
   /{{name}} <任务>     启用技能并执行（如 /tracking 梳理埋点链路）
-  输入 /             终端与 TUI 均支持斜杠补全（Skills / Commands / 内置）
+  输入 /             斜杠补全（Skills / Commands / 内置）
   /skill clear       清空已启用技能
   Thought 规范       .llgraph/thought/*.md + .llgraph/agent.json（检索无结果扩词等）
   /index             查看索引状态；/index full|incremental|rebuild 在会话内构建
@@ -116,8 +116,7 @@ llgraph 交互帮助
 
 【启动参数】
 
-  llgraph              交互（默认经典终端，/trace steps）
-  llgraph --ui tui       Textual TUI（步骤侧栏 Ctrl+O）
+  llgraph              交互（/trace steps）
   llgraph --trace all  启动即为完整过程展示
   llgraph -C <目录>    工作区根目录（文件工具沙箱）
   llgraph -w           允许写入（search_replace / write_file）；会话内可用 /write off
@@ -173,6 +172,6 @@ llgraph 交互帮助
   search_workspace 的 keywords 须由模型一次给出多个相关词（无内置业务词典）。
   例如整理直播：keywords=live,livestream,broadcast,streaming,room,acme-live,直播
 """
-    from llgraph.ui.output import emit_report
+    from llgraph.terminal.output import emit_report
 
     emit_report(text.strip())

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
 
 from llgraph.context.message_dispatch_profile import (
     MessageDispatchProfile,
@@ -13,10 +14,9 @@ from llgraph.context.message_dispatch_profile import (
 )
 from llgraph.context.message_normalize import _message_text
 
-_TOOL_HISTORY_NOTE_PREFIX = "[历史工具输出摘要]"
-
 _REPAIR_TOOL_RESULT = "（上一轮工具调用未完成，已跳过；请继续当前问题。）"
 _REASONING_PLACEHOLDER = "（历史思考过程未落盘，占位以满足 Kimi 等网关校验。）"
+_TOOL_CALL_ID_UNSAFE = re.compile(r"[^a-zA-Z0-9_-]+")
 
 
 @dataclass
@@ -29,6 +29,7 @@ class ChatHistorySanitizeReport:
     expanded_tool_rounds: int = 0
     patched_reasoning_content: int = 0
     stripped_thinking_blocks: int = 0
+    sanitized_tool_call_ids: int = 0
 
     @property
     def changed(self) -> bool:
@@ -39,6 +40,7 @@ class ChatHistorySanitizeReport:
             or self.expanded_tool_rounds > 0
             or self.patched_reasoning_content > 0
             or self.stripped_thinking_blocks > 0
+            or self.sanitized_tool_call_ids > 0
         )
 
 
@@ -109,6 +111,79 @@ def _normalize_tool_call_id(tool_call_id: object | None) -> str | None:
         return None
     text = str(tool_call_id).strip()
     return text or None
+
+
+def _gateway_safe_tool_call_id(tool_call_id: str) -> str:
+    """
+    将 tool_call_id 规范为 Anthropic/Claude 网关可接受字符集（如拒绝 ':'）。
+
+    @param tool_call_id 原始 id
+    @return 规范化 id
+    """
+    safe = _TOOL_CALL_ID_UNSAFE.sub("_", tool_call_id.strip())
+    return safe or "tool_call"
+
+
+def sanitize_gateway_tool_call_ids(
+    messages: list[BaseMessage],
+) -> tuple[list[BaseMessage], int]:
+    """
+    出站前规范化 tool_call_id（AI tool_calls 与 ToolMessage 对齐）。
+
+    Kimi 等模型落盘 id 可能含 `grep_files:65`，Claude 网关会 400；仅 dispatch 改写。
+
+    @param messages 消息列表
+    @return (新列表, 改写条数)
+    """
+    changed = 0
+    out: list[BaseMessage] = []
+
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            calls = ai_message_tool_calls(msg)
+            if not calls:
+                out.append(msg)
+                continue
+            new_calls: list[Any] = []
+            remapped = False
+            for tc in calls:
+                if not isinstance(tc, dict):
+                    new_calls.append(tc)
+                    continue
+                cid = _tool_call_id(tc)
+                if not cid:
+                    new_calls.append(tc)
+                    continue
+                safe = _gateway_safe_tool_call_id(cid)
+                if safe == cid:
+                    new_calls.append(tc)
+                    continue
+                new_tc = dict(tc)
+                new_tc["id"] = safe
+                new_calls.append(new_tc)
+                remapped = True
+            if remapped:
+                changed += 1
+                out.append(msg.model_copy(update={"tool_calls": new_calls}))
+            else:
+                out.append(msg)
+            continue
+
+        if isinstance(msg, ToolMessage):
+            tid = getattr(msg, "tool_call_id", None)
+            if tid is not None:
+                text = str(tid)
+                safe = _gateway_safe_tool_call_id(text)
+                if safe != text:
+                    changed += 1
+                    out.append(msg.model_copy(update={"tool_call_id": safe}))
+                    continue
+            out.append(msg)
+            continue
+
+        out.append(msg)
+
+    return out, changed
 
 
 def normalize_ai_tool_calls_on_message(msg: AIMessage) -> tuple[AIMessage, bool]:
@@ -415,57 +490,6 @@ def _append_single_tool_round(
             report.patched_tool_results += 1
 
 
-def rewrite_tool_history_as_text_notes(
-    messages: list[BaseMessage],
-) -> tuple[list[BaseMessage], int]:
-    """
-    将历史 tool 轮改写为 Human 文本摘要（Claude 网关无法回放 ToolMessage 链时使用）。
-
-    落盘仍保留 canonical tool 链；仅出站前调用。
-
-    @param messages 消息列表
-    @return (新列表, 改写轮数)
-    """
-    rewritten = 0
-    out: list[BaseMessage] = []
-    i = 0
-    n = len(messages)
-
-    while i < n:
-        msg = messages[i]
-        if isinstance(msg, AIMessage) and ai_message_has_tool_calls(msg):
-            text = _message_text(getattr(msg, "content", "")).strip()
-            i += 1
-            notes: list[str] = []
-            while i < n and isinstance(messages[i], ToolMessage):
-                tool_msg = messages[i]
-                preview = _message_text(getattr(tool_msg, "content", "")).strip()
-                if len(preview) > 800:
-                    preview = preview[:800] + "…"
-                name = getattr(tool_msg, "name", None) or "tool"
-                notes.append(f"- {name}: {preview or '（空）'}")
-                i += 1
-            if text:
-                out.append(msg.model_copy(update={"tool_calls": [], "content": text}))
-            if notes:
-                rewritten += 1
-                out.append(
-                    HumanMessage(
-                        content=f"{_TOOL_HISTORY_NOTE_PREFIX}\n" + "\n".join(notes),
-                    ),
-                )
-            continue
-
-        if isinstance(msg, ToolMessage):
-            i += 1
-            continue
-
-        out.append(msg)
-        i += 1
-
-    return out, rewritten
-
-
 def rebuild_provider_safe_messages(
     messages: list[BaseMessage],
     profile: MessageDispatchProfile | None = None,
@@ -474,6 +498,7 @@ def rebuild_provider_safe_messages(
     按网关规则重建消息链：每条 tool 前一条必须是仅含对应 call 的 AI。
 
     说明：OpenAI 允许「1 个 AI + 连续多个 Tool」；火山等要求每条 Tool 紧跟一个 AI。
+    Anthropic/Claude 要求并行 tool 的全部 tool_result 同处一条 user 消息，故 expand 保持 false。
 
     @param messages 原始消息
     @param profile 修链策略；None 时为落盘 canonical（不展开、不补 reasoning）
@@ -539,8 +564,9 @@ def rebuild_provider_safe_messages(
     if effective.strip_assistant_thinking_blocks:
         safe, stripped = strip_assistant_thinking_blocks(safe)
         report.stripped_thinking_blocks = stripped
-    if effective.rewrite_tool_history_as_text:
-        safe, _rewritten = rewrite_tool_history_as_text_notes(safe)
+    # 出站前始终规范化 tool_call_id（Kimi 落盘 id 常含 ':'，Claude/Bedrock 会 400）
+    safe, sanitized = sanitize_gateway_tool_call_ids(safe)
+    report.sanitized_tool_call_ids = sanitized
     return safe, report
 
 
@@ -676,7 +702,7 @@ def ensure_agent_chat_history_sanitized(
     if canon_report.archived_system_messages > 0:
         parts.append(f"归档 {canon_report.archived_system_messages} 条中段 system")
     if parts:
-        from llgraph.ui.ops_notice import ops_notice
+        from llgraph.terminal.ops_notice import ops_notice
 
         ops_notice(f"历史消息已修复: {'；'.join(parts)}。")
     return report

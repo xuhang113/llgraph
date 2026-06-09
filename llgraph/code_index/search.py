@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from llgraph.code_index.search_path_filter import is_junk_search_path
 from llgraph.code_index.vector_search import perform_vector_search
 
 
@@ -72,6 +73,15 @@ def search_semantic(
         return "未找到语义相关代码块。"
 
     lines = [f"语义检索 Top{len(hits)}（索引 {outcome.chunk_count} chunks）:", ""]
-    for i, hit in enumerate(hits, start=1):
-        lines.append(format_hit(hit, i))
+    rank = 0
+    for hit in hits:
+        rel = str(hit.get("rel_path", ""))
+        if is_junk_search_path(rel):
+            continue
+        rank += 1
+        lines.append(format_hit(hit, rank))
+        if rank >= top_k:
+            break
+    if rank == 0:
+        return "未找到语义相关代码块（结果均为索引噪声，可 llgraph index 重建）。"
     return "\n".join(lines)

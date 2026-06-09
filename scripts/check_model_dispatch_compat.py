@@ -46,15 +46,21 @@ def _missing_reasoning_in_http_payload(
 ) -> list[int]:
     from llgraph.core.llm import create_gateway_llm
     from llgraph.core.gateway_kimi_patch import (
+        is_kimi_thinking_model,
         missing_reasoning_on_formatted_tool_assistants,
     )
+    from llgraph.core.llm_settings import set_runtime_model
 
+    set_runtime_model(model_id)
     llm = create_gateway_llm(workspace)
     payload = llm._get_request_payload(prepared)
     formatted = payload.get("messages")
     if not isinstance(formatted, list):
         return [-1]
-    return missing_reasoning_on_formatted_tool_assistants(formatted)
+    return missing_reasoning_on_formatted_tool_assistants(
+        formatted,
+        require_thinking_block=is_kimi_thinking_model(model_id),
+    )
 
 
 def _simulate_parallel_tool_roundtrip(
@@ -202,9 +208,11 @@ def main() -> int:
             f"{profile.summary()} [{status}]"
         )
 
-    print("\nKimi 并行 tool 二次 invoke（HTTP payload reasoning_content）:")
-    for model_id in ("kimi-k2.6", "kimi-k2.5"):
-        if model_id not in model_ids:
+    print("\n并行 tool 二次 invoke（HTTP payload reasoning_content）:")
+    for model_id in model_ids:
+        profile = resolve_dispatch_profile(workspace, model_id)
+        if not profile.patch_tool_ai_reasoning:
+            print(f"  {model_id}: SKIP（未启用 patch_reasoning_content）")
             continue
         missing = _simulate_parallel_tool_roundtrip(workspace, model_id)
         ok = not missing
@@ -226,6 +234,7 @@ def main() -> int:
             resolve_prompt_cache_settings,
         )
         from llgraph.core.gateway_kimi_patch import (
+            is_kimi_thinking_model,
             missing_reasoning_on_formatted_tool_assistants,
         )
 
@@ -285,10 +294,12 @@ def main() -> int:
                 ):
                     llm = apply_prompt_cache_to_llm(llm, workspace)
                 bound = llm.bind_tools(tools)
-                if model_id.lower().startswith("kimi"):
+                profile = resolve_dispatch_profile(workspace, model_id)
+                if profile.patch_tool_ai_reasoning:
                     payload = bound._get_request_payload(prepared)
                     miss = missing_reasoning_on_formatted_tool_assistants(
                         payload.get("messages") or [],
+                        require_thinking_block=is_kimi_thinking_model(model_id),
                     )
                     if miss:
                         all_ok = False
@@ -307,28 +318,49 @@ def main() -> int:
         from llgraph.config.config import get_llgraph_settings, load_llgraph_env
 
         load_llgraph_env()
+        from llgraph.core.agent import build_system_prompt
         from llgraph.core.llm import create_gateway_llm
         from llgraph.core.llm_settings import set_runtime_model
+        from llgraph.core.prompt_cache import apply_prompt_cache_to_llm
+        from llgraph.core.prompt_cache_settings import (
+            prompt_cache_enabled_for_model,
+            resolve_prompt_cache_settings,
+        )
+        from llgraph.context.context_dispatch_window import trim_messages_for_dispatch_window
+        from llgraph.context.context_settings import resolve_context_settings
         from llgraph.context.message_normalize import prepare_messages_for_llm_dispatch
 
         settings = get_llgraph_settings()
         if not settings.get("api_key"):
             print("\n跳过 API 探测: 未配置 LLGRAPH_API_KEY", file=sys.stderr)
         else:
-            print("\nAPI 探测（canonical + 探测句，各模型 1 次）:")
+            print("\nAPI 探测（dispatch 窗口 + 探测句，各模型 1 次）:")
             probe = HumanMessage(content="请只回复一个词：ok")
+            ctx_settings = resolve_context_settings(workspace)
+            sys_prompt = build_system_prompt(workspace, allow_write=False)
+            cache_settings = resolve_prompt_cache_settings(workspace)
             for model_id in model_ids:
                 set_runtime_model(model_id)
                 profile = resolve_dispatch_profile(workspace, model_id)
                 dispatched, _ = rebuild_provider_safe_messages(canonical, profile)
-                tail = dispatched[-40:] if len(dispatched) > 40 else dispatched
-                batch = [*tail, probe]
+                if ctx_settings.dispatch_keep_user_turns > 0:
+                    dispatched = trim_messages_for_dispatch_window(
+                        dispatched,
+                        keep_user_turns=ctx_settings.dispatch_keep_user_turns,
+                    )
+                batch = [*dispatched, probe]
                 prepared = prepare_messages_for_llm_dispatch(
                     batch,
+                    agent_system_content=sys_prompt,
                     workspace=workspace,
                     model_id=model_id,
                 )
                 llm = create_gateway_llm(workspace)
+                if (
+                    prompt_cache_enabled_for_model(workspace, model_id)
+                    and cache_settings.enabled
+                ):
+                    llm = apply_prompt_cache_to_llm(llm, workspace)
                 try:
                     out = llm.invoke(prepared)
                     text = getattr(out, "content", "") or ""

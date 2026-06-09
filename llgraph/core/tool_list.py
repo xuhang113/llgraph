@@ -10,14 +10,16 @@ _MCP_NAME_PREFIX = "mcp__"
 
 _BUILTIN_GROUPS: tuple[tuple[str, frozenset[str]], ...] = (
     ("通用", frozenset({"get_current_utc_time"})),
-    (
+        (
         "文件",
         frozenset({
             "list_directory",
+            "glob_files",
             "search_workspace",
             "search_files",
             "grep_files",
             "read_file",
+            "read_files",
             "search_replace",
             "append_file",
             "write_file",

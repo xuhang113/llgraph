@@ -87,7 +87,6 @@ PACKAGE_MAP: dict[str, str] = {
     # display — 追踪、日志、终端样式
     "trace_display": "display",
     "execution_log": "display",
-    "ui_mode": "display",
     "terminal_style": "display",
     "log_retention": "display",
     # cli — 子命令

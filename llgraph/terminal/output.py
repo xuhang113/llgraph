@@ -1,40 +1,29 @@
-"""对话输出：按当前 UI（TUI / 终端）路由，经典终端统一主题。"""
+"""经典终端对话输出与报告分色。"""
 
 from __future__ import annotations
 
 import sys
 
-from llgraph.ui.style import sty
+from llgraph.terminal.style import sty
+from llgraph.terminal.terminal_theme import colorize_terminal_text
 
 
 def write_dialog_block(text: str) -> None:
     """
-    向当前 UI 写入多行文本。
+    向终端写入多行文本。
 
     @param text 多行内容
     """
-    from llgraph.ui.context import get_ui_app
-
-    app = get_ui_app()
-    if app is not None:
-        app.write_chat_block(text.strip())
-        return
     if text.strip():
         print(text.strip(), flush=True)
 
 
 def write_dialog_line(text: str) -> None:
     """
-    向当前 UI 写入单行。
+    向终端写入单行。
 
     @param text 一行文本
     """
-    from llgraph.ui.context import get_ui_app
-
-    app = get_ui_app()
-    if app is not None:
-        app.write_chat_line(text, dim=False)
-        return
     if text.strip():
         print(text, flush=True)
 
@@ -46,29 +35,18 @@ def emit(
     colorize: bool = False,
 ) -> None:
     """
-    经典终端/TUI 输出单行（空串仅换行）。
+    终端输出单行（空串仅换行）。
 
     @param text 一行文本
     @param style 直接套 STYLES 键名
     @param colorize 是否按 terminal_theme 规则分色
     """
-    from llgraph.ui.context import get_ui_app
-    from llgraph.ui.terminal_theme import colorize_terminal_text
-
     if style:
         payload = sty(text, style)
     elif colorize and text.strip():
         payload = colorize_terminal_text(text)
     else:
         payload = text
-
-    app = get_ui_app()
-    if app is not None:
-        if payload.strip():
-            app.write_chat_line(payload, dim=False)
-        else:
-            app.write_chat_line("", dim=False)
-        return
     print(payload, flush=True)
 
 
@@ -79,8 +57,6 @@ def emit_block(text: str, *, colorize: bool = True) -> None:
     @param text 多行文本
     @param colorize 是否套用 terminal_theme
     """
-    from llgraph.ui.terminal_theme import colorize_terminal_text
-
     payload = colorize_terminal_text(text) if colorize else text
     write_dialog_block(payload)
 

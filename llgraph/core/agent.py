@@ -52,10 +52,80 @@ def build_system_prompt(
     @return 系统提示词
     """
     mode = "可读写" if allow_write else "只读（禁止调用 write_file、append_file、search_replace）"
-    tools_read = (
-        "list_directory、search_workspace、search_files、grep_files、"
-        "read_file、search_session_history、run_shell_command、get_current_utc_time"
+    from llgraph.code_index.index_ready import code_index_is_ready
+
+    index_ready = code_index_is_ready(workspace_root)
+    batch_search_hint = (
+        "同时查找**多个已知文件名/脚本名**时："
+        "用**一次** grep_files（如 pattern=\"collect_alert|gitlab_monitor|dm-daily-task\"，"
+        "path=\"markdowns\" 或 path=\".\"）；**禁止**对每个文件名逐个调用 glob_files。\n"
+        "glob 全未命中或连续多个 glob 为 0："
+        "源文件可能不在工作区、仅在 markdowns/docs 台账/crontab 文档中被引用；"
+        "改用 grep_files（path=\"markdowns\" 或 path=\"docs\"）或 read_file 已知文档，"
+        "勿再逐个 glob。\n"
     )
+    path_scope_hint = (
+        "**glob_files / grep_files 的 path（必须遵守）**：\n"
+        "- path = 相对工作区根的**搜索根（子树边界）**，无 cwd；只在 path 子树内匹配，**不含兄弟目录**。\n"
+        "- **禁止** path 含 \"../\"（会越界或解析错误）。\n"
+        "- 默认 path=\".\" 或 \"<仓库名>\"（如 auth-api）；"
+        "**禁止**沿用 list_directory 后的深层 path 做跨包 glob"
+        "（如 path=.../activity 却 glob **/basic/**）。\n"
+        "- list_directory 仅用于浏览；glob/grep 搜类/模块时 path 至少到**仓库根**。\n"
+        "- glob/grep 0 命中后**禁止同 path 再试**；须换更宽 path 或 search_code_hybrid。\n"
+    )
+    batch_read_hint = (
+        "**批量读文件（减少 I/O 与 ReAct 轮次，对齐 Cursor）**：\n"
+        "- hybrid/glob/grep 已给出多个**完整相对路径**时：**尽量一次** "
+        "read_files(paths=[...])（最多 8 个）取齐，**禁止**每个路径单独 read_file 各占一轮 LLM。\n"
+        "- 能批量就批量：同一轮需要对比/梳理 N 个类时，一次 read_files 优于 N 次 read_file。\n"
+        "- 推荐流程：search_code_hybrid 规划 → read_files 批量读 → 正文汇总；"
+        "单文件过大或只需局部时用 read_file(start_line/end_line)。\n"
+        "- read/glob path **禁止** \"../\" 或猜路径；须从检索结果**原样复制**完整路径。\n"
+        "- read_file/read_files 结果**不落盘**，全文直接进上下文；超大单文件请分段 read_file。\n"
+        "- read_file/read_files 失败后**禁止**再 glob 同名补救（应回到 hybrid 换路径）。\n"
+    )
+    if index_ready:
+        tools_read = (
+            "list_directory、glob_files、grep_files、search_code_hybrid、"
+            "search_code_semantic、search_workspace、"
+            "read_file、read_files、search_session_history、"
+            "run_shell_command、get_current_utc_time"
+        )
+        search_order_hint = (
+            "本工作区**代码向量索引已就绪**（llgraph index）。\n"
+            "目录浏览与文件发现**禁止** run_shell_command 的 ls/ls -la/find/tree/du；"
+            "用内置工具：列目录 **list_directory**；"
+            "找文件名 **glob_files**；搜内容 **grep_files**；"
+            "读文件 **read_file** / 批量 **read_files**。\n"
+            + path_scope_hint
+            + batch_read_hint
+            + "找文件/脚本/类/业务概念时检索顺序：\n"
+            "1) **search_code_hybrid** — **首选**（路径匹配 + grep + 语义，一次调用）；\n"
+            "2) **read_files** — hybrid/glob 已列出多个路径时**一次批量读**；\n"
+            "3) **grep_files** — 已知精确类名/表名/符号（path 用 \".\" 或仓库名）；\n"
+            "4) **glob_files** — 仅当知精确**文件名**且 path=\".\" 或仓库名；\n"
+            "5) search_code_semantic / search_workspace — 兜底。\n"
+            + batch_search_hint
+            + "glob/grep 0 命中：先看工具返回的 path 作用域提示；"
+            "内容可能在 markdowns/docs，或 path 过深，勿重复 find/ls/glob。\n"
+        )
+    else:
+        tools_read = (
+            "list_directory、glob_files、grep_files、search_code_hybrid、"
+            "search_code_semantic、search_workspace、search_files、"
+            "read_file、read_files、search_session_history、"
+            "run_shell_command、get_current_utc_time"
+        )
+        search_order_hint = (
+            "本工作区**尚未建立代码向量索引**（请 llgraph index -C .）。\n"
+            "列目录用 **list_directory**；**禁止** run_shell_command 的 ls/find/tree 做目录浏览或文件发现。\n"
+            + path_scope_hint
+            + batch_read_hint
+            + "检索顺序：glob_files → grep_files → read_files（多路径）→ search_files / search_workspace；"
+            "建索引后优先 search_code_hybrid。\n"
+            + batch_search_hint
+        )
     if web_search_enabled:
         tools_read += "、web_search"
     tools_write = "、search_replace、append_file、write_file" if allow_write else ""
@@ -69,29 +139,55 @@ def build_system_prompt(
     )
 
     model_id = resolve_effective_model(workspace_root)
+    from llgraph.core.model_thinking import resolve_model_thinking_payload
+
+    thinking_payload = resolve_model_thinking_payload(workspace_root, model_id)
+    thinking_hint = ""
+    if thinking_payload is not None:
+        thinking_hint = (
+            f"网关 thinking 已启用（agent.json）：{thinking_payload}。"
+            "用户询问扩展思考/thinking 模式时，如实说明已开启；勿回答「不支持」或「无法传 thinking 参数」。\n"
+            "**thinking 输出约束（必须遵守）**：\n"
+            "- thinking/reasoning 仅作内部推理，**终端用户看不到**；"
+            "面向用户的结论、梳理、代码说明、步骤总结**必须写在正文 text**，不可只写在 thinking 里。\n"
+            "- 调用工具前可以只有 thinking + tool_call；"
+            "**一旦本轮不再调用工具（结束 turn），必须输出完整可见正文**，"
+            "禁止 thinking-only 就 end_turn。\n"
+            "- 用户要求「仅对话、不落盘」时：结论仍须出现在正文 text，"
+            "只是不要 write_file；**不是**把答案只放在 thinking。\n"
+            "- 工具读完后要给用户汇总时：先停止调工具，再单独一轮用正文输出完整梳理，"
+            "不要 endless read_file 后在 thinking 里草稿即结束。\n"
+        )
     base = (
         "你是工作区编程助手，通过 OpenAI 兼容 API 网关（LLGRAPH_API_BASE_URL）调用大模型。\n"
         f"当前模型: {model_id}\n"
-        "若用户问「你是什么模型 / 你是谁」，只回答当前模型 id，不要自称 Claude、GPT 或其它未在配置中的名称。\n"
+        + thinking_hint
+        + "若用户问「你是什么模型 / 你是谁」，只回答当前模型 id，不要自称 Claude、GPT 或其它未在配置中的名称。\n"
         f"当前工作区根目录: {workspace_root}\n"
         f"文件访问模式: {mode}。\n"
         f"可用工具: {tools_read}{tools_write}。\n"
         + (f"{edit_hint}\n" if edit_hint else "")
-        + "Skill/Rule 以目录形式提供（描述+路径），正文不在上下文中；"
-        "匹配后须 read_file 对应路径，长文用 start_line/end_line 分段。\n"
+        + "**终端展示与落盘（勿混淆）**：\n"
+        "- 用户看到的回复 = 助手**正文 text**（终端流式输出）；thinking、tool 结果预览**不算**用户可见答复。\n"
+        "- 用户说「放到 text / 正文 / 对话里展示 / 不要落盘 / 仅对话」时：**禁止** write_file/append_file；"
+        "完整梳理须直接写在助手正文里，**不是**写 .md 文件，也不是只写 thinking。\n"
+        "- write_file 仅当用户**明确要求**保存到某路径（如「写到 docs/xxx.md」）时使用；"
+        "写文件后仍须在正文给出可读的结论摘要，不能只有「已写入 xxx.md」一句。\n"
+        + "Skill/Rule 全量目录与简介在置顶 <session-manifest>；正文不在上下文中。"
+        "需要某技能/规则时用 read_file 对应路径（见 manifest 目录）。"
+        "/skill <name> 可会话置顶该技能路径；不自动匹配、不注入 SKILL 正文。\n"
         + "置顶 <session-manifest>、<conversation-anchor>（路径见 manifest.json；通常在 ~/.llgraph/context/<工作区>/sessions/） "
         "在上下文压缩后仍保留路径指针；远早对话原文不在每轮上下文中。\n"
         + "会话失忆/指代不清/压缩或换模型后：先读置顶 anchor，仍不足则 **search_session_history(query=关键词)** "
         "检索归档与 messages.jsonl，勿臆造未检索过的历史细节；需要全文再 read_file 归档路径。\n"
         + "业务归属、项目对照：先 read_file 技能/规则/ markdowns 索引中的文档，再扫代码；"
         "禁止未读文档硬猜服务名。\n"
-        "代码检索：排查/类似逻辑/语义问题优先 search_code_hybrid（需先 llgraph index）；"
-        "精确类名/表名/堆栈符号用 grep_files；目录与多关键词用 search_workspace。\n"
-        "检索代码时：必须用 search_workspace，且在 keywords 中自行列出 5～12 个"
-        "可能相关的检索词（中英文、路径片段、服务名缩写、下划线/连字符变体等），"
-        "不要只写一个词（错误示例：仅 keywords=live）。topic 可填用户原话。"
-        "单关键词用 search_files；精读用 read_file。不要臆造未读过的文件。\n"
-        "需要 pwd、git status、mvn、构建/测试脚本等时，使用 run_shell_command（cwd 相对工作区）；"
+        + search_order_hint
+        + "run_shell_command **仅**用于需要真实 shell 环境的操作："
+        "pwd、git status/log/diff、mvn/npm 构建、运行**已定位**的脚本/测试、docker 等；"
+        "cwd 相对工作区。\n"
+        "**禁止**用 shell 的 ls/ls -la/find/grep/rg/cat/head/tail 做目录浏览、文件发现或读代码"
+        "（请用 list_directory / glob_files / grep_files / read_file / read_files）。"
         "不要声称无法执行 shell。\n"
         "路径一律使用相对工作区的路径（如 services/order-api/README.md）。\n"
         "工具返回若含「工具结果已落盘」与路径，表示全文在磁盘；用 read_file/grep_files 按需读取，"
@@ -110,9 +206,15 @@ def build_system_prompt(
             + "\n\n需要用户确认时：禁止要求用户「输入序号/打字」；"
             "须在回复末尾输出 <<<llgraph-survey>>> JSON <<<end-survey>>>，"
             "必须含 title 与 questions 数组（每题含 id、prompt、options≥2、step_label；"
+            "多选题为 multi_select:true，终端用 Space 勾选、Enter 确认；"
             "option_hints 为每题可选说明，禁止放在 JSON 根级）。"
             "终端会隐藏该 JSON 并弹出确认向导。"
-            "梳理/整理类请求会先走前置向导，未确认前不要大规模 read_file 或落盘。"
+            "问卷仅由 Agent 在回复末尾输出 <<<llgraph-survey>>> 触发；"
+            "llgraph 不在 Agent 运行前弹出固定问卷。"
+            "遵循 project-organize 等 Skill 时："
+            "单项目（仅 1 仓）无 doc 时直接落盘、有 doc 时 survey 仅 mode+overwrite；"
+            "多项目（≥2 仓或业务域）survey 必须含 scope 确认改动哪些仓库，"
+            "禁止因依赖关系自动扩仓落盘；无 doc 时至少先 scope 再读代码/落盘。"
         )
     elif allow_write:
         base = (
@@ -226,6 +328,7 @@ def rebuild_agent_preserving_memory(
     web_search_enabled: bool | None = None,
     mcp_tools: list | None = None,
     on_file_changed: Callable[[str], None] | None = None,
+    sandbox_policy: SandboxPolicy | None = None,
 ) -> Any:
     """
     切换模型等场景下重建 Agent，并尽量保留会话消息。
@@ -235,6 +338,7 @@ def rebuild_agent_preserving_memory(
     @param web_search_enabled 是否注册 web_search；None 时沿用会话状态
     @param mcp_tools MCP 工具列表
     @param on_file_changed 写文件回调
+    @param sandbox_policy 沙箱策略；None 时沿用 agent_session.sandbox_policy
     @return 新 Agent
     """
     config = {"configurable": {"thread_id": agent_session.thread_id}}
@@ -251,6 +355,13 @@ def rebuild_agent_preserving_memory(
         if web_search_enabled is not None
         else getattr(agent_session, "web_search_enabled", False)
     )
+    policy = (
+        sandbox_policy
+        if sandbox_policy is not None
+        else getattr(agent_session, "sandbox_policy", None)
+    )
+    if sandbox_policy is not None:
+        agent_session.sandbox_policy = sandbox_policy
 
     new_agent = build_agent(
         with_memory=agent_session.with_memory,
@@ -264,7 +375,7 @@ def rebuild_agent_preserving_memory(
         web_search_enabled=web,
         edit_confirm_gate=getattr(agent_session, "edit_confirm_gate", None),
         context_session=agent_session.context_session,
-        sandbox_policy=getattr(agent_session, "sandbox_policy", None),
+        sandbox_policy=policy,
     )
     if messages and agent_session.with_memory:
         from llgraph.context.message_normalize import reorder_pinned_system_messages
@@ -355,18 +466,25 @@ def invoke_agent(
             workspace=root,
         )
         if prune_report is not None:
-            from llgraph.ui.ops_notice import ops_notice
+            from llgraph.terminal.ops_notice import ops_notice
 
             ops_notice(format_tool_prune_report(prune_report))
 
+        from llgraph.context.context_settings import resolve_context_settings
+
+        ctx_settings = resolve_context_settings(root)
+        invoke_preserve = (
+            False if ctx_settings.compress_strategy == "cursor" else None
+        )
         compress_report = apply_compress_to_agent_state(
             agent,
             thread_id=thread_id,
             workspace=root,
             force=False,
+            preserve_current_turn=invoke_preserve,
         )
         if compress_report is not None:
-            from llgraph.ui.ops_notice import ops_notice
+            from llgraph.terminal.ops_notice import ops_notice
 
             ops_notice(format_compress_report(compress_report))
             archive_path = compress_report.archive_path
@@ -438,7 +556,7 @@ def invoke_agent(
             workspace=root,
         )
         if end_prune is not None:
-            from llgraph.ui.ops_notice import ops_notice
+            from llgraph.terminal.ops_notice import ops_notice
 
             ops_notice(format_tool_prune_report(end_prune))
     return turn_result.text

@@ -113,7 +113,7 @@ def should_use_message_for_auto_title(text: str) -> bool:
     stripped = str(text or "").strip()
     if not stripped:
         return False
-    from llgraph.ui.keys import is_exit_command
+    from llgraph.terminal.keys import is_exit_command
 
     if is_exit_command(stripped):
         return False

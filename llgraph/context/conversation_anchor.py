@@ -188,8 +188,8 @@ def format_anchor_system_message(sections: dict[str, str], *, anchor_path: str) 
         lines.append(body)
         lines.append("")
     lines.append(
-        "需要逐条对话、完整 tool 输出时：read_file manifest.json 的 archive_path；"
-        "大工具结果见 spill_dir。"
+        "需要逐条对话、完整 tool 输出时：read_file manifest 的 archive_path（完整对话归档文件）；"
+        "大工具结果见 spill_dir；可用 search_session_history 按关键词检索历史。"
     )
     lines.append("</conversation-anchor>")
     return "\n".join(lines).strip()
@@ -409,17 +409,104 @@ def retrieve_related_code_for_compress(
         return ""
 
 
-def _messages_to_transcript(messages: list[BaseMessage], *, per_msg_limit: int = 4000) -> str:
+def _messages_to_transcript(messages: list[BaseMessage]) -> str:
+    """
+    将消息转为摘要输入 transcript（不截断单条 content；超长 tool 应已掩码为指针）。
+
+    @param messages 消息列表
+    @return  transcript 文本
+    """
     lines: list[str] = []
     for msg in messages:
         if is_session_manifest_message(msg) or is_conversation_anchor_message(msg):
             continue
         role = type(msg).__name__
         content = getattr(msg, "content", "")
-        if isinstance(content, str) and len(content) > per_msg_limit:
-            content = content[:per_msg_limit] + "\n…(截断)"
+        if not isinstance(content, str):
+            content = str(content)
         lines.append(f"[{role}]\n{content}\n")
     return "\n".join(lines)
+
+
+def _chunk_messages_for_summary(
+    messages: list[BaseMessage],
+    *,
+    max_chars: int,
+) -> list[list[BaseMessage]]:
+    """
+    将待摘要消息按字符预算切成多段（保持 segment 边界）。
+
+    @param messages 消息列表
+    @param max_chars 每段 transcript 字符上限
+    @return 消息段列表
+    """
+    from llgraph.context.context_message_split import _segment_messages
+
+    segments = _segment_messages(messages)
+    chunks: list[list[BaseMessage]] = []
+    current: list[BaseMessage] = []
+    current_chars = 0
+    for seg in segments:
+        seg_text = _messages_to_transcript(seg)
+        seg_chars = len(seg_text)
+        if current and current_chars + seg_chars > max_chars:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+        current.extend(seg)
+        current_chars += seg_chars
+    if current:
+        chunks.append(current)
+    return chunks if chunks else [list(messages)]
+
+
+def _summarize_prompt_header() -> str:
+    return (
+        "你是 coding agent 的会话压缩器。根据对话片段做**智能摘要**（不是机械截断或删句）。"
+        "只输出一个 JSON 对象，键必须且仅能包含："
+        "session_goal, files_modified, decisions, errors_resolved, pending_tasks, related_code, detail_pointers。"
+        "每个值为中文字符串；无信息则空字符串。"
+        "必须保留：用户目标、已改文件路径、关键决策与结论、未完成任务、错误根因；禁止编造。"
+        "files_modified 须为列表行，每行 `- 相对路径: 说明`。"
+        "detail_pointers 可写需回查 archive/spill 的说明。"
+    )
+
+
+def _invoke_anchor_summary_llm(
+    workspace: Path,
+    prompt_body: str,
+    *,
+    model_name: str | None,
+) -> dict[str, str]:
+    """
+    调用 LLM 生成锚点章节增量。
+
+    @param workspace 工作区根
+    @param prompt_body 完整 prompt
+    @param model_name 压缩用模型
+    @return 章节增量
+    """
+    llm = create_gateway_llm(workspace)
+    if model_name:
+        llm = llm.bind(model=model_name)
+    response = llm.invoke([HumanMessage(content=prompt_body)])
+    text = getattr(response, "content", str(response))
+    if isinstance(text, list):
+        text = "".join(str(x) for x in text)
+    return _parse_anchor_delta_json(str(text).strip())
+
+
+def _merge_anchor_delta_dicts(deltas: list[dict[str, str]]) -> dict[str, str]:
+    """
+    合并多段摘要增量。
+
+    @param deltas 各段 LLM 输出
+    @return 合并后的章节增量
+    """
+    merged = empty_anchor_sections()
+    for delta in deltas:
+        merged = merge_anchor_sections(merged, delta)
+    return merged
 
 
 def summarize_span_to_anchor_delta(
@@ -430,9 +517,10 @@ def summarize_span_to_anchor_delta(
     artifact_trail: str,
     retrieval_block: str,
     model_name: str | None,
+    summary_chunk_chars: int = 120_000,
 ) -> dict[str, str]:
     """
-    仅摘要新挤出消息段，输出结构化章节增量（JSON）。
+    智能摘要待压缩段，输出结构化章节增量（支持分块 map-reduce，不截断单条消息）。
 
     @param workspace 工作区根
     @param span_messages 本轮新挤出段
@@ -440,39 +528,52 @@ def summarize_span_to_anchor_delta(
     @param artifact_trail 硬性文件清单
     @param retrieval_block Tier3 检索结果
     @param model_name 压缩用模型
+    @param summary_chunk_chars 单段 LLM 输入字符上限，超出则分块摘要后合并
     @return 章节增量 dict
     """
-    transcript = _messages_to_transcript(span_messages)
     existing_preview = json.dumps(existing_sections, ensure_ascii=False, indent=2)
-    if len(existing_preview) > 6000:
-        existing_preview = existing_preview[:6000] + "\n…"
+    chunks = _chunk_messages_for_summary(span_messages, max_chars=summary_chunk_chars)
+    partial_deltas: list[dict[str, str]] = []
 
-    prompt_parts = [
-        "你是 coding agent 的会话压缩器。根据「本轮新挤出的对话片段」更新会话锚点。",
-        "只输出一个 JSON 对象，键必须且仅能包含：",
-        "session_goal, files_modified, decisions, errors_resolved, pending_tasks, related_code, detail_pointers",
-        "每个值为中文字符串；无信息则空字符串。禁止编造。",
-        "files_modified 须为列表行，每行 `- 相对路径: 说明`；可合并 artifact 中的路径。",
-        "detail_pointers 可写 archive/spill 以外的补充说明。",
-        "related_code 可吸收下方检索结果要点。",
+    for idx, chunk_msgs in enumerate(chunks):
+        transcript = _messages_to_transcript(chunk_msgs)
+        prompt_parts = [
+            _summarize_prompt_header(),
+            f"（第 {idx + 1}/{len(chunks)} 段）" if len(chunks) > 1 else "",
+            "",
+            f"已有锚点（勿重复堆砌，仅补充新信息）：\n{existing_preview}",
+        ]
+        if artifact_trail.strip() and idx == 0:
+            prompt_parts.append(
+                f"\n硬性事实（必须写入 files_modified 或 decisions）：\n{artifact_trail}"
+            )
+        if retrieval_block.strip() and idx == len(chunks) - 1:
+            prompt_parts.append(f"\n代码检索结果：\n{retrieval_block}")
+        prompt_parts.append(f"\n本段对话：\n{transcript}")
+        partial_deltas.append(
+            _invoke_anchor_summary_llm(
+                workspace,
+                "\n".join(prompt_parts),
+                model_name=model_name,
+            )
+        )
+
+    if len(partial_deltas) == 1:
+        return partial_deltas[0]
+
+    consolidate_prompt = [
+        _summarize_prompt_header(),
         "",
-        f"已有锚点（勿重复堆砌，仅补充新信息）：\n{existing_preview}",
+        "以下为多段对话分别摘要的 JSON，请合并为一份无重复、信息完整的 JSON：",
+        json.dumps(partial_deltas, ensure_ascii=False, indent=2),
+        "",
+        f"已有锚点：\n{existing_preview}",
     ]
-    if artifact_trail.strip():
-        prompt_parts.append(f"\n硬性事实（必须写入 files_modified 或 decisions）：\n{artifact_trail}")
-    if retrieval_block.strip():
-        prompt_parts.append(f"\n代码检索结果：\n{retrieval_block}")
-    prompt_parts.append(f"\n本轮新挤出对话片段：\n{transcript}")
-
-    llm = create_gateway_llm(workspace)
-    if model_name:
-        llm = llm.bind(model=model_name)
-    response = llm.invoke([HumanMessage(content="\n".join(prompt_parts))])
-    text = getattr(response, "content", str(response))
-    if isinstance(text, list):
-        text = "".join(str(x) for x in text)
-    text = str(text).strip()
-    return _parse_anchor_delta_json(text)
+    return _invoke_anchor_summary_llm(
+        workspace,
+        "\n".join(consolidate_prompt),
+        model_name=model_name,
+    )
 
 
 def _parse_anchor_delta_json(text: str) -> dict[str, str]:
@@ -532,6 +633,7 @@ def run_anchor_update(
     compress_model: str | None,
     retrieval_enabled: bool,
     retrieval_top_k: int,
+    summary_chunk_chars: int = 120_000,
 ) -> tuple[dict[str, str], str | None]:
     """
     Tier 2+3：增量更新锚点并落盘。
@@ -565,6 +667,7 @@ def run_anchor_update(
         artifact_trail=artifact,
         retrieval_block=retrieval_block,
         model_name=compress_model,
+        summary_chunk_chars=summary_chunk_chars,
     )
     if artifact.strip() and not delta.get(SECTION_FILES_MODIFIED):
         delta[SECTION_FILES_MODIFIED] = artifact
@@ -607,16 +710,6 @@ def load_session_from_manifest(workspace: Path, thread_id: str):
         manual = data.get("active_skills_manual")
         if isinstance(manual, list):
             session.active_skills = [str(x) for x in manual]
-        auto = data.get("auto_match_skills")
-        if auto is not None:
-            if isinstance(auto, str):
-                session.auto_match_skills = auto.strip().lower() not in (
-                    "0",
-                    "false",
-                    "no",
-                )
-            else:
-                session.auto_match_skills = bool(auto)
     except (OSError, json.JSONDecodeError):
         pass
     return session

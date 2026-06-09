@@ -121,7 +121,7 @@ def print_index_status(workspace: Path) -> None:
 
     @param workspace 工作区根
     """
-    from llgraph.ui.output import emit_report
+    from llgraph.terminal.output import emit_report
 
     status = get_index_status(workspace)
     log_dir = index_log_dir(workspace)
@@ -192,7 +192,7 @@ def print_index_status(workspace: Path) -> None:
 
 def print_index_interactive_help() -> None:
     """交互会话 /index 用法。"""
-    from llgraph.ui.output import emit_block
+    from llgraph.terminal.output import emit_block
 
     emit_block(
         "命令:\n"

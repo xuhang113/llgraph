@@ -36,7 +36,10 @@ def resolve_auto_compress_threshold(settings: ContextSettings) -> int:
     ratio_threshold = int(settings.max_tokens_estimate * settings.auto_compress_ratio)
     if settings.compress_trigger_max_tokens is not None:
         return min(ratio_threshold, settings.compress_trigger_max_tokens)
-    # 大窗口模型默认加绝对上限，避免 80%×262K 导致长期不压缩
+    # cursor 策略默认仅按比例触发，接近满窗再摘要（对齐 Cursor）
+    if settings.compress_strategy == "cursor":
+        return ratio_threshold
+    # legacy：大窗口模型默认加绝对上限
     if settings.max_tokens_estimate > 128_000:
         return min(ratio_threshold, 64_000)
     return ratio_threshold

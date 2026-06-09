@@ -71,14 +71,14 @@ class IndexWatchService:
             from watchdog.events import FileSystemEventHandler
             from watchdog.observers import Observer
         except ImportError:
-            from llgraph.ui.output import emit_warn
+            from llgraph.terminal.output import emit_warn
 
             emit_warn(_WATCHDOG_MISSING)
             return False
 
         lock = IndexLock(self._workspace)
         if not lock.try_acquire():
-            from llgraph.ui.output import emit_warn
+            from llgraph.terminal.output import emit_warn
 
             emit_warn("[index-watch] 已有全量 llgraph index 在运行，跳过自动监听")
             return False
@@ -106,9 +106,9 @@ class IndexWatchService:
         self._observer.start()
         self._running = True
         debounce = self._settings.watch_debounce_sec
-        from llgraph.ui.context import ui_notify
+        from llgraph.terminal.notify import notify
 
-        ui_notify("index-watch", f"已启动 debounce={debounce}s")
+        notify("index-watch", f"已启动 debounce={debounce}s")
         return True
 
     def stop(self) -> None:
@@ -137,9 +137,9 @@ class IndexWatchService:
             except Exception:
                 pass
             self._index_lock = None
-        from llgraph.ui.context import ui_notify
+        from llgraph.terminal.notify import notify
 
-        ui_notify("index-watch", "已停止")
+        notify("index-watch", "已停止")
 
     def notify_changed(self, rel_path: str) -> None:
         """

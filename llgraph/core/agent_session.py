@@ -35,3 +35,4 @@ class AgentSessionContext:
     web_search_enabled: bool = False
     edit_confirm_gate: EditConfirmGate | None = None
     sandbox_policy: SandboxPolicy | None = None
+    sandbox_cli_enabled: bool | None = None

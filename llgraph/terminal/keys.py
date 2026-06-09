@@ -1,4 +1,4 @@
-"""TUI 快捷键与退出口令（唯一维护点）。"""
+"""终端快捷键与退出口令（唯一维护点）。"""
 
 from __future__ import annotations
 
@@ -10,13 +10,10 @@ MSG_MENU_CANCELLED = "已取消。"
 
 HELP_SHORTCUT_LINES: tuple[str, ...] = (
     "  exit, quit, q      退出",
-    "  TUI: Ctrl+C / Ctrl+Q 退出 · Ctrl+O 步骤侧栏",
-    "  terminal: ↑↓ 历史 · /paste 多行粘贴",
+    "  Ctrl+C             中断当前轮并退出",
+    "  ↑↓ 历史 · /paste   多行粘贴",
     "  /help /trace /paste  元命令",
-    "  --ui tui            Textual TUI（默认 terminal；或 LLGRAPH_UI）",
 )
-
-BANNER_SHORTCUT_HINT = "Ctrl+Q 退出 · /help"
 
 
 def is_exit_command(text: str) -> bool:

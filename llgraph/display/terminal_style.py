@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from llgraph.ui.style import indent_line, sty
+from llgraph.terminal.style import indent_line, sty
 
 LABEL_COL_WIDTH = 14
 _TREE_BRANCH = "├─"

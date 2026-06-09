@@ -80,9 +80,11 @@ class ContextSpill:
             disabled=disabled or not settings.enabled,
         )
 
-    def _should_spill(self, content: str) -> bool:
+    def _should_spill(self, tool_name: str, content: str) -> bool:
         """判断是否应对结果落盘。"""
         if self.disabled or not self.settings.enabled:
+            return False
+        if tool_name in self.settings.spill_exempt_tools:
             return False
         text = content.strip()
         if not text:
@@ -112,7 +114,7 @@ class ContextSpill:
         @param content 原始工具输出
         @return 可能已替换为指针的文本
         """
-        if not self._should_spill(content):
+        if not self._should_spill(tool_name, content):
             return content
 
         spill_path = self._next_spill_path(tool_name)
@@ -176,7 +178,7 @@ class ContextSpill:
             f"全文路径（相对工作区）: {rel_path}\n"
             f"规模: {total_lines} 行 / {total_chars} 字符\n"
             f"说明: 下文仅为末尾预览；需要全文或指定段落时请 read_file(path, start_line, end_line)，"
-            f"或对落盘文件 grep_files。\n"
+            f"或对落盘文件 grep_files（勿重复 read 源码）。\n"
             f"--- 末尾预览 ---\n"
             f"{preview}\n"
             f"--- 预览结束 ---"

@@ -20,15 +20,27 @@ _BUILTIN_RETRIEVAL_THOUGHT = """\
 每轮**准备调用工具之前**，先用 1～3 句中文说明：当前目标、上一步结果、本步打算做什么。
 若终端为 `/trace all`，这段规划会显示在「模型规划」之前，便于对照。
 
+## 目录浏览与文件发现（禁止 shell 替代）
+
+- **list_directory**：列目录（如 `path="docs"`、`.llgraph/context/tool-results`）；**禁止** `ls` / `ls -la`。
+- **glob_files**：按文件名找（如 `**/collect_alert.sh`）；**禁止** `find`。
+- **grep_files**：按内容搜（含 .md）；**禁止** shell `grep`/`rg`。
+- **read_file**：读已知路径文件；**禁止** shell `cat`/`head`/`tail`。
+
+## 批量文件名检索（禁止逐个 glob）
+
+- **多个已知文件名/脚本名**：**一次** `grep_files`（如 `pattern="collect_alert|gitlab_monitor|dm-daily-task"`，`path="markdowns"` 或 `path="."`）；**禁止**对每个名字单独 `glob_files`。
+- **glob 全未命中或连续多个 glob 为 0**：源文件可能不在工作区，仅在 **markdowns/docs** 台账/crontab 文档中被引用；改 `grep_files`（`path="markdowns"` 或 `path="docs"`）或 `read_file` 已知文档，**勿再逐个 glob**。
+
 ## 检索无结果时必须重试（勿立刻断言「不存在」）
 
-1. **扩词**：同义词、英文/缩写、连字符与下划线变体、易混项目名（如 graphify → llgraph、code index、.llgraph）。
-2. **search_workspace**：一次在 `keywords` 中列出 **5～12 个**词，不要只写一个；可换 `path`（如某服务目录、`.llgraph`、`docs`）。
-3. **grep_files**：可用正则 OR，例如 `foo|bar|FooBar`。
-4. **search_code_hybrid**：语义/概念类问题且已 `llgraph index` 时优先。
-5. **read_file**：对 manifest、embedding.json、README 等配置先读后答，避免臆造产品名。
+1. **glob_files**：文件名是否存在（如 `**/collect_alert.sh`）。
+2. **grep_files**：字面/正则搜内容（含 .md）；多词用 `词A|词B`。
+3. **search_code_hybrid**：业务概念 / crontab / 自然语言（已 llgraph index 时）。
+4. **search_workspace**：`keywords` 一次 **5～12** 个词；换 `path`（`markdowns`、`docs`）。
+5. **read_file**：manifest、embedding.json、README 等配置先读后答。
 
-同一用户问题内，至少换 **2 种**检索策略（不同工具或不同 keywords/path）再下「工作区无此内容」的结论。
+同一用户问题内，至少换 **2 种**工具；**禁止**对同一 find/glob/ls 空结果重复超过 1 次。
 """
 
 

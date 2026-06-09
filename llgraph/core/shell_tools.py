@@ -44,12 +44,12 @@ def _append_terminal_log(
         pass
 
 
-def _inactive_sandbox_policy(workspace: Path) -> SandboxPolicy:
+def _inactive_sandbox_policy(workspace: Path, *, allow_write: bool = False) -> SandboxPolicy:
     from llgraph.config.sandbox_settings import resolve_sandbox_settings
     from llgraph.sandbox.policy import build_sandbox_policy
 
     settings = resolve_sandbox_settings(workspace)
-    return build_sandbox_policy(workspace, settings, cli_enabled=False)
+    return build_sandbox_policy(workspace, settings, cli_enabled=False, allow_write=allow_write)
 
 
 def create_shell_tools(
@@ -70,7 +70,7 @@ def create_shell_tools(
     if not shell_settings.enabled:
         return []
 
-    sandbox = ctx.sandbox_policy or _inactive_sandbox_policy(ctx.root)
+    sandbox = ctx.sandbox_policy or _inactive_sandbox_policy(ctx.root, allow_write=ctx.allow_write)
 
     def run_shell_command(command: str, working_directory: str = ".") -> str:
         """

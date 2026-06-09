@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-from llgraph.ui.output import emit, emit_hint
+from llgraph.terminal.output import emit, emit_hint
 
 # 须在首次 input() 之前加载，macOS 上才能让 ↑↓ 翻阅历史
 try:

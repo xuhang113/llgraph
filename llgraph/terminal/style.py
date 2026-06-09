@@ -1,4 +1,4 @@
-"""TUI 追踪行样式（Rich/ANSI 语义，供 trace_display 构建文本）。"""
+"""终端追踪行样式（ANSI 语义，供 trace_display 构建文本）。"""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def _is_interactive_tty() -> bool:
 
 def color_enabled() -> bool:
     """
-    是否启用 ANSI（经典终端 trace 保留；TUI RichLog 会剥离）。
+    是否启用 ANSI 着色。
 
     LLGRAPH_COLOR=1 可强制着色；LLGRAPH_COLOR=0 强制关闭。
     交互终端默认着色（与 prompt-toolkit 斜杠补全一致），NO_COLOR 仅影响非交互输出。

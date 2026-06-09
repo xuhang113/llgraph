@@ -134,17 +134,13 @@ def resolve_active_skills(
     skills: list[SkillEntry],
     *,
     session_active: list[str],
-    user_message: str,
-    auto_match: bool,
 ) -> list[SkillEntry]:
     """
-    合并会话 /skill 启用与自动匹配的技能。
+    合并 /skill 手动置顶的技能（不自动匹配）。
 
     @param skills 全部技能
     @param session_active /skill 指定的名称
-    @param user_message 用户消息
-    @param auto_match 是否自动匹配
-    @return 本轮生效的技能实体
+    @return 置顶技能实体
     """
     by_name = {s.name.lower(): s for s in skills}
     order: list[str] = []
@@ -152,11 +148,5 @@ def resolve_active_skills(
         key = name.lower()
         if key in by_name and key not in [n.lower() for n in order]:
             order.append(by_name[key].name)
-
-    if auto_match:
-        for name in match_skills_by_message(skills, user_message):
-            key = name.lower()
-            if key in by_name and key not in [n.lower() for n in order]:
-                order.append(by_name[key].name)
 
     return [by_name[n.lower()] for n in order]
