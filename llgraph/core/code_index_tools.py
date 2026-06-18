@@ -4,13 +4,13 @@ from pathlib import Path
 
 from langchain_core.tools import StructuredTool
 
-from llgraph.code_index.hybrid import search_hybrid
+from llgraph.code_index.parallel_search import search_parallel
 from llgraph.code_index.search import search_semantic
 
 
 def create_code_index_tools(workspace_root: Path) -> list:
     """
-    创建语义 / Hybrid 检索工具。
+    创建语义 / 并行检索工具。
 
     @param workspace_root 工作区根
     @return Tool 列表
@@ -41,28 +41,28 @@ def create_code_index_tools(workspace_root: Path) -> list:
             tool="search_code_semantic",
         )
 
-    def search_code_hybrid(
+    def search_code_parallel(
         query: str,
-        top_k: int = 10,
+        top_k: int = 15,
         path_prefix: str = ".",
     ) -> str:
         """
-        Hybrid 检索（索引已启用时**首选**）：路径/文件名 + 内容 grep + 向量语义，RRF 融合。
+        并行代码检索（字面量 grep + 向量，无内嵌 LLM）。
 
-        已内聚 search_files 的路径匹配能力；找 crontab 脚本、Java Job、Python 实现时直接用本工具，
-        勿再单独调用 search_files。
+        意图不清时**可选调用一次**；请在 query 里自行扩展类名/关键字（空格分隔）。
+        同一轮后续用 read_files + grep_files 追上下游，勿再调用本工具。
 
-        @param query 脚本名、业务描述、类名、错误信息或概念（可中英文组合）
-        @param top_k 最终返回条数，默认 10
-        @param path_prefix 限定相对子目录，如 queryplatform-backend-service
+        @param query 主 Agent 扩展后的检索词（类名 + 业务描述）
+        @param top_k 最终返回条数，默认 15
+        @param path_prefix 限定相对子目录（建议仓库名），默认 .
         """
-        return search_hybrid(
+        return search_parallel(
             root,
             query,
             top_k=top_k,
             path_prefix=path_prefix,
             source="agent",
-            tool="search_code_hybrid",
+            tool="search_code_parallel",
         )
 
     return [
@@ -72,8 +72,8 @@ def create_code_index_tools(workspace_root: Path) -> list:
             description=search_code_semantic.__doc__ or "",
         ),
         StructuredTool.from_function(
-            func=search_code_hybrid,
-            name="search_code_hybrid",
-            description=search_code_hybrid.__doc__ or "",
+            func=search_code_parallel,
+            name="search_code_parallel",
+            description=search_code_parallel.__doc__ or "",
         ),
     ]

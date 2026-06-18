@@ -13,6 +13,7 @@ from llgraph.core.filesystem_tools import create_filesystem_tools
 from llgraph.session.session_history_tools import create_session_history_tools
 from llgraph.core.shell_tools import create_shell_tools
 from llgraph.core.web_search_tools import create_web_search_tools
+from llgraph.plan.plan_tools import create_plan_tools
 from llgraph.config.mcp_config import resolve_mcp_settings
 from llgraph.core.mcp_tools import McpToolRegistry, create_mcp_tools
 from llgraph.survey.edit_confirm import EditConfirmGate
@@ -72,6 +73,7 @@ def get_agent_tools(
     )
     index_tools = create_code_index_tools(root)
     history_tools = create_session_history_tools(root)
+    plan_tools = create_plan_tools(root)
     shell_tools = create_shell_tools(ctx, allow_write=allow_write)
     sandbox_blocks_network = (
         sandbox_policy is not None
@@ -90,6 +92,7 @@ def get_agent_tools(
         *shell_tools,
         *index_tools,
         *history_tools,
+        *plan_tools,
         *web_tools,
         *extra,
     ]

@@ -9,7 +9,7 @@ from typing import Any
 from langchain_core.messages import BaseMessage, ToolMessage
 
 from llgraph.context.context_compressor import estimate_tokens
-from llgraph.context.context_settings import ContextSettings, resolve_context_settings
+from llgraph.context.context_settings import ContextSettings, is_auto_compress_strategy, resolve_context_settings
 from llgraph.context.context_spill import mask_tool_message_content
 
 
@@ -36,8 +36,8 @@ def resolve_auto_compress_threshold(settings: ContextSettings) -> int:
     ratio_threshold = int(settings.max_tokens_estimate * settings.auto_compress_ratio)
     if settings.compress_trigger_max_tokens is not None:
         return min(ratio_threshold, settings.compress_trigger_max_tokens)
-    # cursor 策略默认仅按比例触发，接近满窗再摘要（对齐 Cursor）
-    if settings.compress_strategy == "cursor":
+    # auto 策略默认仅按比例触发，接近满窗再摘要
+    if is_auto_compress_strategy(settings.compress_strategy):
         return ratio_threshold
     # legacy：大窗口模型默认加绝对上限
     if settings.max_tokens_estimate > 128_000:

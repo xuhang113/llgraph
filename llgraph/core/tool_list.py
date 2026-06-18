@@ -28,7 +28,7 @@ _BUILTIN_GROUPS: tuple[tuple[str, frozenset[str]], ...] = (
     ("Shell", frozenset({"run_shell_command"})),
     (
         "代码索引",
-        frozenset({"search_code_semantic", "search_code_hybrid"}),
+        frozenset({"search_code_semantic", "search_code_parallel"}),
     ),
     ("Web", frozenset({"web_search"})),
 )

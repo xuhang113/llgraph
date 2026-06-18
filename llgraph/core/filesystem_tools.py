@@ -108,7 +108,7 @@ def _format_empty_glob_message(
     """
     scope = _format_path_scope_hint(path, glob_pattern=glob_pattern)
     if index_ready:
-        next_tools = "grep_files(pattern=...) 或 search_code_hybrid(query=...)"
+        next_tools = "grep_files(pattern=...) 或 search_code_parallel(query=...)"
     else:
         next_tools = "grep_files、search_files 或 search_workspace"
     return (
@@ -136,7 +136,7 @@ def _format_empty_grep_message(
     """
     scope = _format_path_scope_hint(path)
     if index_ready:
-        tail = "可改用 search_code_hybrid(query=...) 做语义检索。"
+        tail = "可改用 search_code_parallel(query=...) 做语义检索。"
     else:
         tail = "可扩大 path=\".\" 或换 search_workspace。"
     return (
@@ -162,7 +162,7 @@ def _reject_unsafe_relative_path(path: str) -> str | None:
     normalized = raw.replace("\\", "/")
     if normalized.startswith("../") or "/../" in normalized or normalized.endswith("/.."):
         return (
-            f"路径非法: {path!r}（禁止 ../；请使用 search_code_hybrid/glob_files "
+            f"路径非法: {path!r}（禁止 ../；请使用 search_code_parallel/glob_files "
             "返回的完整相对路径，勿拼接猜测）。"
         )
     return None
@@ -463,7 +463,7 @@ def create_filesystem_tools(
         """
         if not ripgrep_available():
             return (
-                "错误: 未安装 ripgrep (rg)。请安装后重试，或改用 search_files / search_code_hybrid。"
+                "错误: 未安装 ripgrep (rg)。请安装后重试，或改用 search_files / search_code_parallel。"
             )
         paths, err = ripgrep_files(
             ctx.root,
@@ -516,7 +516,7 @@ def create_filesystem_tools(
         """
         按单个关键字在文件名/路径中查找（不读内容）。
 
-        本工作区已向量化索引时**不注册此工具**；请用 search_code_hybrid（已含路径匹配）。
+        本工作区已向量化索引时**不注册此工具**；请用 search_code_parallel（已含路径匹配）。
 
         @param keyword 一个关键字（不区分大小写）
         @param path 起始相对目录，默认 .
@@ -542,7 +542,7 @@ def create_filesystem_tools(
         """
         多关键词并集检索工作区（文件名 + 可选内容 grep）。
 
-        索引已启用时请用 search_code_hybrid，勿用本工具做探索性检索。
+        索引已启用时请用 search_code_parallel，勿用本工具做探索性检索。
         同义词、英文路径、项目缩写等须由你在 keywords 中一次给出多个（5～12 个为宜），
         工具不做业务词典映射。topic 仅作补充切分（整句、去「业务/服务」等后缀、提取英文词）。
 
@@ -748,7 +748,7 @@ def create_filesystem_tools(
         """
         一次批量读取多个文件（对齐 Cursor：规划后一次取数，减少 I/O 与 ReAct 轮次）。
 
-        适用：search_code_hybrid / glob_files / grep_files 已给出多个**完整相对路径**，
+        适用：search_code_parallel / glob_files / grep_files 已给出多个**完整相对路径**，
         需要对比或梳理多个类/模块时。**能批量就批量**，单次最多 8 个路径；**禁止** path 含 ../。
         结果全文进上下文（不落盘 spill）；超大文件请 read_file 分段。
 

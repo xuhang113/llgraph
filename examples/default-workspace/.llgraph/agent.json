@@ -20,13 +20,26 @@
     "failures_before_hint": 2
   },
   "context": {
+    "_docs": {
+      "compress_strategy": "auto | legacy | cursor(已废弃,等同auto)。auto=远早对话LLM摘要+出站按token自动扩展user轮；legacy=按keep_recent_turns保留尾段。",
+      "dispatch_keep_user_turns": "0=自动扩展出站轮数；>0=固定保留N个user轮。",
+      "dispatch_min_user_turns": "自动出站至少保留user轮数，默认2",
+      "dispatch_max_user_turns": "自动出站最多保留user轮数，默认8",
+      "dispatch_window_token_ratio": "自动出站历史可用上下文比例，默认0.35"
+    },
+    "compress_strategy": "auto",
+    "dispatch_keep_user_turns": 0,
+    "dispatch_min_user_turns": 2,
+    "dispatch_max_user_turns": 8,
+    "dispatch_window_token_ratio": 0.35,
+    "compress_during_react": true,
     "budget_source": "model",
     "context_fallback_max_tokens": 200000,
-    "auto_compress_ratio": 0.8,
+    "auto_compress_ratio": 0.85,
     "compress_trigger_max_tokens": 64000,
     "incremental_tool_prune": true,
     "keep_recent_tool_messages": 12,
-    "keep_recent_turns": 6,
+    "keep_recent_turns": 2,
     "keep_recent_token_ratio": 0.25,
     "compress_model": null,
     "session_archive_on_compress": true,

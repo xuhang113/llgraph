@@ -290,6 +290,59 @@ class SessionEditTracker:
         candidate.relative_to(self.workspace.resolve())
         return candidate
 
+    def _rewrite_edits_jsonl(self) -> None:
+        """将内存账本写回 edits.jsonl。"""
+        if not self.settings or not self.settings.persist_edits:
+            return
+        self._ensure_edits_file()
+        try:
+            payload = "\n".join(
+                json.dumps(asdict(record), ensure_ascii=False) for record in self.records
+            )
+            if payload:
+                payload += "\n"
+            self._edits_path.write_text(payload, encoding="utf-8")
+        except OSError:
+            pass
+
+    def _drop_path_ledger(self, rel: str) -> None:
+        """
+        回滚成功后从账本移除路径。
+
+        @param rel 工作区相对路径
+        """
+        rel = self._normalize_rel(rel)
+        if not rel:
+            return
+        self.records = [record for record in self.records if record.rel_path != rel]
+        self._rewrite_edits_jsonl()
+
+    def _is_undo_pending(self, rel: str) -> bool:
+        """
+        是否仍有可回滚的磁盘改动。
+
+        @param rel 工作区相对路径
+        @return 新建文件仍存在，或已修改文件与快照不一致
+        """
+        rel = self._normalize_rel(rel)
+        if not rel:
+            return False
+        snap_path = self._snapshot_path_for(rel)
+        try:
+            target = self._resolve_target(rel)
+        except ValueError:
+            return False
+        if snap_path.is_file():
+            if not target.is_file():
+                return True
+            try:
+                return snap_path.read_text(encoding="utf-8") != target.read_text(
+                    encoding="utf-8"
+                )
+            except OSError:
+                return True
+        return target.is_file()
+
     def list_snapshot_paths(self) -> list[str]:
         """
         列出本会话所有快照对应的路径。
@@ -320,21 +373,37 @@ class SessionEditTracker:
 
     def _undo_targets(self) -> list[str]:
         """
-        汇总可还原目标：账本路径 + 仅存在快照的路径。
+        汇总仍可回滚的目标（账本路径 + 快照路径，且磁盘状态待还原）。
 
         @return 去重相对路径
         """
         seen: set[str] = set()
         ordered: list[str] = []
         for rel in self._all_edited_paths():
-            if rel not in seen:
-                seen.add(rel)
-                ordered.append(rel)
+            if rel in seen or not self._is_undo_pending(rel):
+                continue
+            seen.add(rel)
+            ordered.append(rel)
         for rel in self.list_snapshot_paths():
-            if rel not in seen:
-                seen.add(rel)
-                ordered.append(rel)
+            if rel in seen or not self._is_undo_pending(rel):
+                continue
+            seen.add(rel)
+            ordered.append(rel)
         return ordered
+
+    def _finalize_undo(self, rel: str, result: UndoItemResult) -> UndoItemResult:
+        """
+        回滚成功后清理账本，避免 Web 列表仍显示已处理文件。
+
+        @param rel 工作区相对路径
+        @param result 还原结果
+        @return 原结果
+        """
+        if result.action in {"restored", "deleted"}:
+            self._drop_path_ledger(rel)
+        elif result.action == "skipped" and not self._is_undo_pending(rel):
+            self._drop_path_ledger(rel)
+        return result
 
     def restore_path(self, rel_path: str) -> UndoItemResult:
         """
@@ -358,18 +427,27 @@ class SessionEditTracker:
                 content = snap_path.read_text(encoding="utf-8")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
-                return UndoItemResult(rel, "restored", "已从会话首次编辑前快照还原")
+                return self._finalize_undo(
+                    rel,
+                    UndoItemResult(rel, "restored", "已从会话首次编辑前快照还原"),
+                )
             except OSError as exc:
                 return UndoItemResult(rel, "failed", str(exc))
 
         if target.is_file():
             try:
                 target.unlink()
-                return UndoItemResult(rel, "deleted", "已删除本会话新建的文件（无编辑前快照）")
+                return self._finalize_undo(
+                    rel,
+                    UndoItemResult(rel, "deleted", "已删除本会话新建的文件（无编辑前快照）"),
+                )
             except OSError as exc:
                 return UndoItemResult(rel, "failed", str(exc))
 
-        return UndoItemResult(rel, "skipped", "无快照且磁盘上不存在该文件")
+        return self._finalize_undo(
+            rel,
+            UndoItemResult(rel, "skipped", "无快照且磁盘上不存在该文件"),
+        )
 
     def restore_all(self) -> list[UndoItemResult]:
         """
@@ -378,6 +456,32 @@ class SessionEditTracker:
         @return 每个路径的还原结果
         """
         return [self.restore_path(rel) for rel in self._undo_targets()]
+
+    def web_changes_payload(self) -> dict[str, object]:
+        """
+        Web UI：本会话可还原文件摘要。
+
+        @return paths / total / can_undo
+        """
+        targets = self._undo_targets()
+        paths: list[dict[str, object]] = []
+        for rel in targets:
+            has_snap = self._snapshot_path_for(rel).is_file()
+            count = sum(1 for r in self.records if r.rel_path == rel)
+            paths.append(
+                {
+                    "path": rel,
+                    "has_snapshot": has_snap,
+                    "kind": "modified" if has_snap else "created",
+                    "edit_count": count,
+                }
+            )
+        return {
+            "session_id": self.session_id,
+            "paths": paths,
+            "total": len(paths),
+            "can_undo": bool(targets),
+        }
 
     def format_undo_report(self, results: list[UndoItemResult]) -> str:
         """
@@ -453,9 +557,19 @@ class SessionEditTracker:
         """
         rel = rel_path.strip().lstrip("/")
         snap_path = self._snapshots_dir / f"{encode_rel_path(rel)}.txt"
+        full = self.workspace / rel
         if not snap_path.is_file():
+            if full.is_file():
+                try:
+                    size = full.stat().st_size
+                except OSError:
+                    size = 0
+                return (
+                    f"新建文件: {rel}（{size} 字节）。\n"
+                    "本会话首次写入前无快照；点击「回滚」或 /undo 将删除该文件。"
+                )
             return (
-                f"无快照: 本会话尚未编辑过 {rel!r}，或该文件为新建（无编辑前原文）。\n"
+                f"无快照: 本会话尚未编辑过 {rel!r}，或该文件已回滚删除。\n"
                 "可先 read_file 查看当前内容，或使用 git diff。"
             )
         full = self.workspace / rel

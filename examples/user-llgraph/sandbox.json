@@ -1,7 +1,7 @@
 {
   "enabled": false,
   "bindWriteMode": true,
-  "autoEnableOnReadonly": true,
+  "autoEnableOnReadonly": false,
   "mode": "workspace_readwrite",
   "network": "deny",
   "additionalReadonlyPaths": [],

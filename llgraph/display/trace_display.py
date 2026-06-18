@@ -1,6 +1,7 @@
 """终端追踪输出：/trace 四档（all / steps / reply / none）。"""
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -9,7 +10,9 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
+from llgraph.display.assistant_content import AssistantTurnContent, build_assistant_turn_content
 from llgraph.display.execution_log import _usage_dict_from_mapping
+from llgraph.survey.survey_prompt import strip_survey_for_display
 
 DEFAULT_PREVIEW_LINES = 4
 STEP_INLINE_PREVIEW_LINES = 3
@@ -387,9 +390,15 @@ class TraceSession:
     mode: TraceMode = TraceMode.STEPS
     preview_lines: int = DEFAULT_PREVIEW_LINES
     show_step_tokens: bool = True
+    render_markdown: bool = True
+    """仅控制 trace 内助手回复是否做终端 Markdown 渲染（Rich 或 ANSI 回退）。"""
+    use_rich: bool = False
+    """助手回复是否用 Rich（默认关；/trace rich on 或 LLGRAPH_MD_RICH=1）。"""
     last_turn_steps: list[TraceStepRecord] = field(default_factory=list)
     last_turn_raw_reply: str = ""
     trace_sink: Any = None
+    """当前轮 TurnTracePrinter；供工具内部子过程（检索参数等）注册步骤。"""
+    active_printer: Any = None
 
     def shows_process(self) -> bool:
         """是否展示规划/工具过程（steps 折叠或 all 完整）。"""
@@ -406,6 +415,26 @@ class TraceSession:
     def is_silent(self) -> bool:
         """是否完全不展示过程。"""
         return self.mode == TraceMode.NONE
+
+
+def emit_trace_milestone(session: TraceSession, text: str) -> None:
+    """
+    流程里程碑：优先写入 trace sink（Web SSE），否则回退终端 emit_milestone。
+
+    @param session 当前 trace 会话
+    @param text 里程碑说明
+    """
+    body = text.lstrip("\n")
+    if not body.startswith("▶"):
+        body = f"▶ {body}"
+    line = f"[{_timestamp()}] {body}"
+    sink = session.trace_sink
+    if sink is not None:
+        sink.line(line)
+        return
+    from llgraph.terminal.output import emit_milestone
+
+    emit_milestone(text)
 
 
 def print_invoke_prelude(trace_session: TraceSession | None) -> None:
@@ -524,12 +553,39 @@ LAST_TRACE_SESSION: TraceSession | None = None
 
 @dataclass
 class TurnRunResult:
-    """单轮执行结果（供执行日志与调用方）。"""
+    """
+    单轮执行结果（供执行日志与调用方）。
+
+    text / raw_text 均为 Markdown 原文，未经 Rich/ANSI 渲染；
+    Web 取 content 或 to_content_payload()，终端 trace 自行渲染展示。
+    """
 
     text: str
     raw_text: str = ""
     tool_names: list[str] = field(default_factory=list)
     duration_sec: float = 0.0
+
+    @property
+    def content(self) -> AssistantTurnContent:
+        """
+        结构化内容载荷（Markdown 原文）。
+
+        @return AssistantTurnContent
+        """
+        return build_assistant_turn_content(
+            markdown=self.text,
+            raw_markdown=self.raw_text,
+            tool_names=self.tool_names,
+            duration_sec=self.duration_sec,
+        )
+
+    def to_content_payload(self) -> dict:
+        """
+        Web/API 序列化（format=markdown，不含终端渲染产物）。
+
+        @return dict
+        """
+        return self.content.to_payload()
 
 
 class TurnTracePrinter:
@@ -542,8 +598,13 @@ class TurnTracePrinter:
         self._step_index = 0
         self._final_text: str = ""
         self._last_thinking_text: str = ""
+        self._thinking_finalized: bool = False
+        self._thinking_emit_at: float = 0.0
+        self._thinking_emit_len: int = 0
+        self._thinking_header_printed: bool = False
         self._printed_final_header = False
         self._streamed_reply = False
+        self._reply_body_printed = False
         self._tool_names: list[str] = []
         self._steps: list[TraceStepRecord] = []
         self._pending_usage: StepUsage | None = None
@@ -598,6 +659,83 @@ class TurnTracePrinter:
         )
         return self._step_index
 
+    def on_thinking_chunk(self, text: str) -> None:
+        """
+        流式 thinking 更新：Web SSE 实时推送；终端 steps/all 打摘要行。
+
+        @param text 截至当前的完整 thinking 文本
+        """
+        cleaned = text.strip()
+        if not cleaned:
+            return
+        if len(cleaned) < len(self._last_thinking_text):
+            return
+        self._last_thinking_text = cleaned
+        if not _thinking_worth_trace_step(cleaned):
+            return
+        sink = self._session.trace_sink
+        now = time.perf_counter()
+        should_emit = (
+            self._thinking_emit_len == 0
+            or len(cleaned) - self._thinking_emit_len >= 300
+            or now - self._thinking_emit_at >= 0.35
+        )
+        if sink is not None and hasattr(sink, "thinking_update") and should_emit:
+            self._thinking_emit_at = now
+            self._thinking_emit_len = len(cleaned)
+            sink.thinking_update(cleaned)
+        if self._session.shows_process() and not self._thinking_header_printed:
+            self._thinking_header_printed = True
+            self._line(
+                _c(f"[{_timestamp()}] ", "90")
+                + _c("▶ 思考中（thinking 流式）…", "33"),
+            )
+
+    def _reset_thinking_capture(self, *, keep_finalized: bool = False) -> None:
+        """下一轮模型调用前清空 thinking 缓冲。"""
+        self._last_thinking_text = ""
+        if not keep_finalized:
+            self._thinking_finalized = False
+        self._thinking_emit_len = 0
+        self._thinking_emit_at = 0.0
+        self._thinking_header_printed = False
+
+    def _finalize_thinking_step(self, *, reset_after: bool = False) -> None:
+        """将本轮 thinking 落为可展开 trace 步骤。"""
+        if self._thinking_finalized:
+            return
+        text = self._last_thinking_text.strip()
+        self._thinking_finalized = True
+        recorded = False
+        if text and _thinking_worth_trace_step(text):
+            recorded = True
+            elapsed = time.perf_counter() - self._step_start
+            body = text.splitlines()
+            char_count = len(text)
+            step_id = self._register_step(
+                "thinking",
+                "模型思考",
+                elapsed,
+                f"{char_count} 字",
+                body_lines=body,
+            )
+            sink = self._session.trace_sink
+            if self._session.shows_process() and not self._session.is_verbose():
+                self._print_step_summary(
+                    step_id,
+                    "模型思考",
+                    elapsed,
+                    f"{char_count} 字",
+                    step_marker="◎",
+                    inline_preview=6,
+                )
+            elif sink is not None and self._steps:
+                sink.step_added(self._steps[-1])
+            if sink is not None and hasattr(sink, "thinking_update"):
+                sink.thinking_update(text)
+        if reset_after:
+            self._reset_thinking_capture(keep_finalized=recorded)
+
     def absorb_usage_from_chunk(self, msg_chunk: Any) -> None:
         """
         从流式 AIMessageChunk 合并 usage（网关常在末包返回）。
@@ -637,18 +775,24 @@ class TurnTracePrinter:
                 return "  " + _c(inline, "35")
         return ""
 
-    def _print_step_inline_detail(self, step_id: int) -> None:
+    def _print_step_inline_detail(
+        self,
+        step_id: int,
+        *,
+        preview_limit: int | None = None,
+    ) -> None:
         """
         折叠模式下步骤行下方缩进预览（无需再输 /trace step）。
 
         @param step_id 步骤编号
+        @param preview_limit 预览行数；默认 STEP_INLINE_PREVIEW_LINES
         """
         if self._session.is_verbose():
             return
         step = next((s for s in self._steps if s.step_id == step_id), None)
         if step is None or not step.body_lines:
             return
-        limit = STEP_INLINE_PREVIEW_LINES
+        limit = preview_limit if preview_limit is not None else STEP_INLINE_PREVIEW_LINES
         for line in step.body_lines[:limit]:
             clipped = _clip_line(line)
             if clipped.lstrip().startswith("【规划】"):
@@ -684,6 +828,8 @@ class TurnTracePrinter:
         summary: str,
         *,
         usage: StepUsage | None = None,
+        step_marker: str = "▶",
+        inline_preview: int | None = None,
     ) -> None:
         resolved = usage
         if resolved is None and self._steps:
@@ -692,16 +838,72 @@ class TurnTracePrinter:
                 resolved = last.usage
         self._line(
             _c(f"[{_timestamp()}] ", "90")
-            + _c(f"▶ #{step_id} {title}", "32")
+            + _c(f"{step_marker} #{step_id} {title}", "32")
             + _c(f"  ({_format_duration(elapsed)})", "90")
             + f"  {summary}"
             + self._format_step_token_suffix(resolved)
             + _step_expand_hint(self._session, step_id),
         )
-        self._print_step_inline_detail(step_id)
+        self._print_step_inline_detail(step_id, preview_limit=inline_preview)
         sink = self._session.trace_sink
         if sink is not None and self._steps:
             sink.step_added(self._steps[-1])
+
+    def emit_preprocess_step(
+        self,
+        title: str,
+        summary: str,
+        body_lines: list[str],
+        elapsed: float,
+        *,
+        kind: str = "preprocess",
+        inline_preview: int | None = None,
+    ) -> int:
+        """
+        注册工具内部前置子过程步骤（如 parallel 内检索参数拆分）。
+
+        在「模型决策」之后、「执行 tool」之前由工具同步调用。
+
+        @param title 步骤标题
+        @param summary 折叠行摘要
+        @param body_lines 展开详情
+        @param elapsed 子过程耗时
+        @param kind 步骤类型标记
+        @param inline_preview 折叠态 inline 预览行数
+        @return 步骤编号；未展示时返回 0
+        """
+        if not self._session.shows_process():
+            return 0
+        step_id = self._register_step(
+            kind,
+            title,
+            elapsed,
+            summary,
+            body_lines=body_lines,
+        )
+        verbose = self._session.is_verbose()
+        if verbose:
+            self._line(
+                _c(f"[{_timestamp()}] ", "90")
+                + _c(f"◇ #{step_id} {title}", "35")
+                + _c(f"  ({_format_duration(elapsed)})", "90")
+                + f"  {summary}",
+            )
+            for line in body_lines:
+                self._line(_c(f"{_TRACE_L2}│ {_clip_line(line)}", "90"))
+            sink = self._session.trace_sink
+            if sink is not None and self._steps:
+                sink.step_added(self._steps[-1])
+        else:
+            self._print_step_summary(
+                step_id,
+                title,
+                elapsed,
+                summary,
+                step_marker="◇",
+                inline_preview=inline_preview,
+            )
+        return step_id
 
     def on_turn_start(
         self,
@@ -753,6 +955,7 @@ class TurnTracePrinter:
         if not isinstance(last, AIMessage):
             return
 
+        self._finalize_thinking_step(reset_after=True)
         elapsed = time.perf_counter() - self._step_start
         tool_calls = getattr(last, "tool_calls", None) or []
         text = _message_text(last.content).strip()
@@ -825,7 +1028,11 @@ class TurnTracePrinter:
         elif not tool_calls and not text:
             # 最终轮 thinking-only：暂存，on_turn_end 无正文时降级展示
             thinking_only = _extract_thinking_from_message_chunk(last)
-            if thinking_only:
+            if (
+                thinking_only
+                and _thinking_worth_trace_step(thinking_only)
+                and not self._thinking_finalized
+            ):
                 self._last_thinking_text = thinking_only
 
         self._step_start = time.perf_counter()
@@ -895,21 +1102,87 @@ class TurnTracePrinter:
         if not text.strip():
             return
         elapsed = time.perf_counter() - self._step_start
-        self._step_index += 1
-        if self._session.shows_process():
-            label = f"💬 #{self._step_index} 助手回复"
-            self._line(
-                _c(f"[{_timestamp()}] ", "90")
-                + _c(label, "1")
-                + _c(f"  ({_format_duration(elapsed)})", "90"),
-            )
         self._printed_final_header = True
         self._streamed_reply = True
         self._survey_filter.reset()
         visible = self._survey_filter.feed(text)
-        if visible:
-            self._stream(visible)
+        if not visible.strip():
+            visible = strip_survey_for_display(text).strip()
+        if not visible:
+            self._stream_end()
+            return
+
+        if self._session.shows_process() and not self._session.is_verbose():
+            body_lines = visible.splitlines()
+            char_count = len(visible.strip())
+            resolved_usage = self._resolve_step_usage(None)
+            step_id = self._register_step(
+                "reply",
+                "助手回复",
+                elapsed,
+                f"{char_count} 字",
+                body_lines=body_lines,
+                usage=resolved_usage,
+            )
+            self._print_step_summary(
+                step_id,
+                "助手回复",
+                elapsed,
+                f"{char_count} 字",
+                usage=resolved_usage,
+                step_marker="💬",
+                inline_preview=8,
+            )
+        else:
+            self._step_index += 1
+            if self._session.shows_process():
+                label = f"💬 #{self._step_index} 助手回复"
+                self._line(
+                    _c(f"[{_timestamp()}] ", "90")
+                    + _c(label, "1")
+                    + _c(f"  ({_format_duration(elapsed)})", "90"),
+                )
+            self._print_reply_body(visible)
         self._stream_end()
+
+    def _print_reply_body(self, text: str) -> None:
+        """
+        输出助手正文（Rich/ANSI 渲染后经 _trace_line，与步骤摘要同路径）。
+
+        @param text 过滤 survey 后的正文
+        """
+        if not text.strip():
+            return
+        sink = self._session.trace_sink
+        if sink is not None and getattr(sink, "suppress_reply_body", False):
+            self._reply_body_printed = True
+            return
+        self._stream_end()
+        payload = text
+        if getattr(self._session, "render_markdown", True):
+            from llgraph.terminal.markdown_render import (
+                markdown_render_enabled,
+                render_for_terminal,
+            )
+
+            if markdown_render_enabled():
+                try:
+                    rendered = render_for_terminal(
+                        text,
+                        force=True,
+                        session=self._session,
+                    )
+                    if rendered.strip():
+                        payload = rendered
+                except Exception:
+                    payload = text
+        for line in payload.splitlines():
+            stripped = line.rstrip()
+            if stripped:
+                _trace_line(self._session, f"{_TRACE_L1}{stripped}")
+            else:
+                _trace_line(self._session, "")
+        self._reply_body_printed = True
 
     def on_text_chunk(self, chunk_text: str) -> None:
         if not self._session.shows_reply_stream():
@@ -917,6 +1190,14 @@ class TurnTracePrinter:
             return
         if not chunk_text:
             return
+        self._finalize_thinking_step(reset_after=True)
+        # Markdown 渲染开启时累积全文，结束时一次性渲染（避免流式半截 MD）
+        if getattr(self._session, "render_markdown", True):
+            from llgraph.terminal.markdown_render import markdown_render_enabled
+
+            if markdown_render_enabled():
+                self._final_text += chunk_text
+                return
         # steps 折叠：中间轮次只累积，最终回复在 on_agent_update 整段输出
         if self._session.shows_process() and not self._session.is_verbose():
             self._final_text += chunk_text
@@ -943,6 +1224,7 @@ class TurnTracePrinter:
             self._stream(visible)
 
     def on_turn_end(self, *, last_step_body: str = "") -> tuple[str, str]:
+        self._finalize_thinking_step()
         if (
             self._session.mode == TraceMode.STEPS
             and last_step_body
@@ -955,9 +1237,13 @@ class TurnTracePrinter:
         if not self._session.is_silent():
             if self._printed_final_header:
                 tail = self._survey_filter.flush()
-                if tail:
-                    self._stream(tail)
+                if tail and not self._reply_body_printed:
+                    self._print_reply_body(tail)
                 self._stream_end()
+            if not self._reply_body_printed and self._final_text.strip():
+                body = strip_survey_for_display(self._final_text).strip()
+                if body:
+                    self._print_reply_body(body)
             total = time.perf_counter() - self._turn_start
             self._line(
                 _c(f"[{_timestamp()}] ", "90")
@@ -974,19 +1260,21 @@ class TurnTracePrinter:
                             "35",
                         ),
                     )
-                if _trace_sink_is_terminal(self._session):
+                sink = self._session.trace_sink
+                if getattr(sink, "suppress_web_hints", False):
+                    pass
+                elif _trace_sink_is_terminal(self._session):
                     hint = (
                         f"{_TRACE_L1}提示: 输入步骤号或 /trace step <#> 展开"
                         " · /trace all 看完整过程 · /trace token 关步骤 token"
                     )
+                    self._line(_c(hint, "90"))
                 else:
                     hint = (
                         f"{_TRACE_L1}提示: 点击左侧步骤展开 · /trace step 列表"
                         " · /trace token 关步骤 token"
                     )
-                self._line(_c(hint, "90"))
-        from llgraph.survey.survey_prompt import strip_survey_for_display
-
+                    self._line(_c(hint, "90"))
         if not self._final_text.strip() and self._last_thinking_text.strip():
             fallback = self._last_thinking_text.strip()
             wrapped = (
@@ -1129,6 +1417,40 @@ def set_trace_step_tokens(session: TraceSession, enabled: bool | None = None) ->
     return session.show_step_tokens
 
 
+def set_trace_rich_render(session: TraceSession, enabled: bool | None = None) -> bool:
+    """
+    开关助手回复 Rich 渲染（需 render_markdown 开且已安装 rich）。
+
+    @param session 追踪会话
+    @param enabled True/False 显式设置；None 则切换
+    @return 切换后的状态
+    """
+    from llgraph.terminal.markdown_render import _rich_import_ok
+
+    if enabled is None:
+        session.use_rich = not session.use_rich
+    else:
+        session.use_rich = enabled
+    if session.use_rich and not _rich_import_ok():
+        session.use_rich = False
+    return session.use_rich
+
+
+def set_trace_render_markdown(session: TraceSession, enabled: bool | None = None) -> bool:
+    """
+    开关助手回复 Markdown/JSON 终端渲染。
+
+    @param session 追踪会话
+    @param enabled True/False 显式设置；None 则切换
+    @return 切换后的状态
+    """
+    if enabled is None:
+        session.render_markdown = not session.render_markdown
+    else:
+        session.render_markdown = enabled
+    return session.render_markdown
+
+
 def _extract_text_from_message_chunk(chunk: Any) -> str:
     content = getattr(chunk, "content", None)
     if isinstance(content, str):
@@ -1140,6 +1462,25 @@ def _extract_text_from_message_chunk(chunk: Any) -> str:
                 parts.append(str(block.get("text", "")))
         return "".join(parts)
     return ""
+
+
+_MIN_THINKING_TRACE_CHARS = 16
+
+
+def _thinking_worth_trace_step(text: str) -> bool:
+    """
+    thinking 是否值得落为 trace 步骤 / Web 流式展示。
+
+    过滤 Kimi 等模型在简单回复时流出的占位符（如单个「.」）。
+
+    @param text thinking 全文
+    @return 是否记录
+    """
+    cleaned = text.strip()
+    if len(cleaned) < _MIN_THINKING_TRACE_CHARS:
+        return False
+    core = re.sub(r"[\s\.\…。·•,，;；:!！?？'\"“”‘’\-—_]+", "", cleaned)
+    return len(core) >= 8
 
 
 def _extract_thinking_from_message_chunk(chunk: Any) -> str:
@@ -1172,11 +1513,21 @@ def _extract_thinking_from_message_chunk(chunk: Any) -> str:
 
 
 def _print_trace_usage(session: TraceSession) -> None:
+    from llgraph.terminal.markdown_render import _rich_import_ok, rich_render_enabled
+
     token_state = "开" if session.show_step_tokens else "关"
+    md_state = "开" if session.render_markdown else "关"
+    rich_state = "开" if rich_render_enabled(session=session) else "关"
+    rich_pkg = "已安装" if _rich_import_ok() else "未安装"
     _trace_line(session, 
         f"当前过程展示: {TRACE_MODE_LABELS[session.mode]} ({session.mode.value})",
     )
     _trace_line(session, f"步骤 token 显示: {token_state}（/trace token 切换）")
+    _trace_line(session, f"Markdown 渲染: {md_state}（/trace md · 仅助手回复）")
+    _trace_line(
+        session,
+        f"Rich 渲染: {rich_state}（/trace rich · {rich_pkg}；默认关，LLGRAPH_MD_RICH=1 启动即开）",
+    )
     _trace_line(session, "用法: /trace <模式|子命令>")
     _trace_line(session, "  all    完整过程（规划+工具参数+输出，同截图）")
     _trace_line(
@@ -1190,6 +1541,8 @@ def _print_trace_usage(session: TraceSession) -> None:
     _trace_line(session, "  step last    展开最近一步")
     _trace_line(session, "  token        开关每步 token/cache 摘要")
     _trace_line(session, "  token on|off 显式开关步骤 token")
+    _trace_line(session, "  md           开关助手回复 Markdown 渲染")
+    _trace_line(session, "  rich         开关助手回复 Rich 渲染（默认关）")
     _trace_line(session, "  stats        token 估算与工具落盘统计（含执行日志路径）")
 
 
@@ -1209,6 +1562,18 @@ def _collect_tool_names_from_updates(payload: dict) -> list[str]:
     return names
 
 
+def _web_progress_milestone(session: TraceSession | None, text: str) -> None:
+    """
+    Web / reply / none 等不展示完整过程时，仍推送简要里程碑到 SSE。
+
+    @param session trace 会话
+    @param text 里程碑说明
+    """
+    if session is None:
+        return
+    emit_trace_milestone(session, text)
+
+
 def _stream_collect_silent(
     agent,
     user_message: str,
@@ -1225,6 +1590,10 @@ def _stream_collect_silent(
     tool_names: list[str] = []
     payload = effective_message if effective_message is not None else user_message
     input_state = {"messages": [{"role": "user", "content": payload}]}
+    session = trace_session or TraceSession()
+    _web_progress_milestone(session, "思考中…")
+    thinking_emit_len = 0
+    thinking_emit_at = 0.0
 
     for item in agent.stream(
         input_state,
@@ -1235,6 +1604,16 @@ def _stream_collect_silent(
             continue
         mode, chunk = item
         if mode == "updates" and isinstance(chunk, dict):
+            for node_name, state_update in chunk.items():
+                messages = (state_update or {}).get("messages", [])
+                if node_name == "tools":
+                    _web_progress_milestone(session, "工具执行中…")
+                elif node_name == "agent":
+                    if any(
+                        isinstance(m, AIMessage) and (getattr(m, "tool_calls", None) or [])
+                        for m in messages
+                    ):
+                        _web_progress_milestone(session, "模型决策中…")
             tool_names.extend(_collect_tool_names_from_updates(chunk))
             continue
         if mode != "messages" or not isinstance(chunk, tuple):
@@ -1243,6 +1622,19 @@ def _stream_collect_silent(
         meta = metadata if isinstance(metadata, dict) else {}
         if meta.get("langgraph_node", "") != "agent":
             continue
+        thinking = _extract_thinking_from_message_chunk(msg_chunk)
+        if thinking:
+            sink = session.trace_sink
+            if sink is not None and hasattr(sink, "thinking_update"):
+                now = time.perf_counter()
+                if (
+                    thinking_emit_len == 0
+                    or len(thinking) - thinking_emit_len >= 300
+                    or now - thinking_emit_at >= 0.35
+                ):
+                    thinking_emit_at = now
+                    thinking_emit_len = len(thinking)
+                    sink.thinking_update(thinking.strip())
         if getattr(msg_chunk, "tool_calls", None) or []:
             continue
         text = _extract_text_from_message_chunk(msg_chunk)
@@ -1250,10 +1642,11 @@ def _stream_collect_silent(
             final_parts.append(text)
 
     result = "".join(final_parts).strip()
-    session = trace_session or TraceSession()
     if result:
         _trace_stream(session, result)
         _trace_stream_end(session)
+    elif session.trace_sink is not None:
+        _web_progress_milestone(session, "本轮完成")
     return TurnRunResult(
         text=result,
         tool_names=tool_names,
@@ -1308,12 +1701,15 @@ def stream_agent_turn(
 
     config = {"configurable": {"thread_id": thread_id}} if with_memory else None
     printer = TurnTracePrinter(session)
+    session.active_printer = printer
     ws_path = Path(workspace).expanduser().resolve() if workspace is not None else None
     printer.on_turn_start(
         user_message,
         workspace=ws_path,
         context_session=context_session,
     )
+    if not session.shows_process():
+        _web_progress_milestone(session, "思考中…")
 
     input_state = {"messages": [{"role": "user", "content": payload}]}
     saw_tool_round = False
@@ -1339,10 +1735,14 @@ def stream_agent_turn(
                     ):
                         saw_tool_round = True
                         streaming_reply = False
+                        if not session.shows_process():
+                            _web_progress_milestone(session, "模型决策中…")
                     printer.on_agent_update(messages)
                 elif node_name == "tools":
                     saw_tool_round = True
                     streaming_reply = False
+                    if not session.shows_process():
+                        _web_progress_milestone(session, "工具执行中…")
                     for msg in messages:
                         if isinstance(msg, ToolMessage):
                             last_tool_body = _message_text(msg.content)
@@ -1375,7 +1775,7 @@ def stream_agent_turn(
                 printer.absorb_usage_from_chunk(msg_chunk)
             thinking = _extract_thinking_from_message_chunk(msg_chunk)
             if thinking:
-                printer._last_thinking_text = thinking
+                printer.on_thinking_chunk(thinking)
             if getattr(msg_chunk, "tool_calls", None) or []:
                 streaming_reply = False
                 continue
@@ -1388,6 +1788,7 @@ def stream_agent_turn(
 
     display_text, raw_text = printer.on_turn_end(last_step_body=last_tool_body)
     session.last_turn_steps = list(printer._steps)
+    session.active_printer = None
     return TurnRunResult(
         text=display_text,
         raw_text=raw_text,

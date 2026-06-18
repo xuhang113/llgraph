@@ -65,15 +65,64 @@ def _parse_thinking_raw(raw: object) -> dict[str, Any] | None | object:
 
 _USE_DEFAULT = object()
 
+_runtime_thinking: bool | None = None
 
-def resolve_model_thinking_payload(
+
+def set_runtime_thinking(enabled: bool | None) -> None:
+    """
+    会话内覆盖 thinking 开关（Web / 终端运行时）。
+
+    @param enabled True=强制开；False=强制关；None=恢复 agent.json/启发式
+    """
+    global _runtime_thinking
+    _runtime_thinking = enabled
+
+
+def get_runtime_thinking() -> bool | None:
+    """当前 thinking 运行时覆盖。"""
+    return _runtime_thinking
+
+
+def model_supports_thinking(workspace: Path | None, model_id: str | None) -> bool:
+    """
+    模型是否支持（可配置）thinking。
+
+    @param workspace 工作区根
+    @param model_id 模型 id
+    @return 是否展示 thinking 开关
+    """
+    if not model_id or not str(model_id).strip():
+        return False
+    effective = str(model_id).strip()
+    catalog, _ = load_model_catalog(workspace)
+    for entry in catalog:
+        if entry.model_id == effective:
+            parsed = _parse_thinking_raw(getattr(entry, "thinking", None))
+            if parsed is None:
+                return False
+            if parsed is not _USE_DEFAULT:
+                return True
+            break
+    return _heuristic_thinking_payload(effective) is not None
+
+
+def is_thinking_enabled(workspace: Path | None, model_id: str | None) -> bool:
+    """
+    当前模型 thinking 是否实际启用（含运行时覆盖）。
+
+    @param workspace 工作区根
+    @param model_id 模型 id
+    @return 是否发往网关 thinking 参数
+    """
+    return resolve_model_thinking_payload(workspace, model_id) is not None
+
+
+def _resolve_config_thinking_payload(
     workspace: Path | None,
     model_id: str | None,
 ) -> dict[str, Any] | None:
     """
-    解析当前模型发往网关的 thinking 参数。
-
-    优先级：catalog 项 thinking > llm.thinking_defaults > 模型族 heuristic。
+    按 agent.json 与模型族解析 thinking（不含运行时覆盖）。
 
     @param workspace 工作区根
     @param model_id 模型 id
@@ -122,6 +171,32 @@ def resolve_model_thinking_payload(
         return {**heuristic, **parsed_defaults}
 
     return _heuristic_thinking_payload(effective)
+
+
+def resolve_model_thinking_payload(
+    workspace: Path | None,
+    model_id: str | None,
+) -> dict[str, Any] | None:
+    """
+    解析当前模型发往网关的 thinking 参数。
+
+    优先级：运行时覆盖 > catalog 项 thinking > llm.thinking_defaults > 模型族 heuristic。
+
+    @param workspace 工作区根
+    @param model_id 模型 id
+    @return thinking 字典；None 表示不发送
+    """
+    if _runtime_thinking is False:
+        return None
+    base = _resolve_config_thinking_payload(workspace, model_id)
+    if _runtime_thinking is True:
+        if base is not None:
+            return base
+        if not model_id or not str(model_id).strip():
+            return None
+        heuristic = _heuristic_thinking_payload(str(model_id).strip())
+        return heuristic if heuristic is not None else {"type": "enabled"}
+    return base
 
 
 def merge_payload_thinking(

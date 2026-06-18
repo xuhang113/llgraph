@@ -74,15 +74,16 @@ def prepare_messages_for_llm_dispatch(
     )
     ordered = reorder_pinned_system_messages(cleaned)
     if workspace is not None:
-        from llgraph.context.context_dispatch_window import trim_messages_for_dispatch_window
+        from llgraph.context.context_compressor import estimate_tokens
+        from llgraph.context.context_dispatch_window import apply_dispatch_window_trim
         from llgraph.context.context_settings import resolve_context_settings
 
         ctx_settings = resolve_context_settings(workspace)
-        if ctx_settings.dispatch_keep_user_turns > 0:
-            ordered = trim_messages_for_dispatch_window(
-                ordered,
-                keep_user_turns=ctx_settings.dispatch_keep_user_turns,
-            )
+        ordered = apply_dispatch_window_trim(
+            ordered,
+            settings=ctx_settings,
+            estimate_tokens=estimate_tokens,
+        )
     normalized = normalize_messages_for_llm(
         ordered,
         agent_system_content=agent_system_content,

@@ -66,6 +66,7 @@ def switch_agent_thread(
         session=agent_session.context_session,
         user_message="",
         with_memory=agent_session.with_memory,
+        allow_write=agent_session.allow_write,
     )
 
     msg_count = 0
@@ -164,6 +165,9 @@ def format_session_command_help(workspace: Path, current_thread_id: str) -> str:
         "  /session delete all --including-current  全量删除",
         "  /session current      显示当前 thread_id 与恢复命令",
         "  /session id           同 /session current",
-        "  /sessionid            同 /session current",
+        "  /plan [目标]          进入 Plan 模式（推荐）",
+        "  /plan switch <id>     切换 Plan 会话",
+        "  /session plan [说明]     同 /plan [目标]（不含切换）",
+        "  /session agent           当前已在 Agent 模式",
     ]
     return "\n".join(lines)

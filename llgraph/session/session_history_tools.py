@@ -41,7 +41,7 @@ def create_session_history_tools(workspace_root: Path) -> list:
 
         检索 shell/find/git/命令 类问题时，会自动纳入 tool 输出与 AI 的 tool_calls 参数。
 
-        不要用于：当前轮已可见的最近几轮内容；纯代码检索请用 search_code_hybrid/grep_files。
+        不要用于：当前轮已可见的最近几轮内容；纯代码检索请用 search_code_parallel/grep_files。
 
         @param query 检索问句或 3～12 个关键词（中英文、文件路径片段、服务名等）
         @param top_k 返回条数，默认 8，最大 20

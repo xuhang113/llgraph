@@ -46,6 +46,11 @@ service-account*.json
 
 # examples/default-workspace/.llgraph/ 为 demo 配置，需提交，不在此列
 
+# --- Web UI（可选 ``llgraph web``）---
+web-ui/node_modules/
+web-ui/dist/
+.run/
+
 # --- 评审 / 本地产出 ---
 llgraph-review/
 

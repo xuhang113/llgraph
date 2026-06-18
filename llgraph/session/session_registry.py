@@ -201,7 +201,9 @@ def discover_sessions(workspace: Path) -> list[SessionSummary]:
     msg_map = _load_jsonl_sessions(root)
     all_ids = disk_ids | set(msg_map.keys())
     listable_ids = [
-        tid for tid in sorted(all_ids) if session_has_substantive_content(root, tid)
+        tid
+        for tid in sorted(all_ids)
+        if session_has_substantive_content(root, tid) and not tid.startswith("plan-")
     ]
     backfill_session_titles(root, listable_ids)
 

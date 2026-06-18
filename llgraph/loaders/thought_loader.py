@@ -36,7 +36,7 @@ _BUILTIN_RETRIEVAL_THOUGHT = """\
 
 1. **glob_files**：文件名是否存在（如 `**/collect_alert.sh`）。
 2. **grep_files**：字面/正则搜内容（含 .md）；多词用 `词A|词B`。
-3. **search_code_hybrid**：业务概念 / crontab / 自然语言（已 llgraph index 时）。
+3. **search_code_parallel**：当轮不明确时可选一次；query 里自行扩展关键字；之后 grep_files 深挖。
 4. **search_workspace**：`keywords` 一次 **5～12** 个词；换 `path`（`markdowns`、`docs`）。
 5. **read_file**：manifest、embedding.json、README 等配置先读后答。
 

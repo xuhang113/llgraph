@@ -198,6 +198,7 @@ def build_session_manifest_payload(
     archive_path: str | None = None,
     spill_dir: str | None = None,
     anchor_path: str | None = None,
+    allow_write: bool = False,
 ) -> dict[str, Any]:
     """
     构建可落盘的 manifest 结构。
@@ -231,6 +232,7 @@ def build_session_manifest_payload(
         "version": _MANIFEST_VERSION,
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "thread_id": thread_id,
+        "file_access_mode": "readwrite" if allow_write else "readonly",
         "manifest_path": manifest_rel,
         "archive_path": archive,
         "messages_path": messages_path,
@@ -289,6 +291,7 @@ def build_session_manifest_message_content(
     archive_path: str | None = None,
     spill_dir: str | None = None,
     anchor_path: str | None = None,
+    allow_write: bool = False,
 ) -> str:
     """
     构建置顶 SystemMessage 正文（压缩时不摘要此消息）。
@@ -302,6 +305,8 @@ def build_session_manifest_message_content(
     @param anchor_path 结构化锚点路径
     @return 锚点消息正文
     """
+    from llgraph.session.session_write_mode import format_file_access_manifest_line
+
     payload = build_session_manifest_payload(
         workspace,
         thread_id,
@@ -310,6 +315,7 @@ def build_session_manifest_message_content(
         archive_path=archive_path,
         spill_dir=spill_dir,
         anchor_path=anchor_path,
+        allow_write=allow_write,
     )
     manifest_rel = payload.get("manifest_path") or _rel_workspace_path(
         workspace, session_manifest_json_path(workspace, thread_id)
@@ -319,6 +325,7 @@ def build_session_manifest_message_content(
     parts = [
         SESSION_MANIFEST_TAG,
         f"会话: {thread_id}",
+        format_file_access_manifest_line(allow_write),
         f"manifest: `{manifest_rel}`（完整 JSON，可用 read_file 读取）",
     ]
     archive = payload.get("archive_path")
@@ -342,10 +349,16 @@ def build_session_manifest_message_content(
     if rules_sec:
         parts.append(rules_sec)
     parts.append("## 文档目录\n")
-    parts.append(
-        "新业务梳理落盘: `docs/`（工作区 `docs/{业务域}/`、各仓 `{repo}/docs/`）；"
-        "tmp 模式（不覆盖）时工作区与各仓**全部**写 `{原名}.tmp.md`，即使该仓原先无 doc。"
-    )
+    if allow_write:
+        parts.append(
+            "新业务梳理落盘: `docs/`（工作区 `docs/{业务域}/`、各仓 `{repo}/docs/`）；"
+            "tmp 模式（不覆盖）时工作区与各仓**全部**写 `{原名}.tmp.md`，即使该仓原先无 doc。"
+        )
+    else:
+        parts.append(
+            "当前只读：禁止 Agent 落盘（含 tmp 模式 .tmp.md、覆盖业务总览）；"
+            "梳理须在助手正文输出，或请用户 `/write on` 后再落盘。"
+        )
     parts.append(
         "历史参考（只读，禁止落盘）: `markdowns/`（按需 list_directory / read_file；不内联索引正文）"
     )
@@ -363,6 +376,7 @@ def build_session_manifest_system_message(
     archive_path: str | None = None,
     spill_dir: str | None = None,
     anchor_path: str | None = None,
+    allow_write: bool = False,
 ) -> SystemMessage:
     """
     构建会话锚点 SystemMessage。
@@ -384,6 +398,7 @@ def build_session_manifest_system_message(
         archive_path=archive_path,
         spill_dir=spill_dir,
         anchor_path=anchor_path,
+        allow_write=allow_write,
     )
     return SystemMessage(content=content)
 
@@ -402,6 +417,7 @@ def sync_session_manifest_to_agent_state(
     user_message: str,
     with_memory: bool,
     archive_path: str | None = None,
+    allow_write: bool = False,
 ) -> str | None:
     """
     落盘 manifest.json 并将锚点 SystemMessage 置顶到 agent 状态。
@@ -431,6 +447,7 @@ def sync_session_manifest_to_agent_state(
         archive_path=archive_path,
         spill_dir=spill_dir,
         anchor_path=default_anchor,
+        allow_write=allow_write,
     )
     manifest_rel = write_session_manifest_json(workspace, thread_id, payload)
     if not with_memory:
@@ -451,6 +468,7 @@ def sync_session_manifest_to_agent_state(
         archive_path=archive_path or payload.get("archive_path"),
         spill_dir=spill_dir,
         anchor_path=payload.get("anchor_path"),
+        allow_write=allow_write,
     )
     rest = strip_manifest_messages(messages)
     new_messages = reorder_pinned_system_messages([pinned, *rest])
@@ -469,6 +487,7 @@ def sync_session_manifest_after_compress(
     session: ContextSession,
     archive_path: str | None,
     anchor_path: str | None,
+    allow_write: bool = False,
 ) -> str | None:
     """
     压缩后刷新 manifest.json 与置顶 manifest（更新 archive/anchor 路径）。
@@ -492,6 +511,7 @@ def sync_session_manifest_after_compress(
         archive_path=archive_path,
         spill_dir=spill_dir,
         anchor_path=anchor_path,
+        allow_write=allow_write,
     )
     manifest_rel = write_session_manifest_json(workspace, thread_id, payload)
     config = {"configurable": {"thread_id": thread_id}}
@@ -509,6 +529,7 @@ def sync_session_manifest_after_compress(
         archive_path=archive_path or payload.get("archive_path"),
         spill_dir=spill_dir,
         anchor_path=anchor_path or payload.get("anchor_path"),
+        allow_write=allow_write,
     )
     new_messages = reorder_pinned_system_messages(
         [manifest_msg, *strip_manifest_messages(messages)]

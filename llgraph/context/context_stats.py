@@ -349,6 +349,9 @@ def format_context_usage_report(
             ),
         ]
     )
+    from llgraph.context.context_settings import format_context_config_help
+
+    lines.extend(["", format_context_config_help(workspace)])
     return "\n".join(lines)
 
 

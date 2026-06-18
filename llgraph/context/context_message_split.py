@@ -156,7 +156,7 @@ def split_messages_for_compress_strategy(
     @param estimate_tokens token 估算函数
     @return (to_compress, to_keep)
     """
-    if strategy == "cursor":
+    if strategy in ("cursor", "auto"):
         return split_messages_cursor_style(
             messages,
             preserve_current_turn=preserve_current_turn,

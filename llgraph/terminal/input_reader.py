@@ -193,15 +193,23 @@ def _drain_buffered_lines(timeout: float = 0.35) -> list[str]:
     return extra
 
 
-def read_interactive_user_message(workspace: Path | None = None) -> str:
+def read_interactive_user_message(
+    workspace: Path | None = None,
+    *,
+    prompt_label: str | None = None,
+) -> str:
     """
     读取一条用户消息（含粘贴合并、/paste、斜杠补全）。
 
     @param workspace 工作区根（斜杠补全 Skills/Commands）
+    @param prompt_label 输入框标签；plan 时显示【plan模式】
     @return 用户输入（可能多行）
     @raises EOFError 输入结束
     """
-    prompt = "\n> "
+    if prompt_label == "plan":
+        prompt = "\n【plan模式】> "
+    else:
+        prompt = "\n> "
     if sys.stdin.isatty() and workspace is not None:
         from llgraph.terminal.slash_complete import prompt_toolkit_available
 

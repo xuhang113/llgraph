@@ -6,6 +6,8 @@ LangGraph terminal agent with LLGRAPH_* API credentials.
     core      Agent 编排、Gateway LLM、工具
     context   上下文、消息规范、压缩
     session   会话持久化与生命周期
+    gateway   Web/远程控制面网关（local / remote）
+    console   工作区与会话库 API（Web UI / 集成首选）
     config    环境变量与 settings
     loaders   Rules / Skills / Commands
     commands  斜杠命令

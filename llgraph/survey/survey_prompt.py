@@ -386,17 +386,28 @@ def run_survey_interactive(spec: SurveySpec) -> dict[str, str] | None:
     return run_survey_tty(spec)
 
 
-def format_survey_answers_for_agent(answers: dict[str, str]) -> str:
+def format_survey_answers_for_agent(
+    answers: dict[str, str],
+    *,
+    allow_write: bool = True,
+) -> str:
     """
     将问卷结果整理为发给 Agent 的简短确认消息。
 
     @param answers 题 id → 选项
+    @param allow_write 当前是否可写（只读时附加无法落盘提醒）
     @return 用户消息正文
     """
     lines = ["【用户确认】"]
     for key, value in answers.items():
         lines.append(f"- {key}: {value}")
     lines.append("")
+    if not allow_write:
+        lines.append(
+            "【系统提醒】当前会话为**只读模式**，无法 write_file / 落盘 tmp 模式（.tmp.md）；"
+            "请勿按上述确认中的写文件项执行；在正文输出完整梳理，或明确提示用户先 `/write on`。"
+        )
+        lines.append("")
     lines.append("请按以上确认继续执行，无需重复提问。")
     return "\n".join(lines)
 
@@ -442,6 +453,70 @@ def infer_survey_from_markdown(text: str) -> SurveySpec | None:
     )
 
 
+def infer_project_organize_survey(text: str) -> SurveySpec | None:
+    """
+    project-organize 等 Skill 未输出 survey JSON 时的兜底（Agent 纯文本确认）。
+
+    @param text 助手回复
+    @return 问卷规格
+    """
+    if not re.search(r"请先确认|须确认|须用户确认|判定", text):
+        return None
+    questions: list[SurveyQuestion] = []
+    if re.search(r"改动范围|scope", text, re.IGNORECASE):
+        questions.append(
+            SurveyQuestion(
+                question_id="scope",
+                prompt="本次将改动哪些项目？（未选中的仓库禁止 write_file）",
+                options=(
+                    "仅 docs/ 工作区总览",
+                    "工作区总览 + 各核心仓库 docs",
+                    "其他（手动输入）",
+                ),
+                default_index=0,
+                allow_free_text=True,
+                step_label="改动范围",
+                multi_select=True,
+            )
+        )
+    if re.search(r"梳理方式|仅按文档|结合代码", text):
+        questions.append(
+            SurveyQuestion(
+                question_id="mode",
+                prompt="范围内已有业务文档，梳理方式？",
+                options=(
+                    "仅按文档为主（只读已有 doc）",
+                    "结合代码梳理并落盘 tmp",
+                    "其他（手动输入）",
+                ),
+                default_index=1,
+                allow_free_text=True,
+                step_label="梳理方式",
+            )
+        )
+    if re.search(r"覆盖|overwrite|正式\s*\.md", text, re.IGNORECASE):
+        questions.append(
+            SurveyQuestion(
+                question_id="overwrite",
+                prompt="是否覆盖正式业务文档（.md）？",
+                options=(
+                    "否，仅产出 .tmp.md",
+                    "是，核对后覆盖正式 .md",
+                    "其他（手动输入）",
+                ),
+                default_index=0,
+                allow_free_text=True,
+                step_label="覆盖策略",
+            )
+        )
+    if not questions:
+        return None
+    return SurveySpec(
+        title="业务梳理 — 请确认",
+        questions=tuple(questions),
+    )
+
+
 def resolve_survey_from_assistant(text: str) -> SurveySpec | None:
     """
     解析助手回复中的问卷（JSON 块优先，其次 Markdown 编号列表）。
@@ -452,7 +527,10 @@ def resolve_survey_from_assistant(text: str) -> SurveySpec | None:
     spec = extract_survey_block(text)
     if spec is not None:
         return spec
-    return infer_survey_from_markdown(text)
+    spec = infer_survey_from_markdown(text)
+    if spec is not None:
+        return spec
+    return infer_project_organize_survey(text)
 
 
 def try_run_survey_followup(
@@ -460,6 +538,7 @@ def try_run_survey_followup(
     *,
     workspace: Path | None = None,
     context_session: object | None = None,
+    allow_write: bool = True,
 ) -> str | None:
     """
     若助手回复需确认，则走终端向导并返回可提交的用户消息。
@@ -495,4 +574,4 @@ def try_run_survey_followup(
             "[survey] 已取消确认。直接说明你的选择继续对话。"
         )
         return None
-    return format_survey_answers_for_agent(answers)
+    return format_survey_answers_for_agent(answers, allow_write=allow_write)

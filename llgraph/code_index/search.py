@@ -6,6 +6,61 @@ from pathlib import Path
 
 from llgraph.code_index.search_path_filter import is_junk_search_path
 from llgraph.code_index.vector_search import perform_vector_search
+from llgraph.config.logging_settings import get_search_logger
+
+
+def collect_vector_hits(
+    workspace: Path,
+    query: str,
+    *,
+    top_k: int,
+    path_prefix: str = ".",
+    source: str = "cli",
+    tool: str = "search_code_semantic",
+) -> tuple[list[tuple[str, str]], str]:
+    """
+    纯向量检索，返回结构化命中（供 parallel_search RRF 融合）。
+
+    @param workspace 工作区根
+    @param query 语义 query（通常为用户原句）
+    @param top_k 条数
+    @param path_prefix 路径前缀
+    @param source 调用来源
+    @param tool 工具名（日志用）
+    @return ((doc_id, preview) 列表, 错误文案；无错为空串)
+    """
+    logger = get_search_logger()
+    try:
+        outcome = perform_vector_search(
+            workspace,
+            query,
+            top_k=top_k,
+            path_prefix=path_prefix,
+            source=source,
+            tool=tool,
+        )
+    except Exception as exc:
+        logger.error(
+            "[vector] 检索失败 source=%s tool=%s error=%s",
+            source,
+            tool,
+            exc,
+        )
+        return [], str(exc)
+
+    if outcome.skipped:
+        return [], "索引为空"
+
+    out: list[tuple[str, str]] = []
+    for hit in outcome.hits:
+        rel = hit.get("rel_path", "")
+        if is_junk_search_path(str(rel)):
+            continue
+        start = hit.get("start_line", 0)
+        doc_id = f"{rel}:{start}"
+        preview = hit.get("text_preview", "")
+        out.append((doc_id, preview))
+    return out, ""
 
 
 def format_hit(hit: dict, rank: int) -> str:

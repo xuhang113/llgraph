@@ -72,58 +72,50 @@ def build_system_prompt(
         "**禁止**沿用 list_directory 后的深层 path 做跨包 glob"
         "（如 path=.../activity 却 glob **/basic/**）。\n"
         "- list_directory 仅用于浏览；glob/grep 搜类/模块时 path 至少到**仓库根**。\n"
-        "- glob/grep 0 命中后**禁止同 path 再试**；须换更宽 path 或 search_code_hybrid。\n"
+        "- glob/grep 0 命中后**禁止同 path 再试**；须换更宽 path 或 markdowns/docs。\n"
+    )
+    code_search_hint = (
+        "**代码检索（对齐 Cursor：一次给线索，多轮深挖）**：\n"
+        "- 意图不清 → 可选 **search_code_parallel** **一次**；在 **query 里自行扩展**"
+        "类名、仓库名片段、callback/postback 等关键字（空格分隔，可写 ripgrep 正则），"
+        "整句亦作向量语义。\n"
+        "- parallel 后：**read_files** 读线索 → **grep_files** 追上下游/依赖；"
+        "**本轮勿再** search_code_parallel。\n"
+        "- 已知类名/仓库 → 直接 **grep_files**。\n"
     )
     batch_read_hint = (
-        "**批量读文件（减少 I/O 与 ReAct 轮次，对齐 Cursor）**：\n"
-        "- hybrid/glob/grep 已给出多个**完整相对路径**时：**尽量一次** "
-        "read_files(paths=[...])（最多 8 个）取齐，**禁止**每个路径单独 read_file 各占一轮 LLM。\n"
-        "- 能批量就批量：同一轮需要对比/梳理 N 个类时，一次 read_files 优于 N 次 read_file。\n"
-        "- 推荐流程：search_code_hybrid 规划 → read_files 批量读 → 正文汇总；"
-        "单文件过大或只需局部时用 read_file(start_line/end_line)。\n"
-        "- read/glob path **禁止** \"../\" 或猜路径；须从检索结果**原样复制**完整路径。\n"
-        "- read_file/read_files 结果**不落盘**，全文直接进上下文；超大单文件请分段 read_file。\n"
-        "- read_file/read_files 失败后**禁止**再 glob 同名补救（应回到 hybrid 换路径）。\n"
+        "**批量读**：检索给出多个完整路径时，尽量一次 read_files(paths=[...])（最多 8 个）。\n"
+        "path 禁止 ../；须从检索结果原样复制。\n"
     )
     if index_ready:
         tools_read = (
-            "list_directory、glob_files、grep_files、search_code_hybrid、"
+            "list_directory、glob_files、grep_files、search_code_parallel、"
             "search_code_semantic、search_workspace、"
             "read_file、read_files、search_session_history、"
             "run_shell_command、get_current_utc_time"
         )
         search_order_hint = (
             "本工作区**代码向量索引已就绪**（llgraph index）。\n"
-            "目录浏览与文件发现**禁止** run_shell_command 的 ls/ls -la/find/tree/du；"
-            "用内置工具：列目录 **list_directory**；"
-            "找文件名 **glob_files**；搜内容 **grep_files**；"
-            "读文件 **read_file** / 批量 **read_files**。\n"
+            "目录浏览用 list_directory；找文件名 glob_files；搜内容 grep_files；读文件 read_file/read_files。\n"
+            "**禁止** run_shell_command 的 ls/find/tree 做文件发现。\n"
             + path_scope_hint
+            + code_search_hint
             + batch_read_hint
-            + "找文件/脚本/类/业务概念时检索顺序：\n"
-            "1) **search_code_hybrid** — **首选**（路径匹配 + grep + 语义，一次调用）；\n"
-            "2) **read_files** — hybrid/glob 已列出多个路径时**一次批量读**；\n"
-            "3) **grep_files** — 已知精确类名/表名/符号（path 用 \".\" 或仓库名）；\n"
-            "4) **glob_files** — 仅当知精确**文件名**且 path=\".\" 或仓库名；\n"
-            "5) search_code_semantic / search_workspace — 兜底。\n"
             + batch_search_hint
-            + "glob/grep 0 命中：先看工具返回的 path 作用域提示；"
-            "内容可能在 markdowns/docs，或 path 过深，勿重复 find/ls/glob。\n"
+            + "glob/grep 0 命中：换更宽 path 或 markdowns/docs。\n"
         )
     else:
         tools_read = (
-            "list_directory、glob_files、grep_files、search_code_hybrid、"
+            "list_directory、glob_files、grep_files、search_code_parallel、"
             "search_code_semantic、search_workspace、search_files、"
             "read_file、read_files、search_session_history、"
             "run_shell_command、get_current_utc_time"
         )
         search_order_hint = (
             "本工作区**尚未建立代码向量索引**（请 llgraph index -C .）。\n"
-            "列目录用 **list_directory**；**禁止** run_shell_command 的 ls/find/tree 做目录浏览或文件发现。\n"
+            "检索：glob_files → grep_files → read_files；建索引后可用 search_code_parallel。\n"
             + path_scope_hint
             + batch_read_hint
-            + "检索顺序：glob_files → grep_files → read_files（多路径）→ search_files / search_workspace；"
-            "建索引后优先 search_code_hybrid。\n"
             + batch_search_hint
         )
     if web_search_enabled:
@@ -420,6 +412,7 @@ def invoke_agent(
     effective_message_override: str | None = None,
     write_failure_tracker: WriteFailureTracker | None = None,
     context_spill: Any | None = None,
+    allow_write: bool = False,
 ) -> str:
     """
     执行一轮对话并返回助手最后一条文本。
@@ -433,6 +426,7 @@ def invoke_agent(
     @param context_session Rule/Skill 会话状态
     @param effective_message_override 覆盖发给模型的消息（自定义命令用）
     @param write_failure_tracker 写工具失败跟踪
+    @param allow_write Web/CLI 当前是否可写（同步 manifest 与 workspace-context）
     @return 助手回复文本
     """
     trace = trace_session or TraceSession()
@@ -470,11 +464,11 @@ def invoke_agent(
 
             ops_notice(format_tool_prune_report(prune_report))
 
-        from llgraph.context.context_settings import resolve_context_settings
+        from llgraph.context.context_settings import is_auto_compress_strategy, resolve_context_settings
 
         ctx_settings = resolve_context_settings(root)
         invoke_preserve = (
-            False if ctx_settings.compress_strategy == "cursor" else None
+            False if is_auto_compress_strategy(ctx_settings.compress_strategy) else None
         )
         compress_report = apply_compress_to_agent_state(
             agent,
@@ -505,6 +499,7 @@ def invoke_agent(
         user_message=user_message,
         with_memory=with_memory,
         archive_path=archive_path,
+        allow_write=allow_write,
     )
     if with_memory:
         from llgraph.context.chat_history_repair import ensure_agent_chat_history_sanitized
@@ -512,7 +507,34 @@ def invoke_agent(
         # 仅 canonical 落盘清理（不按当前模型展开），出站修链在 prompt normalizer
         ensure_agent_chat_history_sanitized(agent, root, thread_id)
 
-    context_block = build_workspace_context_block(root, ctx, user_message)
+    recent_messages: list[BaseMessage] | None = None
+    edited_paths: list[str] | None = None
+    if with_memory:
+        from langchain_core.messages import BaseMessage
+
+        try:
+            state = agent.get_state({"configurable": {"thread_id": thread_id}})
+            recent_messages = list((state.values or {}).get("messages") or [])
+        except Exception:
+            recent_messages = None
+        if allow_write:
+            try:
+                from llgraph.console.edit_service import session_edit_tracker
+
+                tracker = session_edit_tracker(root, thread_id)
+                paths = tracker.unique_paths()
+                edited_paths = paths if paths else None
+            except Exception:
+                edited_paths = None
+
+    context_block = build_workspace_context_block(
+        root,
+        ctx,
+        user_message,
+        allow_write=allow_write,
+        recent_messages=recent_messages,
+        edited_paths=edited_paths,
+    )
     if effective_message_override is not None:
         effective = effective_message_override
     else:

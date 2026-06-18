@@ -6,6 +6,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 from llgraph.core.agent import build_agent
 from llgraph.config.edit_settings import resolve_edit_settings
@@ -66,17 +67,30 @@ def _run_interactive(
     write_failure_tracker: WriteFailureTracker | None = None,
     resume_hint: str = "",
     memory_kind: str = "",
+    mcp_tools: list | None = None,
+    mcp_registry: Any | None = None,
+    watch_service: Any | None = None,
+    sandbox_policy: Any | None = None,
+    sandbox_cli_enabled: bool | None = None,
+    no_spill: bool = False,
 ) -> None:
-    """交互会话（经典终端）。"""
-    tid = agent_session.thread_id if agent_session is not None else thread_id
+    """交互会话（经典终端，支持与 Plan 模式切换）。"""
+    from llgraph.terminal.mode_loop import AgentPlanLoopContext, run_agent_plan_loop
+    from llgraph.terminal.session import TerminalSessionParams
 
-    from llgraph.terminal.session import TerminalSessionParams, run_terminal_session
+    if agent_session is None:
+        raise RuntimeError("交互模式需要 agent_session")
 
-    run_terminal_session(
-        TerminalSessionParams(
-            agent=agent,
+    session_hints: dict[str, str | None] = {
+        "opening": opening_message,
+        "resume": resume_hint or None,
+    }
+
+    def terminal_params_factory() -> TerminalSessionParams:
+        params = TerminalSessionParams(
+            agent=agent_session.agent,
             workspace=workspace,
-            thread_id=tid,
+            thread_id=agent_session.thread_id,
             trace_session=trace_session,
             context_session=context_session,
             allow_write=allow_write,
@@ -86,19 +100,42 @@ def _run_interactive(
             watch_active=watch_active,
             web_search_enabled=web_search_enabled,
             mcp_summary=mcp_summary,
-            resume_hint=resume_hint,
+            resume_hint=session_hints.get("resume") or "",
             memory_kind=memory_kind,
-            opening_message=opening_message,
+            opening_message=session_hints.get("opening"),
+        )
+        session_hints["opening"] = None
+        session_hints["resume"] = None
+        return params
+
+    run_agent_plan_loop(
+        AgentPlanLoopContext(
+            workspace=workspace,
+            agent_session=agent_session,
+            terminal_params_factory=terminal_params_factory,
+            session_hints=session_hints,
+            plan_common={
+                "trace_session": trace_session,
+                "context_session": context_session,
+                "allow_write": allow_write,
+                "mcp_tools": mcp_tools or [],
+                "sandbox_policy": sandbox_policy,
+                "web_search_enabled": web_search_enabled,
+                "watch_active": watch_active,
+                "mcp_summary": mcp_summary,
+                "memory_kind": memory_kind,
+            },
         )
     )
-
-    from llgraph.session.session_switch import print_session_exit_hint
-
-    print_session_exit_hint(workspace, tid)
 
 
 def main() -> None:
     """解析参数并执行 Agent（默认交互会话）。"""
+    if len(sys.argv) >= 2 and sys.argv[1] == "web":
+        from llgraph.cli.web_cli import main as web_main
+
+        web_main(sys.argv[2:])
+        return
     if len(sys.argv) >= 2 and sys.argv[1] == "index":
         from llgraph.cli.index_cli import main as index_main
 
@@ -108,6 +145,11 @@ def main() -> None:
         from llgraph.cli.search_cli import main as search_main
 
         search_main(sys.argv[2:])
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] == "plan":
+        from llgraph.cli.plan_cli import main as plan_main
+
+        plan_main(sys.argv[2:])
         return
 
     parser = argparse.ArgumentParser(
@@ -145,7 +187,7 @@ def main() -> None:
         "--delete-session",
         default=None,
         metavar="ID",
-        help="删除指定 thread_id 会话落盘后退出（如 cli-c7a2fbca）",
+        help="删除指定 thread_id 会话落盘后退出（cli-* 或 plan-*，Plan 含 Worker 级联）",
     )
     parser.add_argument(
         "--purge-sessions",
@@ -261,19 +303,21 @@ def main() -> None:
         return
 
     if args.delete_session:
-        from llgraph.session.session_delete import delete_session, validate_thread_id
+        from llgraph.session.session_delete import delete_workspace_session, validate_thread_id
 
         try:
             tid = validate_thread_id(args.delete_session.strip())
         except ValueError as exc:
             print(f"错误: {exc}", file=sys.stderr)
             sys.exit(1)
-        result = delete_session(workspace, tid)
+        result = delete_workspace_session(workspace, tid)
         if result.ok:
             print(f"已删除会话 {tid}。", flush=True)
             for path in result.removed_paths:
                 print(f"  - {path}", flush=True)
-            if not result.removed_paths:
+            for path in result.related_removed:
+                print(f"  - {path}", flush=True)
+            if not result.removed_paths and not result.related_removed:
                 print("  （无落盘文件或已不存在）", flush=True)
         else:
             print(f"删除失败: {result.error}", file=sys.stderr)
@@ -379,10 +423,14 @@ def main() -> None:
         ):
             return
 
+    from llgraph.terminal.markdown_render import markdown_render_enabled, resolve_rich_from_env
+
     initial_mode = parse_trace_mode(args.trace) or TraceMode.STEPS
     trace_session = TraceSession(
         mode=initial_mode,
         preview_lines=max(1, args.preview_lines),
+        render_markdown=markdown_render_enabled(),
+        use_rich=resolve_rich_from_env(),
     )
     allow_write = args.write
     if args.sandbox and args.no_sandbox:
@@ -629,6 +677,12 @@ def main() -> None:
             write_failure_tracker=write_failure_tracker,
             resume_hint=resume_hint,
             memory_kind=memory_kind,
+            mcp_tools=mcp_tools,
+            mcp_registry=mcp_registry,
+            watch_service=watch_service,
+            sandbox_policy=sandbox_policy,
+            sandbox_cli_enabled=cli_sandbox,
+            no_spill=args.no_spill,
         )
     except RuntimeError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)

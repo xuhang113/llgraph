@@ -91,6 +91,11 @@ def _run_turn(params: TerminalSessionParams, user_input: str) -> str | None:
     from llgraph.core.agent import invoke_agent
 
     try:
+        allow_write = (
+            params.agent_session.allow_write
+            if params.agent_session is not None
+            else params.allow_write
+        )
         return invoke_agent(
             agent,
             user_input,
@@ -101,6 +106,7 @@ def _run_turn(params: TerminalSessionParams, user_input: str) -> str | None:
             context_session=params.context_session,
             write_failure_tracker=wft,
             context_spill=spill,
+            allow_write=allow_write,
         )
     except KeyboardInterrupt:
         emit(f"\n{MSG_INTERRUPT_EXIT}", colorize=True)
@@ -158,10 +164,16 @@ def _maybe_survey_followup(
     if resolve_survey_from_assistant(parse_text) is None:
         return
     emit_milestone("检测到确认问卷，请在下方菜单中选择（Esc 取消）…")
+    allow_write = (
+        params.agent_session.allow_write
+        if params.agent_session is not None
+        else params.allow_write
+    )
     followup = try_run_survey_followup(
         parse_text,
         workspace=params.workspace,
         context_session=params.context_session,
+        allow_write=allow_write,
     )
     if not followup:
         return
@@ -213,11 +225,15 @@ def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
     return True
 
 
-def run_terminal_session(params: TerminalSessionParams) -> None:
+from llgraph.session.mode_switch import SessionModeTransition
+
+
+def run_terminal_session(params: TerminalSessionParams) -> SessionModeTransition | None:
     """
     启动经典终端交互循环。
 
     @param params 会话参数
+    @return 模式切换请求；正常 exit 返回 None
     """
     from llgraph.terminal.input_reader import (
         init_input_history,
@@ -241,14 +257,26 @@ def run_terminal_session(params: TerminalSessionParams) -> None:
     )
     emit()
 
+    def _maybe_mode_switch() -> SessionModeTransition | None:
+        if params.agent_session is not None and params.agent_session.mode_switch is not None:
+            transition = params.agent_session.mode_switch
+            params.agent_session.mode_switch = None
+            return transition
+        return None
+
     if params.opening_message:
         if not _process_user_message(params, params.opening_message.strip()):
             save_input_history()
-            return
+            return None
+        sw = _maybe_mode_switch()
+        if sw is not None:
+            save_input_history()
+            return sw
         if params.single_turn:
             save_input_history()
-            return
+            return None
 
+    transition: SessionModeTransition | None = None
     try:
         while True:
             try:
@@ -263,5 +291,17 @@ def run_terminal_session(params: TerminalSessionParams) -> None:
                 continue
             if not _process_user_message(params, user_input):
                 break
+            sw = _maybe_mode_switch()
+            if sw is not None:
+                transition = sw
+                break
     finally:
         save_input_history()
+
+    if transition is not None:
+        return transition
+
+    from llgraph.session.session_switch import print_session_exit_hint
+
+    print_session_exit_hint(params.workspace, _active_thread_id(params))
+    return None

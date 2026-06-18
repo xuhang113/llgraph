@@ -1,6 +1,6 @@
 # 基于 Cursor 的 Agent 实现
 
-llgraph 是 **Cursor Agent 工作流在终端侧的独立实现**：复用相近的产品概念与使用习惯，但运行在 **CLI + LangGraph + 公司 AI Gateway**，不依赖 Cursor IDE。
+llgraph 是 **Cursor Agent 工作流在终端侧的独立实现**：复用相近的产品概念与使用习惯，但运行在 **CLI + LangGraph + 自建 AI Gateway**，不依赖 Cursor IDE。
 
 适合场景：已在 Cursor 里习惯 Agent 排查/改代码，希望在 **终端、脚本、无 IDE 环境** 下用同一套心智模型操作 monorepo 工作区。
 
@@ -17,7 +17,7 @@ llgraph 是 **Cursor Agent 工作流在终端侧的独立实现**：复用相近
 | 代码补全 Tab | ✅ | ❌（仅 Agent，无补全） |
 | 图形化 diff / Apply | ✅ | ❌（用 `/diff`、git diff） |
 
-**结论**：llgraph 不是 Cursor 插件，而是 **「Cursor 式 Agent」的 CLI 复刻 + 公司内部网关适配**；配置与运行时完全分离，避免两套系统绑死。
+**结论**：llgraph 不是 Cursor 插件，而是 **「Cursor 式 Agent」的 CLI 复刻 + 自建网关适配**；配置与运行时完全分离，避免两套系统绑死。
 
 ---
 
@@ -36,7 +36,8 @@ llgraph 是 **Cursor Agent 工作流在终端侧的独立实现**：复用相近
 | **会话内「改了哪些文件」** | `SessionEditTracker` | `/changes`、`/diff` |
 | **MCP 工具** | stdio MCP 客户端，工具名 `mcp__<server>__<tool>` | `.llgraph/mcp.json` |
 | **自定义 Slash 命令** | `.llgraph/commands/*.md`（frontmatter + prompt） | `/commands` |
-| **长上下文 / 压缩** | `/compress` + 接近阈值自动压缩 | `agent.json` → `context` |
+| **长上下文 / 压缩** | `/compress` + `compress_strategy: auto`（滚动 anchor + 按 token 自动扩展出站 user 轮） | `agent.json` → `context`；`/context` 查看 |
+| **续写 / 重写连续性** | `<workspace-context>` pin（已改路径、近期 read、上轮摘要） | 自动（`context_continuity.py`） |
 | **动态上下文发现** | 大工具结果落盘 + 指针，按需 `read_file` | P6，`/trace stats` |
 | **代码评审** | `/review`，落盘 `~/llgraph-review/` | `agent.json` → `review` |
 | **保存后索引更新** | `watchdog` debounce 增量索引 | 随 Agent 启动，`--no-watch-index` 关闭 |
@@ -113,7 +114,8 @@ Cursor IDE Agent                    llgraph CLI Agent
 - Cursor Cloud Agents、Background Agent
 - 自动读取 Cursor `terminals/*.txt`（P6 V2 可选；当前仅 llgraph 自身工具输出落盘）
 - Cursor Hooks（`.cursor/hooks`）— 需自行在 shell 侧集成
-- 提供商侧 `cache_control` 等前缀缓存 API（仅客户端减 token，见 P6）
+
+**已实现**（与旧版文档表述不同）：网关支持时，出站可对稳定 system / tools / 对话尾打 `cache_control` 断点（见 [会话上下文与历史.md](会话上下文与历史.md) §10）。
 
 ---
 

@@ -113,6 +113,20 @@ def _normalize_tool_call_id(tool_call_id: object | None) -> str | None:
     return text or None
 
 
+def _canonical_tool_call_id(tool_call_id: str) -> str:
+    """
+    统一 tool_call_id 匹配键（functions.foo:2 与 functions_foo_2 等价）。
+
+    @param tool_call_id 原始 id
+    @return 规范化 id
+    """
+    text = tool_call_id.strip()
+    if not text:
+        return "tool_call"
+    safe = _TOOL_CALL_ID_UNSAFE.sub("_", text)
+    return safe.replace(".", "_") or "tool_call"
+
+
 def _gateway_safe_tool_call_id(tool_call_id: str) -> str:
     """
     将 tool_call_id 规范为 Anthropic/Claude 网关可接受字符集（如拒绝 ':'）。
@@ -120,8 +134,24 @@ def _gateway_safe_tool_call_id(tool_call_id: str) -> str:
     @param tool_call_id 原始 id
     @return 规范化 id
     """
-    safe = _TOOL_CALL_ID_UNSAFE.sub("_", tool_call_id.strip())
-    return safe or "tool_call"
+    return _canonical_tool_call_id(tool_call_id)
+
+
+def _lookup_tool_message(
+    tools_by_id: dict[str, ToolMessage],
+    call_id: str,
+) -> ToolMessage | None:
+    """
+    按原始或规范化 id 查找 ToolMessage。
+
+    @param tools_by_id id -> ToolMessage（键可为原始或 canonical）
+    @param call_id AI tool_call id
+    @return 匹配的工具消息
+    """
+    direct = tools_by_id.get(call_id)
+    if direct is not None:
+        return direct
+    return tools_by_id.get(_canonical_tool_call_id(call_id))
 
 
 def sanitize_gateway_tool_call_ids(
@@ -415,7 +445,7 @@ def _append_tool_results(
         cid = _tool_call_id(tc)
         if not cid:
             continue
-        tool_msg = tools_by_id.get(cid)
+        tool_msg = _lookup_tool_message(tools_by_id, cid)
         if tool_msg is not None:
             safe.append(tool_msg)
             continue
@@ -476,7 +506,7 @@ def _append_single_tool_round(
             },
         )
         safe.append(ai_piece)
-        tool_msg = tools_by_id.get(cid)
+        tool_msg = _lookup_tool_message(tools_by_id, cid)
         if tool_msg is not None:
             safe.append(tool_msg)
         else:
@@ -525,15 +555,18 @@ def rebuild_provider_safe_messages(
                 safe.append(norm)
                 continue
 
-            expected = {
-                x for x in (_tool_call_id(tc) for tc in tool_calls) if x
+            expected_canonical = {
+                _canonical_tool_call_id(x)
+                for x in (_tool_call_id(tc) for tc in tool_calls)
+                if x
             }
             tools_by_id: dict[str, ToolMessage] = {}
             while i < n and isinstance(messages[i], ToolMessage):
                 tool_msg = messages[i]
                 tid = _normalize_tool_call_id(getattr(tool_msg, "tool_call_id", None))
-                if tid and tid in expected:
+                if tid and _canonical_tool_call_id(tid) in expected_canonical:
                     tools_by_id[tid] = tool_msg
+                    tools_by_id[_canonical_tool_call_id(tid)] = tool_msg
                 else:
                     report.removed_orphan_tools += 1
                 i += 1

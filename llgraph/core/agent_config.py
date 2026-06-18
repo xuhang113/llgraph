@@ -145,4 +145,6 @@ def format_agent_config_sources(workspace: Path) -> str:
             "提示: 可复制 examples/user-llgraph/agent.json 到 ~/.llgraph/agent.json；"
             "工作区用 llgraph --init-config -C <目录>"
         )
+    lines.append("")
+    lines.append("context 字段说明: 会话内 /context 查看；模板见 .llgraph/agent.json → context._docs")
     return "\n".join(lines)

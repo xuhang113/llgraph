@@ -219,7 +219,7 @@ def read_path_rejection_reason(path: Path, workspace: Path | None = None) -> str
     if suffix in _BINARY_READ_SUFFIXES:
         return (
             f"不支持读取库/二进制文件 ({suffix or path.name})；"
-            "请读 src/ 下 .java/.py 等源码，或用 search_code_hybrid/grep_files 定位。"
+            "请读 src/ 下 .java/.py 等源码，或用 search_code_parallel/grep_files 定位。"
         )
 
     lowered_parts = [part.lower() for part in path.parts]

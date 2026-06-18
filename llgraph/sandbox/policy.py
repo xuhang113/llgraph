@@ -182,6 +182,7 @@ def build_sandbox_policy(
     @return SandboxPolicy
     """
     ws = workspace.expanduser().resolve()
+    user_home = Path.home().expanduser().resolve()
     active = _resolve_sandbox_active(
         settings,
         cli_enabled=cli_enabled,
@@ -193,7 +194,8 @@ def build_sandbox_policy(
         allow_write=allow_write,
     )
 
-    readonly: list[Path] = [ws]
+    # 工作区 + 用户主目录（~/.llgraph/skills 等）始终可读，与无沙箱时 read_file 白名单对齐
+    readonly: list[Path] = [ws, user_home]
     readwrite: list[Path] = []
 
     for raw in settings.additional_readonly_paths:

@@ -3,9 +3,57 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Iterator
 
 from llgraph.terminal.style import sty
 from llgraph.terminal.terminal_theme import colorize_terminal_text
+
+_emit_capture: ContextVar[list[str] | None] = ContextVar("emit_capture", default=None)
+
+
+def _append_capture(text: str) -> bool:
+    """
+    将输出写入 Web 元命令捕获缓冲。
+
+    @param text 待写入文本（可含 ANSI）
+    @return 是否处于捕获模式
+    """
+    buf = _emit_capture.get()
+    if buf is None:
+        return False
+    from llgraph.display.trace_sink import strip_ansi
+
+    cleaned = strip_ansi(text).strip()
+    if cleaned:
+        buf.append(cleaned)
+    return True
+
+
+@contextmanager
+def capture_terminal_output() -> Iterator[list[str]]:
+    """
+    捕获 emit / emit_report 等终端输出（供 Web 元命令 API 返回）。
+
+    @yield 按块收集的纯文本列表
+    """
+    buf: list[str] = []
+    token = _emit_capture.set(buf)
+    try:
+        yield buf
+    finally:
+        _emit_capture.reset(token)
+
+
+def format_captured_output(buf: list[str]) -> str:
+    """
+    将捕获块合并为单段 Markdown/纯文本。
+
+    @param buf capture_terminal_output 收集的列表
+    @return 合并后的文本
+    """
+    return "\n".join(buf)
 
 
 def write_dialog_block(text: str) -> None:
@@ -14,6 +62,8 @@ def write_dialog_block(text: str) -> None:
 
     @param text 多行内容
     """
+    if _append_capture(text):
+        return
     if text.strip():
         print(text.strip(), flush=True)
 
@@ -47,27 +97,55 @@ def emit(
         payload = colorize_terminal_text(text)
     else:
         payload = text
+    if _append_capture(payload):
+        return
     print(payload, flush=True)
 
 
-def emit_block(text: str, *, colorize: bool = True) -> None:
+def emit_block(
+    text: str,
+    *,
+    colorize: bool = True,
+    render_markdown: bool = False,
+) -> None:
     """
-    输出多行报告块（默认自动分色）。
+    输出多行报告块（/help、/plan results 等元命令；默认仅分色，不 Rich）。
 
-    @param text 多行文本
-    @param colorize 是否套用 terminal_theme
+    @param text 多行 Markdown/纯文本原文
+    @param colorize 是否套用 terminal_theme 分色
+    @param render_markdown 是否额外做 Rich/ANSI Markdown 渲染（默认 False）
     """
+    if render_markdown and text.strip():
+        from llgraph.terminal.markdown_render import render_for_terminal, rich_render_enabled
+
+        rendered = render_for_terminal(
+            text,
+            force=True,
+            use_rich=rich_render_enabled(),
+        )
+        if rendered.strip():
+            write_dialog_block(rendered)
+            return
     payload = colorize_terminal_text(text) if colorize else text
     write_dialog_block(payload)
 
 
+def emit_markdown_block(text: str) -> None:
+    """
+    显式对 Markdown 做终端 Rich/ANSI 渲染（元命令一般勿用，留给助手 trace）。
+
+    @param text Markdown 原文
+    """
+    emit_block(text, colorize=False, render_markdown=True)
+
+
 def emit_report(text: str) -> None:
     """
-    输出元命令/状态报告（emit_block 别名，始终分色）。
+    输出元命令/状态报告（Markdown 原文 + 终端分色，不做 Rich 渲染）。
 
     @param text 多行文本
     """
-    emit_block(text, colorize=True)
+    emit_block(text, colorize=True, render_markdown=False)
 
 
 def emit_error(text: str) -> None:
@@ -77,6 +155,8 @@ def emit_error(text: str) -> None:
     @param text 错误说明
     """
     msg = text if text.startswith("●") else f"● {text}"
+    if _append_capture(msg):
+        return
     if sys.stderr.isatty() or sys.stdout.isatty():
         print(sty(msg, "err"), file=sys.stderr, flush=True)
     else:

@@ -8,13 +8,22 @@ SKILLS_DIR_NAME = "skills"
 RULES_DIR_NAME = "rules"
 
 
+def _package_examples_root() -> Path:
+    """
+    仓库 examples/ 根目录（与 Python 包 llgraph/ 同级）。
+
+    workspace_config 位于 llgraph/config/，向上三级到仓库根。
+    """
+    return Path(__file__).resolve().parent.parent.parent / "examples"
+
+
 def package_default_config_dir() -> Path:
     """
     包内默认配置模板目录。
 
     @return examples/default-workspace/.llgraph 路径
     """
-    return Path(__file__).resolve().parent.parent / "examples" / "default-workspace" / LLGRAPH_DIR_NAME
+    return _package_examples_root() / "default-workspace" / LLGRAPH_DIR_NAME
 
 
 def package_user_config_dir() -> Path:
@@ -23,7 +32,7 @@ def package_user_config_dir() -> Path:
 
     @return examples/user-llgraph 路径
     """
-    return Path(__file__).resolve().parent.parent / "examples" / "user-llgraph"
+    return _package_examples_root() / "user-llgraph"
 
 
 def init_user_llgraph(*, force: bool = False) -> list[str]:

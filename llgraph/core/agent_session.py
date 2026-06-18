@@ -12,6 +12,7 @@ from llgraph.survey.edit_confirm import EditConfirmGate
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.display.trace_display import TraceSession
 from llgraph.sandbox.policy import SandboxPolicy
+from llgraph.session.mode_switch import SessionModeTransition
 
 
 @dataclass
@@ -36,3 +37,5 @@ class AgentSessionContext:
     edit_confirm_gate: EditConfirmGate | None = None
     sandbox_policy: SandboxPolicy | None = None
     sandbox_cli_enabled: bool | None = None
+    mode_switch: SessionModeTransition | None = None
+    return_agent_thread_id: str | None = None

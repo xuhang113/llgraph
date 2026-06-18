@@ -111,7 +111,7 @@ def resolve_sandbox_settings(workspace: Path) -> SandboxSettings:
     readwrite = _parse_path_list(merged.get("additionalReadwritePaths"))
     allow_tmp = _parse_bool(merged.get("allowTmpWrite"), True)
     bind_write_mode = _parse_bool(merged.get("bindWriteMode"), True)
-    auto_enable_on_readonly = _parse_bool(merged.get("autoEnableOnReadonly"), True)
+    auto_enable_on_readonly = _parse_bool(merged.get("autoEnableOnReadonly"), False)
 
     sources: list[str] = []
     if user_path.is_file():
@@ -149,7 +149,7 @@ def format_sandbox_config_hint(workspace: Path) -> str:
         f"  用户: {user_path}\n"
         f"  工作区: {ws_path}\n"
         "常用字段: enabled, bindWriteMode(默认 true，mode 随只读/-w 联动), "
-        "autoEnableOnReadonly(默认 true，只读启动自动 OS 沙箱), "
+        "autoEnableOnReadonly(默认 false，true 时只读启动自动 OS 沙箱), "
         "mode, network(deny|allow), additionalReadonlyPaths, "
         "additionalReadwritePaths, allowTmpWrite"
     )

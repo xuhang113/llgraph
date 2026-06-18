@@ -389,17 +389,17 @@ def retrieve_related_code_for_compress(
     @return 格式化文本；无索引或失败返回空
     """
     try:
-        from llgraph.code_index.hybrid import search_hybrid
+        from llgraph.code_index.parallel_search import search_parallel
         from llgraph.code_index.store import get_index_status
 
         if not get_index_status(workspace).exists:
             return ""
-        text = search_hybrid(
+        text = search_parallel(
             workspace,
             query,
             top_k=top_k,
             source="compress",
-            tool="search_code_hybrid",
+            tool="search_code_parallel",
         )
         text = text.strip()
         if len(text) > max_chars:
@@ -617,7 +617,7 @@ def update_detail_pointers(
     ]
     if archive_path:
         lines.append(f"- 压缩前完整对话归档: `{archive_path}`（read_file）")
-    lines.append("- 代码细节: `search_code_hybrid` / `grep_files` / `read_file`")
+    lines.append("- 代码细节: `search_code_parallel` / `grep_files` / `read_file`")
     sections = dict(sections)
     sections[SECTION_DETAIL_POINTERS] = "\n".join(lines)
     return sections

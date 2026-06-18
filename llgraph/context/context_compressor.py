@@ -10,7 +10,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from llgraph.context.context_message_split import split_messages_for_compress_strategy
-from llgraph.context.context_settings import resolve_context_settings
+from llgraph.context.context_settings import is_auto_compress_strategy, resolve_context_settings
 from llgraph.context.context_spill import compact_tool_messages_for_compress
 from llgraph.context.conversation_anchor import (
     build_conversation_anchor_system_message,
@@ -165,7 +165,7 @@ class ContextCompressor:
         unpinned = [m for m in unpinned if not is_session_manifest_message(m)]
 
         if preserve_current_turn is None:
-            preserve_current_turn = self.settings.compress_strategy != "cursor"
+            preserve_current_turn = not is_auto_compress_strategy(self.settings.compress_strategy)
 
         token_budget = int(
             self.settings.max_tokens_estimate * self.settings.keep_recent_token_ratio
@@ -270,7 +270,7 @@ def apply_compress_to_agent_state(
 
     compressor = ContextCompressor(workspace, session_id=thread_id)
     if preserve_current_turn is None:
-        preserve_current_turn = compressor.settings.compress_strategy != "cursor"
+        preserve_current_turn = not is_auto_compress_strategy(compressor.settings.compress_strategy)
 
     new_messages, report = compressor.compress(
         messages,
