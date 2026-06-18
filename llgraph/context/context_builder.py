@@ -1,5 +1,7 @@
 """按 Rule / Skill 目录 + 文档索引组装上下文（目录在 session-manifest；此处仅每轮 ephemeral 提示）。"""
 
+from __future__ import annotations
+
 from pathlib import Path
 from typing import TYPE_CHECKING
 
