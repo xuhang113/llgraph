@@ -1,0 +1,113 @@
+# 代码检索与工具选型（对齐 Cursor：少 step、先 grep、parallel 至多一次）
+
+tool_routing: |
+  ## 工具选型（每轮调工具前必对照，禁止试错空转）
+
+  ### 0. 调 tool 前自检（在 thinking 内完成，再发 tool_calls）
+  1. **能否 batch**：本步若需 ≥2 次 grep/read/list/glob → 是否已放在**同一条 assistant 消息的多个 tool_call** 里？若只发 1 个，须在 thinking 写明**为何不能合并**（仅当确实只需一个动作时例外）。
+  2. **是否重复搜**：pattern/path 是否在**本轮 user 以来**的 tool 结果里已出现？0 命中或已落盘的 → **禁止**对 `path="."` 再跑同一 pattern；改 read 落盘行段或换 pattern/path。
+  3. **path 来源**：path 是否来自 list/glob/grep/read 的**原样路径**？**禁止**猜 `acme-xxx` 目录名。
+
+  ### 1. 能否跳过 search_code_parallel？
+  用户问题或上下文中**已有可搜字面量**（URL 域名/路径段、字段 userId/orderId、类名 XxxService、方法 createRecord、表名 tb_）→ **禁止**先 parallel；直接：
+  `grep_files(pattern="词1|词2|词3", path=".")`（全工作区）或 `path="<已确认存在的仓库目录>"`。
+  只有「完全不知模块/仓库/类名、仅有业务口语」→ `search_code_parallel` **至多 1 次**（query 内自带 5+ 关键词）；**第二次必被拦截，勿浪费 step**。
+
+  ### 1b. 用户给了 URL / 接口 path（规划原则，由你决策工具，须自洽）
+  从 URL 提取**检索锚点**（域名关键词、path 各段，如 `billing`、`report`），在 thinking 中写清「锚点 → 预期命中何种路径」。
+  **推荐链路**（接口/鉴权/行为类）：
+  1. `grep_files(pattern="锚点1|锚点2|…", path=".")` — 一次合并，先定位**实现该 URL 的仓库**；
+  2. 仅当 grep 结果（或 parallel/list 的**原样输出**）已出现某仓库根目录名时，才将 path 缩小到该仓库；
+  3. 再 `glob`/`grep` 具体 Controller 或读 `read_files`。
+  **为何不要先扫无关仓库的 `*Controller`**：用户问的是 URL A，在从未出现 A 相关命中的仓库 B 里枚举 Controller，无法回答 A，且浪费 step；这不是工具限制，而是证据链不完整。
+  **path 与问题的关联**：缩小 path 前，thinking 须能完成一句「因为上一步工具返回了 …/repo-x/…，故 path=repo-x」；不能写「我猜 repo-y 可能有 Controller」。
+  全库 grep 锚点均为 0 命中 → 正文说明工作区可能无该服务；若仍要扩大检索，须在 thinking 说明**扩大理由**（如查网关转发、查 markdowns），勿静默枚举 monorepo 里所有 `*-service`。
+
+  ### 2. path 从哪来（禁止猜目录名）
+  - **禁止**凭直觉写 path（如 `acme-api`）；须来自：`list_directory(path=".")` 顶层、`parallel`/`glob_files` 返回的路径前缀、或已读 manifest。
+  - **不确定仓库名** → 用 `path="."` + `pattern` 搜内容，或 `glob_files(glob_pattern="**/*api*", path=".")` 找目录；**不要**连猜多个仓库名各 grep 一轮。
+  - 报「路径不存在」→ 改 `path="."` 或 `list_directory(".")` 核对后**只重试一次** grep。
+
+  ### 3. 场景 → 首步工具
+  | 场景 | 首步 | 接着 |
+  | 表/字段/DO（tb_*、biz_id、某表做什么） | **一次** `grep_files(pattern="表名|CamelDO|Mapper|字段", path=".")` | **同轮或次轮** `read_files` 读 DO+Mapper+Service |
+  | 行为/覆盖/幂等/insert vs update | `grep_files` 业务词+方法名，`path="."` | `read_file` 宽段 80–200 行 |
+  | 已知 `**/Foo.java` 或类名 | `glob_files` 或 `grep_files(pattern="class Foo")` | `read_files` |
+  | 完全不知在哪 | `search_code_parallel` ×1 | `grep` → `read_files` 宽段 |
+  | 只看工作区有哪些仓库 | `list_directory(path=".")` 一次 | 再 `grep` 到具体仓库 |
+  | 会话/历史/之前说过什么 | `search_session_history` | `read_file` 归档行段 |
+
+  ### 4. 标准链路（减 step、默认并行、够答就停）
+  **单点报错/接口原因**（只读）：目标 **3～5 次模型决策**后输出分级结论正文。
+  - 轮1：`grep_files(pattern="接口路径|方法名|业务词A|业务词B", path=".")` — 多词用 `|`，**不限个数**；或同轮并行 2 个 grep（不同 pattern/path）
+  - 轮2：`read_files(paths=[Controller.java, Service.java, …])` — **一次读齐**（最多 8 个 path），勿分多轮 read
+  - 轮3（可选）：同轮 `grep_files(下游|常量类名|Gateway)` + `read_file(宽段)`；或 **证据已够 → 停 tool，直接正文**
+  - 用户要追 OA/配置落库值 → **第二轮**再深挖，勿在同一轮 user 问题里默认挖 30+ 步
+
+  **禁止**：`parallel→parallel`；同 pattern 重复 grep；`read 窄段×5`；同一 path 串行重复 read；`list_directory(.)` 后反复 list；**禁止**「grep 一轮 → read 一轮 → grep 一轮」串行拆法（应合并 grep 或 read_files）。
+
+anti_patterns: |
+  ## 常见多余 step（禁止）
+  1. **parallel 第二次**：换 query 仍算同一用户问题，会被拦截。
+  2. **猜 path**：`grep(path=acme-api)` 失败再猜 `acme-api-service` → 应一开始 `path="."` 或先 `list_directory(".")`。
+  3. **grep 已落盘仍全库重搜**：结果 >200 行已落盘 → 对落盘文件 `read_file(start_line,end_line)` 或缩小 pattern/path，勿对 `path="."` 再跑同一 pattern。
+  4. **list 代替 grep**：`list_directory(.)` 176 项后仍 list 子目录找业务逻辑 → 改 `grep_files`。
+  5. **单工具占满一轮**：调研阶段默认**每轮多个 tool_calls**；仅当确实只需一个动作时才单发。
+  6. **够答仍挖**：单点「什么原因」已有所需 Controller+Service+失败分支，仍继续 10+ 轮 → 应先正文分级结论，用户追问再深挖。
+  7. **thinking 列两个目标只发一个 tool**：须合并 grep（`词A|词B|词C`）或同轮并行多个 tool，禁止下一轮再补。
+  8. **URL 与 path 脱节**：用户给了 `…/billing/report/…`，却在从未出现 billing/report 命中的仓库里 `glob **/*Controller` → 应先 `grep billing|report path="."`，且 thinking 写明 path 依据。
+  9. **串行 grep 同实体**：`grep(tb_xxx)` 一轮后再 `grep(XxxDO)` 一轮 → 应首轮 `grep(tb_xxx|XxxDO|XxxMapper|字段名)`。
+  10. **串行 read**：已从 grep 得到 3+ 路径却 `read_files(1～2 个)` 分多轮 → 应一次 `read_files(paths=[...])`（≤8）。
+
+path_scope: |
+  **glob_files / grep_files 的 path（必须遵守）**：
+  - path = 相对工作区根的**搜索根（子树边界）**，无 cwd；只在 path 子树内匹配，**不含兄弟目录**。
+  - **禁止** path 含 "../"；**禁止**未在 list/glob/parallel 结果中出现过的目录名。
+  - 跨仓库搜业务词：默认 **path="."**；限定单仓时再 path="<仓库根目录名>"。
+  - **禁止**沿用 list_directory 后的深层 path 做跨包 glob（如 path=.../activity 却 glob **/basic/**）。
+  - glob/grep 0 命中：**禁止同 path 同 pattern 再试**；换更宽 path、markdowns/docs，或改 pattern。
+
+code_search: |
+  **代码检索节奏**（索引已就绪时）：
+  - 有字面量 → **grep_files 先行**；无字面量 → **search_code_parallel 至多 1 次**。
+  - parallel 只给**线索路径**；下一步必须 **grep_files** 定行号/调用链，**禁止**再 parallel。
+  - 精读：**read_files(paths=[...])** 或 **read_file 一次宽行段**（import+类+方法，约 80–200 行）。
+  - **search_code_semantic**：仅当 parallel 不可用且 grep 无命中时的补充，**禁止**与 parallel 同问题连用多次。
+
+batch_read: |
+  **批量读**：
+  - 多个路径 → **一次 read_files(paths=[...])**（最多 8 个），常与 grep 同轮并行。
+  - 单文件**连续**区间 → **一次宽** `read_file(start, end)`（import+类+方法，常见 **80～300 行**；文件 <500 行可 `end_line=0` **只读一次全文**）。
+  - 单文件**不连续**多段（如行 50 与行 300）→ **同一条 assistant 消息内并行**多个 `read_file`（同一 path、不同 start/end）；框架同批执行。**禁止**拆成多轮串行窄读。
+  - **禁止**：同一 path 相同 start/end 重复 read；禁止 12 次各读 30 行；禁止「先 read 100 行再等一轮 read 下 100 行」。
+  - path 须从工具结果**原样复制**；禁止 ../。
+
+batch_search: |
+  **批量搜（硬性默认，禁止「一轮一个 grep」）**：
+  - 多个关键字 → **一次** `grep_files(pattern="词A|词B|词C", path=".")`；**禁止**拆成多轮各搜一个词。
+  - **同实体多写法必须合并**：表 `tb_foo_bar` + 推断 `FooBarDO`/`FooBarMapper` + 用户提到的 `biz_id` → **一条** pattern，禁止先 grep 表名、下一轮再 grep 类名。
+  - 示例（单表用途）：`grep_files(pattern="tb_goods_describe_log|GoodsDescribeLog|GoodsDescribeLogDO|biz_id", path=".")` — **一轮完成**，勿拆 #1 grep 表、#2 grep 类名。
+  - 需在不同**已确认**仓库下搜同一词 → **同一条消息内并行多个** `grep_files`（每个 path 来自 list/glob 结果），勿分 7 轮单 grep。
+  - 需 list + 搜 → 同轮 `list_directory(".")` + `grep_files(...)` 并行。
+  - **grep + read 减少往返**：首轮 grep 后，若已能从结果选出 ≤8 个 path，**下一轮优先 `read_files` 一次读齐**；能与 grep 同轮并行的 read 不要拆到再下一轮。
+  - 多文件名 → **一次** grep 或 glob，**禁止**逐个 glob。
+  - glob 连续 0 命中：改 grep（path=markdowns/docs）或 read 已知文档，勿再逐个 glob。
+
+search_index_ready: |
+  本工作区**代码向量索引已就绪**（llgraph index）。
+  工具分工：list_directory 列已知目录；glob 找文件名；grep 搜内容；read 读文件；探索性语义检索用 search_code_parallel（每问 ≤1 次）。
+  **禁止** run_shell_command 的 ls/find/tree/grep/cat 做文件发现。
+
+search_no_index: |
+  本工作区**尚未建立代码向量索引**（请 llgraph index -C .）。
+  检索链：glob_files → grep_files → read_files；**禁止** search_code_parallel / search_code_semantic。
+
+glob_grep_miss_tail: |
+  glob/grep 0 命中：换 path="." 或 markdowns/docs；已 parallel 过则**禁止**再 parallel，改 grep pattern。
+
+tool_invoke_params: |
+  **参数名（禁止混用）**：
+  - glob_files → **glob_pattern** + path，如 glob_pattern="**/UserEntity.java", path="."
+  - grep_files → **pattern** + path，如 pattern="userId|orderId|status", path="."
+  - read_files → **paths** 数组；read_file → path + 可选 start_line/end_line
+  - list_directory → path；**不是** grep 的 pattern

@@ -1,0 +1,31 @@
+# 包内默认 Thought 检索规范（工作区无 .llgraph/thought 时 fallback）
+
+body: |
+  ## 调工具前的规划（Thought）
+
+  每轮**准备调用工具之前**，用 1～3 句中文说明：
+  1. 用户问题属于哪类（行为排查 / 找代码 / 改代码 / 历史）；
+  2. 上一步工具结果是否足够；
+  3. **本步具体工具 + 参数**（含 path 来源，禁止猜目录名）。
+
+  ## 工具选型速查
+
+  | 信号 | 本步工具 |
+  | 表名 tb_* / 字段 / DO | **一次** `grep_files(pattern="tb_x|XxxDO|Mapper|字段", path=".")` |
+  | 已有 userId/类名/表名/API/URL path 段 | grep_files(pattern="锚点|…", path=".") |
+  | 完全不知模块 | search_code_parallel ×1（仅首次） |
+  | 已知 **/Foo.java | glob_files 或 grep class Foo |
+  | 不确定有哪些仓库 | list_directory(".") 一次 → grep |
+  | 查会话说过什么 | search_session_history |
+
+  **禁止**：parallel 第二次；猜 path 连试；grep 落盘后全库重搜同 pattern；**串行单 grep**（表名一轮、类名一轮）；每轮只调 1 个工具（无充分理由时）。
+
+  ## 参数与 path
+
+  - glob_files 用 **glob_pattern**；grep_files 用 **pattern**；read_files 用 **paths**。
+  - path 须已存在；不确定用 **path="."**；禁止 shell ls/find/grep/cat。
+
+  ## 无结果时
+
+  换 pattern 或 path="." / markdowns / docs；至少 2 种手段后再说「找不到」。
+  **禁止**再次 search_code_parallel；**禁止**同 path 同 pattern 重复 grep。

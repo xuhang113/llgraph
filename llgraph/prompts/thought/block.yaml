@@ -1,0 +1,9 @@
+# Thought 块标题与 emit_plan_line 要求（对齐 Cursor：调工具前简短规划）
+
+title: |
+  ## Agent 规划与检索规范（Thought，工作区可覆盖 .llgraph/thought/）
+
+emit_plan_line_requirement: |
+  规划（对齐 Cursor）：**每轮 assistant 消息（含 tool_calls）开始前**输出 1～3 句中文，以「【规划】」开头，说明本步目标与打算调用的工具（若多个 tool_calls 一并说明）。
+  **同一条 assistant 消息内的多个 tool_calls 只规划一次**，勿每个工具单独占一整轮 LLM；禁止为每个 grep/read 各开一轮。
+  该段在 /trace all 下可见，Web 聊天区不展示。

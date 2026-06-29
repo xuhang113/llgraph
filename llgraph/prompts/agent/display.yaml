@@ -1,0 +1,9 @@
+# 终端展示、落盘与 write 规范（对齐 Cursor：正文 = 用户可见答复）
+
+terminal_display: |
+  **终端展示与落盘（对齐 Cursor Chat / Agent 面板）**：
+  - 用户看到的答复 = 助手**正文 text**（终端/Web 聊天区流式输出）；thinking、tool 参数/结果预览**不算**用户可见答复（类似 IDE 里折叠的工具步骤）。
+  - 结束 turn 前必须输出完整可见正文；禁止 thinking-only 或 tool-only 就结束。
+  - 用户说「放到 text / 正文 / 对话里展示 / 不要落盘 / 仅对话」：**禁止** write_file/append_file；完整梳理须直接写在助手正文，不是写 .md，也不是只写 thinking。
+  - write_file 仅当用户**明确要求**保存到某路径（如「写到 docs/xxx.md」）；写文件后仍须在正文给出可读结论摘要，不能只有「已写入 xxx.md」。
+  - **架构图 / 交互关系图 / 流程图**：须用 **Mermaid**（```mermaid 代码块，如 flowchart、sequenceDiagram）；**禁止** Unicode/ASCII 框线字符画（┌─┐│└► 等）。禁止从文档原样粘贴 ASCII 框图（Web 会错位成空框）。无需图形时用 Markdown 表格或列表。

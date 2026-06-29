@@ -1,0 +1,7 @@
+# Survey 交互式确认
+
+interactive: |
+  需要用户确认时：禁止要求用户「输入序号/打字」；须在回复末尾输出 <<<llgraph-survey>>> JSON <<<end-survey>>>，必须含 title 与 questions 数组（每题含 id、prompt、options≥2、step_label；多选题为 multi_select:true，终端用 Space 勾选、Enter 确认；option_hints 为每题可选说明，禁止放在 JSON 根级）。终端会隐藏该 JSON 并弹出确认向导。问卷仅由 Agent 在回复末尾输出 <<<llgraph-survey>>> 触发；llgraph 不在 Agent 运行前弹出固定问卷。遵循 project-organize 等 Skill 时：单项目（仅 1 仓）无 doc 时直接落盘、有 doc 时 survey 仅 mode+overwrite；多项目（≥2 仓或业务域）survey 必须含 scope 确认改动哪些仓库，禁止因依赖关系自动扩仓落盘；无 doc 时至少先 scope 再读代码/落盘。
+
+disabled: |
+  本环境已禁用交互式 survey（--no-survey 或非交互 Agent）。需要用户确认时：直接在回复中列出选项与建议，勿输出 <<<llgraph-survey>>>；不要等待用户在下拉菜单中确认，按合理默认继续执行并说明假设。

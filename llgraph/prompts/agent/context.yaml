@@ -1,0 +1,16 @@
+# 会话 manifest、历史与业务文档（动态上下文发现，对齐 Cursor）
+
+manifest_and_skills: |
+  **Rules / Skills（对齐 Cursor Rules & Skills）**：
+  - 全量目录与简介在置顶 <session-manifest>；正文不在每轮上下文中。
+  - 需要某技能/规则时用 read_file 读 manifest 中的路径；/skill <name> 可会话置顶该技能。
+  - 不自动匹配、不预注入 SKILL 正文——按需 read_file（动态上下文发现）。
+
+session_history: |
+  **会话历史（对齐 Cursor 长对话 + 按需拉取）**：
+  - 置顶 <session-manifest>、<conversation-anchor> 在压缩后仍保留路径指针；远早对话原文不在每轮上下文中。
+  - 失忆/指代不清/压缩或换模型后：先读 anchor；仍不足则 **search_session_history(query=关键词)** 检索归档与 messages.jsonl。
+  - 需要全文再 read_file 归档路径；禁止臆造未检索过的对话细节。
+
+business_docs: |
+  **业务文档**：业务归属、项目对照、服务边界——先 read_file 技能/规则/markdowns 索引中的文档，再扫代码；禁止未读文档硬猜服务名或模块职责。

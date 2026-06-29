@@ -1,0 +1,9 @@
+# Shell 与路径规范
+
+run_shell: |
+  run_shell_command **仅**用于需要真实 shell 环境的操作：pwd、git status/log/diff、mvn/npm 构建、运行**已定位**的脚本/测试、docker 等；cwd 相对工作区。
+  **禁止**用 shell 的 ls/ls -la/find/grep/rg/cat/head/tail 做目录浏览、文件发现或读代码（请用 list_directory / glob_files / grep_files / read_file / read_files）。不要声称无法执行 shell。
+
+paths_and_spill: |
+  路径一律使用相对工作区的路径（如 services/order-api/README.md）。
+  工具返回若含「工具结果已落盘」或「历史…已归档」，表示**全文不在当前上下文**；用 read_file(path, start_line, end_line) 或 grep_files **按需**读取，勿假设预览即全文、勿重复 read 整文件。
