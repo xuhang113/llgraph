@@ -37,6 +37,26 @@ def _message_text(content: Any) -> str:
     return str(content or "")
 
 
+def format_agent_chat_display_text(text: str) -> str:
+    """
+    Web 聊天区助手正文：剥离 tool markup 与【规划】行。
+
+    @param text 原始助手正文
+    @return 用户可见文本
+    """
+    from llgraph.adapters.inbound.xml_tool_call import strip_inbound_tool_call_markup
+    from llgraph.survey.survey_prompt import strip_survey_for_display
+
+    cleaned = strip_inbound_tool_call_markup(text or "")
+    cleaned = strip_survey_for_display(cleaned)
+    lines = [
+        ln
+        for ln in cleaned.splitlines()
+        if ln.strip() and not ln.strip().startswith("【规划】")
+    ]
+    return "\n".join(lines).strip()
+
+
 def _state_messages(state: Any) -> list[BaseMessage]:
     if isinstance(state, dict):
         raw = state.get("messages") or []
@@ -72,6 +92,9 @@ def prepare_messages_for_llm_dispatch(
         workspace,
         model_id,
     )
+    from llgraph.core.user_message_content import prepare_messages_for_multimodal_dispatch
+
+    cleaned = prepare_messages_for_multimodal_dispatch(cleaned)
     ordered = reorder_pinned_system_messages(cleaned)
     if workspace is not None:
         from llgraph.context.context_compressor import estimate_tokens
@@ -79,6 +102,13 @@ def prepare_messages_for_llm_dispatch(
         from llgraph.context.context_settings import resolve_context_settings
 
         ctx_settings = resolve_context_settings(workspace)
+        from llgraph.context.incremental_context import (
+            dedupe_read_tool_messages_for_dispatch,
+            prune_tool_messages_for_dispatch,
+        )
+
+        ordered = prune_tool_messages_for_dispatch(ordered, workspace, ctx_settings)
+        ordered = dedupe_read_tool_messages_for_dispatch(ordered, ctx_settings)
         ordered = apply_dispatch_window_trim(
             ordered,
             settings=ctx_settings,
@@ -90,6 +120,10 @@ def prepare_messages_for_llm_dispatch(
         workspace=workspace,
         model_id=model_id,
     )
+    from llgraph.context.react_step_reminder import append_react_step_reminder_for_dispatch
+
+    with_reminder = append_react_step_reminder_for_dispatch(normalized)
+
     if workspace is not None:
         from llgraph.context.outbound_redact import (
             redact_messages_for_dispatch,
@@ -97,8 +131,8 @@ def prepare_messages_for_llm_dispatch(
         )
 
         redact_settings = resolve_outbound_redact_settings(workspace)
-        return redact_messages_for_dispatch(normalized, redact_settings)
-    return normalized
+        return redact_messages_for_dispatch(with_reminder, redact_settings)
+    return with_reminder
 
 
 def normalize_messages_for_llm(
@@ -162,7 +196,7 @@ def make_prompt_normalizer(
     workspace: Path | None = None,
 ):
     """
-    供 create_react_agent(prompt=...) 使用的可调用对象。
+    供 build_react_graph(prompt=...) 使用的可调用对象。
 
     @param agent_system_content 系统提示词
     @param workspace 工作区根（按当前 /model 解析出站 profile）

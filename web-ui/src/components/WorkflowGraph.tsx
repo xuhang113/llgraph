@@ -47,6 +47,9 @@ interface Props {
   currentTaskId?: string | null;
   variant?: 'compact' | 'main';
   onTaskSelect?: (taskId: string) => void;
+  onTaskStop?: (taskId: string) => void;
+  onTaskRun?: (taskId: string) => void;
+  planJobRunning?: boolean;
 }
 
 interface DagEdge {
@@ -99,6 +102,9 @@ export default function WorkflowGraph({
   currentTaskId,
   variant = 'compact',
   onTaskSelect,
+  onTaskStop,
+  onTaskRun,
+  planJobRunning = false,
 }: Props) {
   const nodeMap = Object.fromEntries(nodes.map((n) => [n.id, n.status]));
   const mergedTasks = useMemo(() => mergeTaskMeta(tasks, planTasks), [tasks, planTasks]);
@@ -204,6 +210,38 @@ export default function WorkflowGraph({
         {blocked && <span className="wf-blocked-badge">等待依赖</span>}
         {opts?.showDepsText && t.depends_on && t.depends_on.length > 0 && (
           <span className="wf-worker-deps">依赖: {t.depends_on.join(', ')}</span>
+        )}
+        {(onTaskStop || onTaskRun) && (
+          <span className="wf-worker-actions">
+            {t.status === 'running' && onTaskStop && (
+              <button
+                type="button"
+                className="wf-action-btn wf-action-btn--stop"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onTaskStop(t.id);
+                }}
+              >
+                停止
+              </button>
+            )}
+            {onTaskRun &&
+              !planJobRunning &&
+              (t.status === 'pending' || t.status === 'failed' || t.status === 'skipped') && (
+                <button
+                  type="button"
+                  className="wf-action-btn wf-action-btn--run"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onTaskRun(t.id);
+                  }}
+                >
+                  执行
+                </button>
+              )}
+          </span>
         )}
       </>
     );

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from llgraph.plan.plan_registry import discover_plan_sessions
+from llgraph.plan.plan_phase_resolve import resolve_plan_phase
 from llgraph.plan.plan_store import load_plan, load_task_result, pick_richer_plan
 from llgraph.plan.config import resolve_plan_settings
 from llgraph.plan.state import PlanPhase
@@ -106,6 +107,9 @@ def read_json_file(path: Path) -> dict[str, Any] | None:
     return None
 
 
+from llgraph.session.jsonl_read import iter_jsonl_text_lines, open_jsonl_for_read
+
+
 def read_jsonl_lines(path: Path, *, offset: int = 0, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
     """
     分页读取 jsonl。
@@ -120,7 +124,7 @@ def read_jsonl_lines(path: Path, *, offset: int = 0, limit: int = 100) -> tuple[
     rows: list[dict[str, Any]] = []
     total = 0
     try:
-        with path.open(encoding="utf-8") as handle:
+        with open_jsonl_for_read(path) as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
@@ -138,14 +142,63 @@ def read_jsonl_lines(path: Path, *, offset: int = 0, limit: int = 100) -> tuple[
     return rows, total
 
 
-def simplify_message(row: dict[str, Any]) -> dict[str, Any]:
+def _strip_user_injected_context(text: str) -> str:
+    """剥离 user 消息中的 workspace-context 等注入块，保留用户原文。"""
+    import re
+
+    out = text
+    out = re.sub(r"<workspace-context>[\s\S]*?</workspace-context>\s*", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"<session-manifest>[\s\S]*?</session-manifest>\s*", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"<custom-command[\s\S]*?</custom-command>\s*", "", out, flags=re.IGNORECASE)
+    return out.strip()
+
+
+def read_jsonl_lines_recent(path: Path, *, limit: int = 200) -> tuple[list[dict[str, Any]], int]:
+    """
+    读取 jsonl 末尾最近 limit 条（长 ReAct 会话最新消息在文件尾）。
+
+    @param path jsonl 路径
+    @param limit 最大返回行数
+    @return (行列表, 总行数)
+    """
+    if not path.is_file():
+        return [], 0
+    try:
+        lines = list(iter_jsonl_text_lines(path))
+    except OSError:
+        return [], 0
+    total = len(lines)
+    if total == 0:
+        return [], 0
+    tail_lines = lines[max(0, total - limit) :]
+    rows: list[dict[str, Any]] = []
+    for line in tail_lines:
+        try:
+            item = json.loads(line)
+            if isinstance(item, dict):
+                rows.append(item)
+        except json.JSONDecodeError:
+            continue
+    return rows, total
+
+
+def simplify_message(
+    row: dict[str, Any],
+    *,
+    slug: str | None = None,
+    thread_id: str | None = None,
+) -> dict[str, Any]:
     """
     将 LangChain messages_to_dict 行简化为前端友好结构。
 
     @param row jsonl 单行
+    @param slug Web 工作区 slug（附件 URL）
+    @param thread_id 会话 ID（附件 URL）
     @return 简化消息
     """
     from llgraph.context.message_normalize import _message_text
+    from llgraph.core.user_message_content import extract_images_from_human_content
+    from llgraph.session.session_image_store import attachment_api_path
 
     msg_type = str(row.get("type") or row.get("role") or "unknown")
     data = row.get("data") if isinstance(row.get("data"), dict) else row
@@ -155,14 +208,35 @@ def simplify_message(row: dict[str, Any]) -> dict[str, Any]:
         tool_calls = data.get("tool_calls") or data.get("additional_kwargs", {}).get("tool_calls")
     name = data.get("name") if isinstance(data, dict) else None
     display_text = _message_text(content).strip()
+
+    def _attachment_url(image_id: str) -> str:
+        if slug and thread_id:
+            return attachment_api_path(slug, thread_id, image_id)
+        return ""
+
+    images = extract_images_from_human_content(
+        content,
+        attachment_url_for=_attachment_url if slug and thread_id else None,
+    )
+    kind: str | None = None
+    if "human" in msg_type.lower():
+        display_text = _strip_user_injected_context(display_text)
+        from llgraph.core.agent_turn import THINK_CONTINUE_NUDGE
+
+        if display_text.strip() == THINK_CONTINUE_NUDGE.strip():
+            kind = "think_nudge"
+    elif "ai" in msg_type.lower() or "assistant" in msg_type.lower():
+        from llgraph.context.message_normalize import format_agent_chat_display_text
+
+        display_text = format_agent_chat_display_text(display_text)
     has_tool_calls = bool(tool_calls)
     if not display_text and not has_tool_calls and isinstance(data, dict):
         extra = data.get("additional_kwargs") if isinstance(data.get("additional_kwargs"), dict) else {}
         llgraph_meta = extra.get("llgraph") if isinstance(extra.get("llgraph"), dict) else {}
         thinking = llgraph_meta.get("thinking_text")
         if isinstance(thinking, str) and thinking.strip():
-            display_text = thinking.strip()
-    return {
+            display_text = format_agent_chat_display_text(thinking.strip())
+    out: dict[str, Any] = {
         "type": msg_type,
         "content": content,
         "display_text": display_text,
@@ -170,6 +244,11 @@ def simplify_message(row: dict[str, Any]) -> dict[str, Any]:
         "tool_calls": tool_calls,
         "raw": row,
     }
+    if images:
+        out["images"] = images
+    if kind:
+        out["kind"] = kind
+    return out
 
 
 def list_edits(workspace: Path, thread_id: str) -> list[dict[str, Any]]:
@@ -195,6 +274,67 @@ def _snapshot_task_ids(snapshot: dict[str, Any]) -> set[str]:
     return {str(t.get("id")) for t in tasks if isinstance(t, dict) and t.get("id")}
 
 
+def _phase_rank(phase: str) -> int:
+    from llgraph.plan.plan_phase_resolve import _phase_rank as _rank
+
+    return _rank(phase)
+
+
+def _task_statuses(plan: dict[str, Any]) -> list[str]:
+    from llgraph.plan.plan_phase_resolve import task_statuses
+
+    return task_statuses(plan)
+
+
+def _resolve_plan_phase(
+    *,
+    plan_state: dict[str, Any],
+    meta: dict[str, Any],
+    plan: dict[str, Any],
+) -> str:
+    return resolve_plan_phase(plan_state=plan_state, meta=meta, plan=plan)
+
+
+def _snapshot_task_status_stale(snapshot: dict[str, Any], plan: dict[str, Any]) -> bool:
+    """snapshot 内 task status 与 plan.json 不一致。"""
+    snap_tasks = snapshot.get("tasks") if isinstance(snapshot.get("tasks"), list) else []
+    snap_by_id = {
+        str(t.get("id")): str(t.get("status") or "")
+        for t in snap_tasks
+        if isinstance(t, dict) and t.get("id")
+    }
+    for task in plan.get("tasks") or []:
+        if not isinstance(task, dict):
+            continue
+        tid = str(task.get("id") or "")
+        if not tid:
+            continue
+        if snap_by_id.get(tid) != str(task.get("status") or ""):
+            return True
+    return False
+
+
+def _workflow_current_node(plan_state: dict[str, Any], *, phase: str) -> str | None:
+    if phase == PlanPhase.COMPLETED:
+        return None
+    ws = plan_state.get("workflow_snapshot")
+    if isinstance(ws, dict) and ws.get("current_node"):
+        return str(ws.get("current_node"))
+    return None
+
+
+def _snapshot_node_status_stale(snapshot: dict[str, Any], phase: str) -> bool:
+    """completed 但 synthesize 仍 running 的旧 snapshot（汇总完成后未刷新节点态）。"""
+    if phase != PlanPhase.COMPLETED:
+        return False
+    for node in snapshot.get("nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        if node.get("id") == "synthesize" and str(node.get("status") or "") == "running":
+            return True
+    return False
+
+
 def load_plan_detail(workspace: Path, thread_id: str) -> dict[str, Any]:
     """
     加载 Plan 详情（plan_state + plan.json + workflow）。
@@ -208,11 +348,11 @@ def load_plan_detail(workspace: Path, thread_id: str) -> dict[str, Any]:
     plan_state = read_json_file(thread_dir / "plan_state.json") or {}
     meta = load_session_meta(workspace, thread_id)
     plan_id = str(plan_state.get("plan_id") or meta.get("plan_id") or "")
-    phase = str(plan_state.get("phase") or meta.get("phase") or "unknown")
 
     plan_inline = plan_state.get("plan") if isinstance(plan_state.get("plan"), dict) else None
     plan_file = load_plan(workspace, plan_id, plans_dir=settings.plans_dir) if plan_id else None
     plan = pick_richer_plan(plan_file, plan_inline)
+    phase = _resolve_plan_phase(plan_state=plan_state, meta=meta, plan=plan)
 
     snapshot = plan_state.get("workflow_snapshot")
     stale_snapshot = (
@@ -220,13 +360,24 @@ def load_plan_detail(workspace: Path, thread_id: str) -> dict[str, Any]:
         and snapshot
         and _snapshot_task_ids(snapshot) != _plan_task_ids(plan)
     )
-    if not isinstance(snapshot, dict) or not snapshot or stale_snapshot:
+    phase_stale = isinstance(snapshot, dict) and snapshot and str(snapshot.get("phase") or "") != phase
+    node_stale = isinstance(snapshot, dict) and snapshot and _snapshot_node_status_stale(snapshot, phase)
+    task_stale = isinstance(snapshot, dict) and snapshot and _snapshot_task_status_stale(snapshot, plan)
+    if (
+        not isinstance(snapshot, dict)
+        or not snapshot
+        or stale_snapshot
+        or phase_stale
+        or node_stale
+        or task_stale
+    ):
+        ws = plan_state.get("workflow_snapshot") if isinstance(plan_state.get("workflow_snapshot"), dict) else {}
         snapshot = build_workflow_snapshot(
             thread_id=thread_id,
             phase=phase,
             plan=plan,
-            current_node=plan_state.get("current_node"),
-            current_task_id=plan_state.get("current_task_id"),
+            current_node=_workflow_current_node(plan_state, phase=phase),
+            current_task_id=plan_state.get("current_task_id") or ws.get("current_task_id"),
         )
     elif "graph_definition" not in snapshot:
         snapshot = {**snapshot, "graph_definition": GRAPH_DEFINITION}
@@ -377,6 +528,7 @@ def build_session_tree(workspace: Path) -> dict[str, Any]:
             "kind": "agent",
             "thread_id": s.thread_id,
             "title": s.title,
+            "title_full": s.title_full,
             "updated_at": s.updated_at,
             "children": [],
         }
@@ -384,19 +536,16 @@ def build_session_tree(workspace: Path) -> dict[str, Any]:
     ]
     plan_nodes: list[dict[str, Any]] = []
     for p in plans:
-        detail = load_plan_detail(workspace, p.thread_id)
-        tasks = detail.get("tasks") or []
         children = [
             {
                 "kind": "worker",
-                "thread_id": f"{p.thread_id}:worker:{t.get('id')}",
-                "task_id": str(t.get("id") or ""),
-                "title": str(t.get("title") or t.get("id") or ""),
-                "status": str(t.get("status") or "pending"),
+                "thread_id": f"{p.thread_id}:worker:{t.id}",
+                "task_id": t.id,
+                "title": t.title,
+                "status": t.status,
                 "children": [],
             }
-            for t in tasks
-            if isinstance(t, dict)
+            for t in p.task_stubs
         ]
         plan_nodes.append(
             {
@@ -404,6 +553,7 @@ def build_session_tree(workspace: Path) -> dict[str, Any]:
                 "thread_id": p.thread_id,
                 "plan_id": p.plan_id,
                 "title": p.title,
+                "title_full": p.title,
                 "phase": p.phase,
                 "updated_at": p.updated_at,
                 "children": children,

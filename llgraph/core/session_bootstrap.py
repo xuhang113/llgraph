@@ -15,7 +15,6 @@ from llgraph.core.write_failure_tracker import WriteFailureTracker
 from llgraph.display.trace_display import TraceSession
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.session.session_file_store import restore_session_to_agent
-from llgraph.survey.edit_confirm import EditConfirmGate
 
 
 @dataclass
@@ -67,7 +66,6 @@ def build_agent_session_for_thread(
         if allow_write
         else None
     )
-    edit_confirm_gate = EditConfirmGate(workspace) if allow_write else None
     watch_service = bundle.watch_service
 
     def on_file_changed(rel: str) -> None:
@@ -84,7 +82,6 @@ def build_agent_session_for_thread(
         context_spill=context_spill,
         write_failure_tracker=write_failure_tracker,
         web_search_enabled=bundle.web_search_enabled,
-        edit_confirm_gate=edit_confirm_gate,
         context_session=bundle.context_session,
         sandbox_policy=bundle.sandbox_policy,
     )
@@ -105,7 +102,6 @@ def build_agent_session_for_thread(
         on_file_changed=on_file_changed if allow_write else None,
         watch_service=watch_service,
         web_search_enabled=bundle.web_search_enabled,
-        edit_confirm_gate=edit_confirm_gate,
         sandbox_policy=bundle.sandbox_policy,
         sandbox_cli_enabled=bundle.sandbox_cli_enabled,
     )

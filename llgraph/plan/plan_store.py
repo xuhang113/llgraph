@@ -84,6 +84,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def is_placeholder_plan_title(title: str, plan_id: str = "") -> bool:
+    """
+    判断 plan.json 标题是否为占位（非用户/Planner 实质标题）。
+
+    @param title plan title
+    @param plan_id Plan ID
+    @return 是否为占位标题
+    """
+    t = str(title or "").strip()
+    if not t or t == "未命名计划":
+        return True
+    pid = str(plan_id or "").strip()
+    if pid and t == f"Plan {pid}":
+        return True
+    return False
+
+
 def empty_plan(*, plan_id: str, title: str = "", goal: str = "") -> dict[str, Any]:
     """
     创建空 plan 结构。
@@ -96,7 +113,7 @@ def empty_plan(*, plan_id: str, title: str = "", goal: str = "") -> dict[str, An
     return {
         "plan_id": plan_id,
         "version": 1,
-        "title": title or f"Plan {plan_id}",
+        "title": title or (f"Plan {plan_id}" if not goal.strip() else ""),
         "goal": goal,
         "phase": PlanPhase.PLANNING,
         "execution": {

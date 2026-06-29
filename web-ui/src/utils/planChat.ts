@@ -2,6 +2,7 @@ import type { MessageItem, PlanDetail } from '../api/client';
 import type { ChatMessage } from '../components/console/ChatThread';
 import {
   extractMessageContent,
+  formatAgentChatDisplayText,
   isInjectedSystemContent,
   parseApiMessagesToChat,
   stripInjectedContext,
@@ -58,6 +59,24 @@ export function buildPlanChatMessages(
     if (report) {
       msgs.push({ id: 'report', role: 'assistant', text: report });
     }
+  }
+
+  const discussMessages = detail.plan_state?.discuss_messages;
+  if (Array.isArray(discussMessages)) {
+    discussMessages.forEach((row, i) => {
+      if (!row || typeof row !== 'object') {
+        return;
+      }
+      const role = String((row as { role?: string }).role || '');
+      const content = extractMessageContent(String((row as { content?: string }).content || '')).trim();
+      if ((role === 'user' || role === 'assistant') && content) {
+        const text =
+          role === 'assistant' ? formatAgentChatDisplayText(content) : content;
+        if (text.trim()) {
+          msgs.push({ id: `discuss-${i}`, role, text });
+        }
+      }
+    });
   }
 
   return msgs;

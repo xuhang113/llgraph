@@ -874,6 +874,7 @@ dependencies = [
     { name = "langgraph" },
     { name = "prompt-toolkit" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
 ]
 
 [package.optional-dependencies]
@@ -917,6 +918,7 @@ watch = [
 ]
 web = [
     { name = "fastapi" },
+    { name = "python-multipart" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -934,6 +936,8 @@ requires-dist = [
     { name = "pyarrow", marker = "extra == 'all'", specifier = ">=14.0.0" },
     { name = "pyarrow", marker = "extra == 'index'", specifier = ">=14.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "python-multipart", marker = "extra == 'web'", specifier = ">=0.0.9" },
+    { name = "pyyaml", specifier = ">=6.0.0" },
     { name = "rich", marker = "extra == 'terminal'", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.9.0" },
     { name = "sentence-transformers", marker = "extra == 'all'", specifier = ">=3.0.0" },

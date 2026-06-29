@@ -13,23 +13,9 @@ def build_planner_role_block(ctx: PlanRuntimeContext) -> str:
     @param ctx Plan 运行时上下文
     @return 角色追加文本
     """
-    return (
-        "\n\n--- Plan Planner 角色 ---\n"
-        "你是 Plan 模式的规划 Agent（Planner）。职责：只读调研工作区，输出结构化计划。\n"
-        f"工作区: {ctx.workspace}\n"
-        "禁止修改代码或写文件。可用检索/读文件工具了解现状。\n"
-        "最终必须在回复末尾输出一个 JSON 代码块，格式：\n"
-        "```json\n"
-        "{\n"
-        '  "title": "计划标题",\n'
-        '  "tasks": [\n'
-        '    {"id": "w1", "title": "...", "description": "...", '
-        '"scope": {"path_globs": ["."]}, "depends_on": [], "readonly": true}\n'
-        "  ]\n"
-        "}\n"
-        "```\n"
-        "task 应可独立执行、职责单一；depends_on 引用其它 task id。"
-    )
+    from llgraph.loaders.prompt_loader import compose_plan_planner_role
+
+    return compose_plan_planner_role(workspace=ctx.workspace)
 
 
 def build_worker_role_block(
@@ -49,17 +35,17 @@ def build_worker_role_block(
     scope = task.get("scope") if isinstance(task.get("scope"), dict) else {}
     globs = scope.get("path_globs") if isinstance(scope.get("path_globs"), list) else ["."]
     mode = "可写" if allow_write and not task.get("readonly") else "只读"
-    return (
-        "\n\n--- Plan Worker 角色 ---\n"
-        f"你是 Plan Worker，执行单个 task：{task.get('title')}\n"
-        f"描述: {task.get('description')}\n"
-        f"路径范围: {', '.join(str(g) for g in globs)}\n"
-        f"模式: {mode}\n"
-        "完成后在回复末尾输出 JSON 摘要：\n"
-        "```json\n"
-        '{"summary": "一行摘要", "artifacts": [], "status": "done", "files_changed": []}\n'
-        "```\n"
-        "files_changed 列出本 task 修改/创建的工作区相对路径。"
+    from llgraph.loaders.prompt_loader import compose_plan_worker_role, prompt_text
+
+    write_hint = ""
+    if allow_write and not task.get("readonly"):
+        write_hint = prompt_text("plan", "worker", "write_hint_enabled")
+    return compose_plan_worker_role(
+        task_title=str(task.get("title") or ""),
+        task_description=str(task.get("description") or ""),
+        path_globs=", ".join(str(g) for g in globs),
+        mode=mode,
+        write_hint=write_hint,
     )
 
 

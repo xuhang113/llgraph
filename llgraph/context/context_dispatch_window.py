@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Callable
 
-from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
+from llgraph.context.chat_history_repair import ai_message_has_tool_calls
 from llgraph.context.context_message_split import _segment_messages
 from llgraph.context.context_settings import ContextSettings
 from llgraph.context.conversation_anchor import is_conversation_anchor_message
@@ -100,20 +101,30 @@ def trim_messages_for_dispatch_window_auto(
     segments = _segment_messages(business)
     kept_segments: list[list[BaseMessage]] = []
     user_turns = 0
+    tool_rounds_kept = 0
     tokens_used = estimate_tokens(pinned)
 
     for seg in reversed(segments):
         seg_tokens = estimate_tokens(seg)
         has_user = any(isinstance(m, HumanMessage) for m in seg)
+        is_tool_round = any(
+            isinstance(m, AIMessage) and ai_message_has_tool_calls(m) for m in seg
+        )
         if kept_segments:
             if user_turns >= max_turns:
                 break
-            if user_turns >= min_turns and tokens_used + seg_tokens > token_budget:
-                break
+            over_budget = tokens_used + seg_tokens > token_budget
+            if over_budget:
+                if user_turns >= min_turns:
+                    break
+                if tool_rounds_kept >= settings.dispatch_min_tool_rounds:
+                    break
         kept_segments.insert(0, seg)
         tokens_used += seg_tokens
         if has_user:
             user_turns += sum(1 for m in seg if isinstance(m, HumanMessage))
+        if is_tool_round:
+            tool_rounds_kept += 1
 
     if not kept_segments:
         return messages

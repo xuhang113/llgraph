@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, type Capabilities } from '../../api/client';
 import MarkdownView from './MarkdownView';
+import { useAppDialog } from '../AppDialog';
 
 type CatalogKind = 'skills' | 'rules' | 'tools';
 
@@ -29,6 +30,7 @@ interface DetailState {
 }
 
 export default function CatalogPanel({ slug, kind, caps, onClose, onCapsRefresh }: Props) {
+  const { alert } = useAppDialog();
   const [detail, setDetail] = useState<DetailState | null>(null);
   const [loading, setLoading] = useState(false);
   const [toggleBusy, setToggleBusy] = useState<string | null>(null);
@@ -99,7 +101,7 @@ export default function CatalogPanel({ slug, kind, caps, onClose, onCapsRefresh 
       await api.toggleSkill(slug, name, active);
       onCapsRefresh?.();
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : String(e));
+      await alert(e instanceof Error ? e.message : String(e));
     } finally {
       setToggleBusy(null);
     }
@@ -111,7 +113,7 @@ export default function CatalogPanel({ slug, kind, caps, onClose, onCapsRefresh 
       await api.toggleRule(slug, id, enabled);
       onCapsRefresh?.();
     } catch (e) {
-      window.alert(e instanceof Error ? e.message : String(e));
+      await alert(e instanceof Error ? e.message : String(e));
     } finally {
       setToggleBusy(null);
     }

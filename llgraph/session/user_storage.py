@@ -17,6 +17,7 @@ SESSIONS_DIR_NAME = "sessions"
 MESSAGES_FILENAME = "messages.jsonl"
 EDITS_FILENAME = "edits.jsonl"
 SNAPSHOTS_DIR_NAME = "snapshots"
+ATTACHMENTS_DIR_NAME = "attachments"
 LEGACY_WORKSPACE_SESSIONS_DIR = ".llgraph/sessions"
 # agent.json 中 edits.sessions_dir 为此值时，改用用户目录（与 messages.jsonl 同目录）
 LEGACY_SESSIONS_DIR_CONFIG = ".llgraph/sessions"
@@ -47,6 +48,18 @@ def user_context_root() -> Path:
     @return ~/.llgraph/context/
     """
     return USER_LLGRAPH_HOME / CONTEXT_DIR_NAME
+
+
+def is_ephemeral_workspace_path(resolved: str) -> bool:
+    """pytest tmp_path、系统临时目录等不应出现在 Web 最近工作区。"""
+    lowered = resolved.lower()
+    return (
+        "/var/folders/" in lowered
+        or "/private/var/folders/" in lowered
+        or lowered.startswith("/tmp/")
+        or lowered.startswith("/private/tmp/")
+        or "/temporaryitems/" in lowered
+    )
 
 
 def workspace_storage_key(workspace: Path) -> str:
@@ -137,6 +150,17 @@ def session_snapshots_dir(workspace: Path, thread_id: str) -> Path:
     @return .../sessions/<thread_id>/snapshots/
     """
     return session_thread_dir(workspace, thread_id) / SNAPSHOTS_DIR_NAME
+
+
+def session_attachments_dir(workspace: Path, thread_id: str) -> Path:
+    """
+    会话图片附件目录。
+
+    @param workspace 工作区根
+    @param thread_id 线程 ID
+    @return .../sessions/<thread_id>/attachments/
+    """
+    return session_thread_dir(workspace, thread_id) / ATTACHMENTS_DIR_NAME
 
 
 def legacy_workspace_session_dir(workspace: Path, thread_id: str) -> Path:
@@ -236,13 +260,13 @@ def _ensure_workspace_marker(context_dir: Path, workspace: Path) -> None:
     if marker.is_file():
         return
     try:
+        resolved = str(workspace.expanduser().resolve())
+        payload: dict[str, str | bool] = {"path": resolved}
+        if is_ephemeral_workspace_path(resolved):
+            payload["hidden_from_recent"] = True
         context_dir.mkdir(parents=True, exist_ok=True)
         marker.write_text(
-            json.dumps(
-                {"path": str(workspace.expanduser().resolve())},
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except OSError:

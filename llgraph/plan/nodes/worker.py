@@ -9,10 +9,10 @@ from typing import Any
 
 from langgraph.types import interrupt
 
-from llgraph.plan.plan_registry import subgraph_messages_path
 from llgraph.plan.plan_store import load_plan, save_task_result, update_task_status
 from llgraph.plan.plan_sync import mutate_plan_on_disk
 from llgraph.plan.runtime import PlanRuntimeContext
+from llgraph.plan.subgraphs.worker import WORKER_SUBGRAPH_SPEC
 from llgraph.plan.state import PlanPhase, TaskStatus
 from llgraph.plan.workflow_view import build_workflow_snapshot
 from llgraph.display.trace_display import emit_trace_milestone
@@ -27,10 +27,9 @@ def _find_task(plan: dict[str, Any], task_id: str) -> dict[str, Any] | None:
 
 
 def _parse_worker_result(text: str) -> dict[str, Any]:
-    import re
+    from llgraph.plan.nodes.planner import _extract_plan_json_raw
 
-    match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    raw = match.group(1) if match else "{}"
+    raw = _extract_plan_json_raw(text)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -43,16 +42,35 @@ def _parse_worker_result(text: str) -> dict[str, Any]:
     return data
 
 
-def _persist_subgraph_messages(workspace: Path, thread_id: str, task_id: str, messages: list) -> None:
-    path = subgraph_messages_path(workspace, thread_id, task_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for msg in messages or []:
-        role = getattr(msg, "type", None) or getattr(msg, "role", "unknown")
-        content = getattr(msg, "content", "")
-        rows.append(json.dumps({"role": str(role), "content": content}, ensure_ascii=False))
-    if rows:
-        path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+def _build_worker_user_prompt(
+    task: dict[str, Any],
+    task_id: str,
+    task_results: dict[str, Any],
+) -> str:
+    lines = [
+        f"执行 task {task_id}：{task.get('title')}",
+        str(task.get("description") or ""),
+    ]
+    deps = task.get("depends_on") if isinstance(task.get("depends_on"), list) else []
+    if deps:
+        ctx: list[str] = ["", "## 依赖 Work 已完成结果（供本 task 参考，勿重复劳动）"]
+        for dep in deps:
+            dep_id = str(dep).strip()
+            if not dep_id:
+                continue
+            row = task_results.get(dep_id)
+            if not isinstance(row, dict):
+                continue
+            summary = str(row.get("summary") or "").strip()
+            files = row.get("files_changed") if isinstance(row.get("files_changed"), list) else []
+            ctx.append(f"### {dep_id}")
+            if summary:
+                ctx.append(summary)
+            if files:
+                ctx.append("改动文件: " + ", ".join(str(f) for f in files if str(f).strip()))
+        if len(ctx) > 2:
+            lines.extend(ctx)
+    return "\n".join(lines)
 
 
 def run_worker_for_task(
@@ -88,21 +106,60 @@ def run_worker_for_task(
 
     plan = _mark_status(TaskStatus.RUNNING)
 
+    from llgraph.plan.execution_coordinator import is_cancel_requested, is_task_cancel_requested
     from llgraph.plan.subgraphs.worker import run_worker_subagent
 
-    prompt = f"执行 task {task_id}：{task.get('title')}\n{task.get('description')}"
-    text, messages, files_changed = run_worker_subagent(
-        ctx,
-        task,
-        task_id=task_id,
-        allow_write=allow_write,
-        user_prompt=prompt,
-    )
-    _persist_subgraph_messages(ctx.workspace, ctx.thread_id, task_id, messages)
+    if is_task_cancel_requested(ctx.thread_id, task_id) or is_cancel_requested(ctx.thread_id):
+        plan = _mark_status(TaskStatus.SKIPPED, error="用户取消")
+        return {
+            "plan": plan,
+            "task_results": dict(state.get("task_results") or {}),
+            "error": f"Worker {task_id} 已取消",
+        }
+
+    task_results = dict(state.get("task_results") or {})
+    prompt = _build_worker_user_prompt(task, task_id, task_results)
+    sub_thread = f"{ctx.thread_id}{WORKER_SUBGRAPH_SPEC.thread_suffix.format(task_id=task_id)}"
+    worker_ctx = ctx.fork_worker_runtime(task_id=task_id, sub_thread=sub_thread)
+    try:
+        text, messages, files_changed = run_worker_subagent(
+            worker_ctx,
+            task,
+            task_id=task_id,
+            allow_write=allow_write,
+            user_prompt=prompt,
+            plan_state=state,
+        )
+    except Exception as exc:
+        if is_task_cancel_requested(ctx.thread_id, task_id) or is_cancel_requested(ctx.thread_id):
+            plan = _mark_status(TaskStatus.SKIPPED, error="用户取消")
+            err = f"Worker {task_id} 已取消"
+        else:
+            plan = _mark_status(TaskStatus.FAILED, error=str(exc))
+            err = f"Worker {task_id} 失败: {exc}"
+        return {
+            "plan": plan,
+            "task_results": task_results,
+            "error": err,
+        }
+
+    if is_task_cancel_requested(ctx.thread_id, task_id) or is_cancel_requested(ctx.thread_id):
+        plan = _mark_status(TaskStatus.SKIPPED, error="用户取消")
+        return {
+            "plan": plan,
+            "task_results": task_results,
+            "error": f"Worker {task_id} 已取消",
+        }
 
     parsed = _parse_worker_result(text)
     final_status = TaskStatus.DONE if parsed.get("status") != TaskStatus.FAILED else TaskStatus.FAILED
     err_msg = str(parsed.get("error") or "") or None
+    merged_files = files_changed or [
+        str(f) for f in (parsed.get("files_changed") or []) if str(f).strip()
+    ]
+    if allow_write and not merged_files and final_status == TaskStatus.DONE:
+        final_status = TaskStatus.FAILED
+        err_msg = err_msg or "可写任务未产生文件改动（须调用 write_file 落盘）"
     plan = _mark_status(final_status, error=err_msg)
 
     result_doc = {
@@ -111,8 +168,7 @@ def run_worker_for_task(
         "artifacts": parsed.get("artifacts") or [],
         "status": final_status,
         "allow_write": allow_write,
-        "files_changed": files_changed
-        or [str(f) for f in (parsed.get("files_changed") or []) if str(f).strip()],
+        "files_changed": merged_files,
     }
     save_task_result(ctx.workspace, plan_id, task_id, result_doc, plans_dir=plans_dir)
 
@@ -196,6 +252,11 @@ def worker_node(state: dict[str, Any], ctx: PlanRuntimeContext) -> dict[str, Any
     @param ctx 运行时上下文
     @return state 更新
     """
+    from llgraph.plan.execution_coordinator import is_cancel_requested
+
+    if is_cancel_requested(ctx.thread_id) or state.get("cancel_requested"):
+        return {"parallel_batch": []}
+
     batch = state.get("parallel_batch")
     if not isinstance(batch, list) or not batch:
         tid = state.get("current_task_id")
@@ -205,6 +266,12 @@ def worker_node(state: dict[str, Any], ctx: PlanRuntimeContext) -> dict[str, Any
             return {}
 
     task_ids = [str(tid) for tid in batch if str(tid).strip()]
+    if not task_ids:
+        return {"parallel_batch": []}
+
+    from llgraph.plan.execution_coordinator import is_task_cancel_requested
+
+    task_ids = [tid for tid in task_ids if not is_task_cancel_requested(ctx.thread_id, tid)]
     if not task_ids:
         return {"parallel_batch": []}
 

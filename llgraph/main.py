@@ -519,11 +519,6 @@ def main() -> None:
                 if watch_service is not None:
                     watch_service.notify_changed(rel)
 
-            from llgraph.survey.edit_confirm import EditConfirmGate
-
-            edit_confirm_gate = (
-                EditConfirmGate(workspace) if allow_write else None
-            )
             agent = build_agent(
                 with_memory=with_memory,
                 workspace_root=workspace,
@@ -534,7 +529,6 @@ def main() -> None:
                 context_spill=context_spill,
                 write_failure_tracker=write_failure_tracker,
                 web_search_enabled=web_search_enabled,
-                edit_confirm_gate=edit_confirm_gate,
                 context_session=context_session,
                 sandbox_policy=sandbox_policy,
             )
@@ -609,9 +603,6 @@ def main() -> None:
             ):
                 sess.watch_service.notify_changed(rel)
 
-        from llgraph.survey.edit_confirm import EditConfirmGate
-
-        edit_confirm_gate = EditConfirmGate(workspace) if allow_write else None
         agent = build_agent(
             with_memory=True,
             workspace_root=workspace,
@@ -622,7 +613,6 @@ def main() -> None:
             context_spill=context_spill,
             write_failure_tracker=write_failure_tracker,
             web_search_enabled=web_search_enabled,
-            edit_confirm_gate=edit_confirm_gate,
             context_session=context_session,
             sandbox_policy=sandbox_policy,
         )
@@ -642,7 +632,6 @@ def main() -> None:
             on_file_changed=on_file_changed,
             watch_service=watch_service,
             web_search_enabled=web_search_enabled,
-            edit_confirm_gate=edit_confirm_gate,
             sandbox_policy=sandbox_policy,
             sandbox_cli_enabled=cli_sandbox,
         )

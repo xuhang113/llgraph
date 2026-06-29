@@ -15,7 +15,7 @@
         "hint": "cost-effective daily use",
         "context_window": 262144,
         "dispatch": {
-          "expand_parallel_tools": true,
+          "expand_parallel_tools": false,
           "patch_reasoning_content": true
         }
       },
@@ -25,7 +25,7 @@
         "hint": "coding",
         "context_window": 262144,
         "dispatch": {
-          "expand_parallel_tools": true,
+          "expand_parallel_tools": false,
           "patch_reasoning_content": true
         }
       },
@@ -49,6 +49,29 @@
           "patch_reasoning_content": false,
           "strip_assistant_thinking_blocks": true
         }
+      },
+      {
+        "id": "deepseek-v4-flash",
+        "rate": 1.2,
+        "hint": "1M context",
+        "context_window": "1M",
+        "thinking": { "enabled": true, "type": "enabled" },
+        "dispatch": {
+          "expand_parallel_tools": false,
+          "patch_reasoning_content": true,
+          "strip_assistant_thinking_blocks": false
+        }
+      },
+      {
+        "id": "glm-5",
+        "rate": 1.3,
+        "context_window": 202752,
+        "thinking": { "enabled": true, "type": "enabled" },
+        "dispatch": {
+          "expand_parallel_tools": false,
+          "patch_reasoning_content": true,
+          "strip_assistant_thinking_blocks": false
+        }
       }
     ]
   },
@@ -61,7 +84,7 @@
     "api_key_env": "TAVILY_API_KEY",
     "max_results": 3,
     "search_depth": "ultra-fast",
-    "include_answer": false,
+    "include_answer": true,
     "timeout_sec": 25
   },
   "context": {

@@ -10,6 +10,7 @@ dependencies = [
     "langchain-core>=0.3.0",
     "python-dotenv>=1.0.0",
     "prompt-toolkit>=3.0.0",
+    "pyyaml>=6.0.0",
 ]
 
 [project.optional-dependencies]
@@ -39,6 +40,7 @@ search = [
 web = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.9",
 ]
 all = [
     "lancedb>=0.6.0",
@@ -68,7 +70,7 @@ where = ["."]
 include = ["llgraph*"]
 
 [tool.setuptools.package-data]
-llgraph = []
+llgraph = ["prompts/**/*.yaml"]
 
 [tool.ruff.lint]
 select = ["F821", "F823"]

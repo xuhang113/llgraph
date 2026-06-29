@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+from llgraph.code_index.search_format import truncate_search_snippet
 from llgraph.code_index.search_path_filter import is_junk_search_path
 from llgraph.core.workspace import WorkspaceContext
 
@@ -55,7 +56,7 @@ def collect_ripgrep_hits(
         if is_junk_search_path(rel):
             continue
         doc_id = f"{rel}:{line_no}"
-        snippet = snippet_body.strip()[:160]
+        snippet = truncate_search_snippet(snippet_body.strip())
         out.append((doc_id, snippet))
     return out
 

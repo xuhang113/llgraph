@@ -1,8 +1,14 @@
 import { useMemo, useState } from 'react';
-import type { SurveySpec } from '../../api/client';
+import type { PlanConfirmHistoryEntry, SurveySpec } from '../../api/client';
 
 function isOtherOption(opt: string): boolean {
   return /其他|手动输入|其它/.test(opt);
+}
+
+function parseSurveyOptionLabel(opt: string): { label: string; recommended: boolean } {
+  const recommended = /\(推荐\)/.test(opt);
+  const label = opt.replace(/\s*\(推荐\)\s*/g, '').trim();
+  return { label, recommended };
 }
 
 interface SurveyProps {
@@ -84,9 +90,6 @@ function SurveyMultiSelectPanel({
           value={query}
           onChange={(e) => setQuery(e.target.value)}
         />
-        <span className="survey-multi-count">
-          已选 <strong>{selected.size}</strong> / {options.length}
-        </span>
       </div>
       <div className="survey-multi-actions">
         <button type="button" className="survey-multi-action" onClick={selectAll}>
@@ -105,6 +108,9 @@ function SurveyMultiSelectPanel({
         >
           清空
         </button>
+        <span className="survey-multi-count">
+          已选 <strong>{selected.size}</strong> / {options.length}
+        </span>
       </div>
       <div className="survey-multi-list" role="listbox" aria-multiselectable>
         {filtered.length === 0 ? (
@@ -113,19 +119,26 @@ function SurveyMultiSelectPanel({
           filtered.map(({ opt, i }) => {
             const checked = selected.has(opt);
             const hint = optionHints?.[i];
+            const { label, recommended } = parseSurveyOptionLabel(opt);
             return (
               <label
                 key={opt}
                 className={`survey-multi-item${checked ? ' is-checked' : ''}`}
-                title={hint ? `${opt} — ${hint}` : opt}
+                title={hint ? `${label} — ${hint}` : label}
               >
                 <input
                   type="checkbox"
+                  className="survey-native-input"
                   checked={checked}
                   onChange={(e) => toggle(opt, e.target.checked)}
                 />
-                <span className="survey-multi-item-main">{opt}</span>
-                {hint && <span className="survey-multi-item-hint">{hint}</span>}
+                <span className="survey-multi-item-content">
+                  <span className="survey-multi-item-main">
+                    {label}
+                    {recommended && <span className="survey-option-badge">推荐</span>}
+                  </span>
+                  {hint && <span className="survey-multi-item-hint">{hint}</span>}
+                </span>
               </label>
             );
           })
@@ -226,20 +239,27 @@ export default function SurveyDialog({ survey, onSubmit, onCancel }: SurveyProps
   }
 
   return (
-    <div className="modal-overlay survey-overlay">
+    <div
+      className="modal-overlay survey-overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) {
+          onCancel();
+        }
+      }}
+    >
       <div
-        className={`modal survey-modal survey-wizard${q.multi_select ? ' survey-wizard--multi' : ''}`}
+        className={`survey-modal survey-wizard${q.multi_select ? ' survey-wizard--multi' : ''}`}
         role="dialog"
+        aria-labelledby="survey-wizard-title"
       >
         <header className="survey-wizard-header">
-          <h2>{survey.title}</h2>
-          <p className="survey-wizard-progress">{questionLabel(q, step, total)}</p>
+          <span className="survey-wizard-badge">{questionLabel(q, step, total)}</span>
+          <h2 id="survey-wizard-title">{survey.title}</h2>
+          <p className="survey-wizard-prompt">{q.prompt}</p>
         </header>
 
         <div className="survey-wizard-body">
           <div className="survey-q">
-            <label className="survey-wizard-prompt">{q.prompt}</label>
-
             {q.multi_select ? (
               <SurveyMultiSelectPanel
                 questionId={q.id}
@@ -261,20 +281,27 @@ export default function SurveyDialog({ survey, onSubmit, onCancel }: SurveyProps
               }}
             />
           ) : (
-            <div className="survey-options">
+            <div className="survey-options" role="radiogroup" aria-label={q.prompt}>
               {q.options.map((opt, i) => {
                 const hint = q.option_hints?.[i];
                 const selected = answers[q.id] === opt;
+                const { label, recommended } = parseSurveyOptionLabel(opt);
                 return (
                   <label key={opt} className={`survey-option-row${selected ? ' is-selected' : ''}`}>
                     <input
                       type="radio"
+                      className="survey-native-input"
                       name={q.id}
                       checked={selected}
                       onChange={() => setAnswers((prev) => ({ ...prev, [q.id]: opt }))}
                     />
-                    <span className="survey-option-text">{opt}</span>
-                    {hint && <span className="survey-option-hint">{hint}</span>}
+                    <span className="survey-option-content">
+                      <span className="survey-option-text">
+                        {label}
+                        {recommended && <span className="survey-option-badge">推荐</span>}
+                      </span>
+                      {hint && <span className="survey-option-hint">{hint}</span>}
+                    </span>
                   </label>
                 );
               })}
@@ -292,7 +319,7 @@ export default function SurveyDialog({ survey, onSubmit, onCancel }: SurveyProps
           )}
           </div>
 
-          {isLast && (
+          {isLast && total > 1 && (
             <div className="survey-summary">
               <p className="survey-summary-title">确认你的选择</p>
               <ul>
@@ -309,24 +336,24 @@ export default function SurveyDialog({ survey, onSubmit, onCancel }: SurveyProps
           )}
         </div>
 
-        <div className="modal-actions survey-wizard-actions">
-          <button type="button" onClick={onCancel}>
+        <footer className="survey-wizard-actions">
+          <button type="button" className="survey-btn survey-btn-ghost" onClick={onCancel}>
             取消
           </button>
           {step > 0 && (
-            <button type="button" onClick={() => setStep((s) => s - 1)}>
+            <button type="button" className="survey-btn survey-btn-ghost" onClick={() => setStep((s) => s - 1)}>
               上一步
             </button>
           )}
           <button
             type="button"
-            className="primary"
+            className="survey-btn survey-btn-primary"
             disabled={!canNext}
             onClick={commitAndNext}
           >
             {isLast ? '提交确认' : '下一步'}
           </button>
-        </div>
+        </footer>
       </div>
     </div>
   );
@@ -345,6 +372,7 @@ export function PlanConfirmDialog({ payload, onConfirm, onCancel }: PlanConfirmP
   const [reviseNote, setReviseNote] = useState('');
   const tasks = (payload.tasks as Array<{ id: string; title: string }>) || [];
   const title = String(payload.title || '未命名计划');
+  const planError = payload.error != null ? String(payload.error) : '';
 
   const finish = () => {
     if (action === 'cancel') {
@@ -376,6 +404,14 @@ export function PlanConfirmDialog({ payload, onConfirm, onCancel }: PlanConfirmP
                 {title}
               </h2>
               <p className="plan-confirm-meta">{tasks.length} 个 Work 任务</p>
+              {planError && (
+                <p className="plan-confirm-error" role="alert">
+                  {planError}
+                </p>
+              )}
+              <p className="plan-confirm-meta plan-confirm-synth-hint">
+                最终报告由流程图下方「汇总」节点自动生成，无需单独 Work 任务。
+              </p>
             </header>
             <div className="plan-confirm-body">
               <ul className="plan-confirm-tasks">
@@ -400,11 +436,14 @@ export function PlanConfirmDialog({ payload, onConfirm, onCancel }: PlanConfirmP
                   >
                     <input
                       type="radio"
+                      className="survey-native-input"
                       name="plan-action"
                       checked={action === val}
                       onChange={() => setAction(val)}
                     />
-                    <span className="survey-option-text">{label}</span>
+                    <span className="survey-option-content">
+                      <span className="survey-option-text">{label}</span>
+                    </span>
                   </label>
                 ))}
               </div>
@@ -436,6 +475,9 @@ export function PlanConfirmDialog({ payload, onConfirm, onCancel }: PlanConfirmP
                     finish();
                     return;
                   }
+                  if (action === 'revise' && !reviseNote.trim()) {
+                    return;
+                  }
                   setStep(1);
                 }}
               >
@@ -460,11 +502,14 @@ export function PlanConfirmDialog({ payload, onConfirm, onCancel }: PlanConfirmP
                     >
                       <input
                         type="radio"
+                        className="survey-native-input"
                         name="plan-write"
                         checked={allowWrite === yes}
                         onChange={() => setAllowWrite(yes)}
                       />
-                      <span className="survey-option-text">{opt}</span>
+                      <span className="survey-option-content">
+                        <span className="survey-option-text">{opt}</span>
+                      </span>
                     </label>
                   );
                 })}
@@ -484,6 +529,131 @@ export function PlanConfirmDialog({ payload, onConfirm, onCancel }: PlanConfirmP
             </footer>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+function confirmActionLabel(action: string): string {
+  if (action === 'approve') {
+    return '确认并开始执行';
+  }
+  if (action === 'revise') {
+    return '修改计划';
+  }
+  if (action === 'cancel') {
+    return '取消';
+  }
+  return action;
+}
+
+/** 确认问卷占位条上的简短摘要。 */
+export function formatPlanConfirmSummary(entry: PlanConfirmHistoryEntry): string {
+  const n = entry.task_count ?? entry.tasks?.length ?? 0;
+  if (entry.action === 'revise') {
+    const note = (entry.revise_note || '').trim();
+    const brief = note.length > 36 ? `${note.slice(0, 36)}…` : note;
+    return brief ? `已提交修订 · ${brief}` : `已提交修订 · v${entry.plan_version ?? ''} · ${n} 任务`;
+  }
+  if (entry.action === 'cancel') {
+    return '已取消计划';
+  }
+  const write = entry.allow_worker_write ? '可写' : '只读';
+  return `已确认 · ${n} 任务 · ${write}`;
+}
+
+interface PlanConfirmSummaryProps {
+  entry: PlanConfirmHistoryEntry;
+  onClick: () => void;
+}
+
+/** Plan 确认问卷占位：点击回看完整内容。 */
+export function PlanConfirmSummaryChip({ entry, onClick }: PlanConfirmSummaryProps) {
+  return (
+    <button type="button" className="plan-confirm-summary-chip" onClick={onClick}>
+      <span className="plan-confirm-summary-icon" aria-hidden>
+        ✓
+      </span>
+      <span className="plan-confirm-summary-text">{formatPlanConfirmSummary(entry)}</span>
+      <span className="plan-confirm-summary-hint">查看确认详情</span>
+    </button>
+  );
+}
+
+interface PlanConfirmReviewProps {
+  entry: PlanConfirmHistoryEntry;
+  onClose: () => void;
+}
+
+/** 只读回看 Plan 确认/修订问卷。 */
+export function PlanConfirmReviewDialog({ entry, onClose }: PlanConfirmReviewProps) {
+  const tasks = entry.tasks || [];
+  const title = entry.title || '计划确认';
+  const at = entry.at
+    ? new Date(entry.at).toLocaleString('zh-CN', { hour12: false })
+    : '';
+
+  return (
+    <div
+      className="modal-overlay plan-confirm-overlay"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <div className="plan-confirm-modal plan-confirm-review" role="dialog" aria-labelledby="plan-review-title">
+        <header className="plan-confirm-header">
+          <span className="plan-confirm-badge">确认记录 · 只读</span>
+          <h2 id="plan-review-title" className="plan-confirm-title">
+            {title}
+          </h2>
+          {at && <p className="plan-confirm-meta">{at}</p>}
+        </header>
+        <div className="plan-confirm-body">
+          <dl className="plan-confirm-review-fields">
+            <div>
+              <dt>操作</dt>
+              <dd>{confirmActionLabel(entry.action)}</dd>
+            </div>
+            {entry.action === 'approve' && (
+              <div>
+                <dt>Worker 写权限</dt>
+                <dd>{entry.allow_worker_write ? '是（受 task scope 限制）' : '否（只读）'}</dd>
+              </div>
+            )}
+            {entry.action === 'revise' && entry.revise_note && (
+              <div>
+                <dt>修订说明</dt>
+                <dd className="plan-confirm-review-note">{entry.revise_note}</dd>
+              </div>
+            )}
+            {entry.plan_version != null && (
+              <div>
+                <dt>计划版本</dt>
+                <dd>v{entry.plan_version}</dd>
+              </div>
+            )}
+          </dl>
+          {tasks.length > 0 && (
+            <>
+              <p className="plan-confirm-meta">{tasks.length} 个 Work 任务</p>
+              <ul className="plan-confirm-tasks">
+                {tasks.map((t) => (
+                  <li key={t.id} className="plan-confirm-task">
+                    <span className="plan-confirm-task-id">{t.id}</span>
+                    <span className="plan-confirm-task-title">{t.title}</span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+        </div>
+        <footer className="plan-confirm-footer">
+          <button type="button" className="plan-confirm-btn plan-confirm-btn-primary" onClick={onClose}>
+            关闭
+          </button>
+        </footer>
       </div>
     </div>
   );

@@ -74,7 +74,7 @@ def resolve_web_search_settings(workspace: Path | None = None) -> WebSearchSetti
     if depth not in VALID_SEARCH_DEPTHS:
         depth = "ultra-fast"
 
-    include_answer = _parse_bool(raw.get("include_answer"), False)
+    include_answer = _parse_bool(raw.get("include_answer"), True)
 
     timeout_sec = raw.get("timeout_sec", 25)
     try:

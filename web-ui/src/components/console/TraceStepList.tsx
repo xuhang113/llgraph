@@ -48,7 +48,7 @@ export default function TraceStepList({
             <summary className="cursor-trace-step-summary">
               <span className="cursor-trace-step-marker">{marker}</span>
               <span className="cursor-trace-step-title">
-                #{step.step_id} {step.title}
+                #{index + 1} {step.title}
               </span>
               <span className="cursor-trace-step-meta">
                 ({formatTraceDuration(step.elapsed)})

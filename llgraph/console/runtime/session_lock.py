@@ -63,3 +63,40 @@ class SessionLockRegistry:
 
 
 LOCKS = SessionLockRegistry()
+
+
+def release_stale_web_lock(thread_id: str) -> bool:
+    """
+    后台 job 已结束但锁未释放时清理（避免停止 Plan 后仍无法删除）。
+
+    @param thread_id 会话 ID
+    @return 是否释放了 stale 锁
+    """
+    from llgraph.plan.execution_coordinator import is_running
+
+    if is_running(thread_id):
+        return False
+    info = LOCKS.get(thread_id)
+    if info is None or info.owner != "web":
+        return False
+    LOCKS.release(thread_id, owner="web")
+    return True
+
+
+def delete_lock_block_reason(thread_id: str) -> str | None:
+    """
+    删除前检查 session 锁；job 未跑时可清理 stale web 锁。
+
+    @param thread_id 会话 ID
+    @return 阻塞原因；None 表示可删
+    """
+    from llgraph.plan.execution_coordinator import is_running
+
+    if is_running(thread_id):
+        return "Plan 仍在执行中，请先取消并等待当前 Work 结束后再删除"
+    info = LOCKS.get(thread_id)
+    if info is None:
+        return None
+    if info.owner == "web" and release_stale_web_lock(thread_id):
+        return None
+    return "会话正在使用中，请稍后再试"

@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from llgraph.commands.meta_commands import handle_meta_command, is_registered_meta_command
+from llgraph.commands.meta_commands import (
+    handle_meta_command,
+    is_registered_meta_command,
+    resolve_meta_display_mode,
+)
+from llgraph.code_index.paths import DEFAULT_SEARCH_TOP_K
 from llgraph.core.session_bootstrap import AgentRuntimeBundle, build_agent_session_for_thread
 from llgraph.terminal.output import capture_terminal_output, format_captured_output
 from llgraph.console.discovery import (
@@ -33,10 +39,19 @@ from llgraph.console.discovery import (
 )
 from llgraph.session.session_meta import load_session_meta
 from llgraph.session.user_storage import session_messages_path, session_thread_dir
-from llgraph.console.runtime.agent_service import AgentChatRequest, create_agent_session, start_agent_chat_async
+from llgraph.console.runtime.agent_service import (
+    AgentChatRequest,
+    abort_agent_chat,
+    create_agent_session,
+    is_agent_chat_running,
+    start_agent_chat_async,
+)
 from llgraph.console.runtime.capabilities import load_capabilities
 from llgraph.console.runtime.event_hub import HUB
 from llgraph.console.runtime.plan_service import (
+    abort_plan,
+    cancel_plan,
+    cancel_plan_task,
     check_plan_task_runnable,
     confirm_plan,
     continue_plan,
@@ -50,7 +65,20 @@ from llgraph.console.runtime.session_lock import LOCKS
 from llgraph.console.runtime.sse_utils import format_sse, merge_sse_streams
 from llgraph.console.runtime.workspace_runtime import RUNTIME_MANAGER
 
-app = FastAPI(title="llgraph-internal-ui", version="0.3.0", docs_url=None, redoc_url=None)
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    yield
+    HUB.close_all()
+
+
+app = FastAPI(
+    title="llgraph-internal-ui",
+    version="0.3.0",
+    docs_url=None,
+    redoc_url=None,
+    lifespan=_app_lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,9 +110,9 @@ class CreateSessionBody(BaseModel):
 
 
 class ChatBody(BaseModel):
-    """发送消息。"""
+    """发送消息（Plan 等 JSON 接口）。"""
 
-    message: str
+    message: str = ""
     allow_write: bool = False
 
 
@@ -179,6 +207,13 @@ class SandboxBody(BaseModel):
     allow_write: bool = False
 
 
+class WriteModeBody(BaseModel):
+    """会话文件写入模式（只读 / 允许写）。"""
+
+    enabled: bool
+    thread_id: str = ""
+
+
 class CompressBody(BaseModel):
     """压缩上下文。"""
 
@@ -208,7 +243,7 @@ class CodeSearchBody(BaseModel):
     """代码搜索。"""
 
     query: str
-    top_k: int = 15
+    top_k: int = DEFAULT_SEARCH_TOP_K
     mode: str = "parallel"
     path_prefix: str = "."
 
@@ -325,6 +360,8 @@ def register_workspace(body: RegisterWorkspaceBody) -> dict[str, Any]:
     """注册/打开工作区路径。"""
     try:
         info = register_workspace_path(body.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     from dataclasses import asdict
@@ -569,6 +606,7 @@ def run_meta_command(slug: str, body: MetaCommandBody) -> dict[str, Any]:
         "registered": True,
         "output": output,
         "trace_mode": rt.trace_session.mode.value,
+        "display_mode": resolve_meta_display_mode(command, workspace),
     }
 
 
@@ -624,6 +662,43 @@ def set_sandbox(slug: str, body: SandboxBody) -> dict[str, Any]:
             _, message = set_session_sandbox_mode(agent_session, enabled=body.enabled)
 
     return {"sandbox": sandbox, "message": message}
+
+
+@app.post("/api/workspaces/{slug}/write-mode")
+def set_write_mode(slug: str, body: WriteModeBody) -> dict[str, Any]:
+    """切换 Agent 会话只读/可写（同步 manifest 与工具集；落盘 meta.json）。"""
+    from llgraph.session.session_meta import save_session_meta
+    from llgraph.session.session_write_mode import set_session_write_mode
+
+    workspace = _ws(slug)
+    message = "已启用文件写入。" if body.enabled else "已切换为只读模式。"
+    if not body.thread_id.strip():
+        return {"enabled": body.enabled, "message": message}
+
+    thread_id = body.thread_id.strip()
+    agent_session = _meta_agent_session(
+        workspace,
+        thread_id,
+        allow_write=body.enabled,
+    )
+    if agent_session is None:
+        return {"enabled": body.enabled, "message": message}
+
+    rt = RUNTIME_MANAGER.get(workspace, allow_write=body.enabled)
+    if set_session_write_mode(
+        agent_session,
+        enabled=body.enabled,
+        context_session=rt.context_session,
+    ):
+        if body.enabled:
+            message = "已启用文件写入（write_file / search_replace 等已注册，会话历史已保留）。"
+        else:
+            message = "已切换为只读模式（禁止 Agent 写文件）。"
+    else:
+        message = "当前已是目标写入模式。" if body.enabled else "当前已是只读模式。"
+
+    save_session_meta(workspace, thread_id, {"allow_write": body.enabled})
+    return {"enabled": body.enabled, "message": message}
 
 
 @app.get("/api/workspaces/{slug}/context")
@@ -1010,15 +1085,36 @@ def get_session(slug: str, thread_id: str) -> dict:
     meta = load_session_meta(workspace, thread_id)
     _, total = read_jsonl_lines(session_messages_path(workspace, thread_id), offset=0, limit=0)
     lock = LOCKS.get(thread_id)
+    if lock is not None and lock.owner == "web":
+        from llgraph.console.runtime.agent_service import is_agent_chat_running
+
+        if not is_agent_chat_running(thread_id):
+            LOCKS.release(thread_id, owner="web")
+            lock = None
     from llgraph.session.session_meta import resolve_session_display_title
+    from llgraph.session.session_run_log import read_session_last_run
 
     return {
         "thread_id": thread_id,
         "meta": meta,
         "title": resolve_session_display_title(workspace, thread_id),
         "message_total": total,
+        "allow_write": bool(meta.get("allow_write", False)),
+        "running": lock is not None and lock.owner == "web",
         "lock": {"owner": lock.owner, "since": lock.since} if lock else None,
+        "last_run": read_session_last_run(workspace, thread_id),
     }
+
+
+@app.post("/api/workspaces/{slug}/sessions/{thread_id}/touch")
+def touch_session(slug: str, thread_id: str) -> dict[str, Any]:
+    """显式刷新会话活动时间（侧栏排序）；仅在有实际活动时调用，选中会话不应 touch。"""
+    from llgraph.session.session_meta import load_session_meta, touch_session_activity
+
+    workspace = _ws(slug)
+    touch_session_activity(workspace, thread_id)
+    meta = load_session_meta(workspace, thread_id)
+    return {"thread_id": thread_id, "updated_at": meta.get("updated_at")}
 
 
 @app.patch("/api/workspaces/{slug}/sessions/{thread_id}/title")
@@ -1042,32 +1138,99 @@ def get_session_messages(
     thread_id: str,
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),
+    tail: bool = Query(False, description="为 true 时返回文件末尾最近 limit 条"),
 ) -> dict:
-    """分页 messages。"""
+    """分页 messages；Web 加载历史建议 tail=true 以包含长 ReAct 轮最新正文。"""
     msg_path = session_messages_path(_ws(slug), thread_id)
-    rows, total = read_jsonl_lines(msg_path, offset=offset, limit=limit)
+    if tail:
+        from llgraph.console.discovery import read_jsonl_lines_recent
+
+        rows, total = read_jsonl_lines_recent(msg_path, limit=limit)
+        effective_offset = max(0, total - len(rows))
+    else:
+        rows, total = read_jsonl_lines(msg_path, offset=offset, limit=limit)
+        effective_offset = offset
     return {
-        "messages": [simplify_message(r) for r in rows],
+        "messages": [
+            simplify_message(r, slug=slug, thread_id=thread_id) for r in rows
+        ],
         "total": total,
-        "offset": offset,
+        "offset": effective_offset,
         "limit": limit,
+        "tail": tail,
     }
+
+
+@app.get("/api/workspaces/{slug}/sessions/{thread_id}/attachments/{image_id}")
+def get_session_attachment(slug: str, thread_id: str, image_id: str) -> FileResponse:
+    """会话图片附件（messages.jsonl 中 image_ref 预览）。"""
+    from llgraph.session.session_image_store import resolve_attachment_file
+
+    workspace = _ws(slug)
+    path = resolve_attachment_file(workspace, thread_id, image_id)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="附件不存在")
+    media = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media)
+
+
+@app.get("/api/workspaces/{slug}/sessions/{thread_id}/last-run")
+def get_session_last_run(slug: str, thread_id: str) -> dict[str, Any]:
+    """会话最近一次 Agent 轮次运行结果（终止原因、trace 摘要；供 Log 排查）。"""
+    from llgraph.session.session_run_log import read_session_last_run
+
+    data = read_session_last_run(_ws(slug), thread_id)
+    if data is None:
+        return {"thread_id": thread_id, "last_run": None}
+    return {"thread_id": thread_id, "last_run": data}
 
 
 @app.get("/api/workspaces/{slug}/sessions/{thread_id}/last-trace")
 def get_session_last_trace(slug: str, thread_id: str) -> dict:
-    """Web 右侧 Trace 面板：最后一轮逐步日志。"""
-    from llgraph.session.web_trace_store import load_last_web_trace
+    """Web Trace 面板：按轮次 + 合并视图（兼容）。"""
+    from llgraph.session.web_trace_store import load_last_web_trace, load_web_trace_turns
 
-    data = load_last_web_trace(_ws(slug), thread_id)
-    if not data:
-        return {"log_lines": [], "steps": []}
-    log_lines = data.get("log_lines")
-    steps = data.get("steps")
+    ws = _ws(slug)
+    turns = load_web_trace_turns(ws, thread_id)
+    data = load_last_web_trace(ws, thread_id)
+    if not turns and not data:
+        return {"log_lines": [], "steps": [], "turns": [], "live_ts": ""}
+    log_lines = data.get("log_lines") if data and isinstance(data.get("log_lines"), list) else []
+    steps = data.get("steps") if data and isinstance(data.get("steps"), list) else []
     return {
-        "log_lines": log_lines if isinstance(log_lines, list) else [],
-        "steps": steps if isinstance(steps, list) else [],
+        "log_lines": log_lines,
+        "steps": steps,
+        "turns": turns,
+        "live_ts": str(data.get("live_ts") or "") if data else "",
     }
+
+
+@app.get("/api/workspaces/{slug}/sessions/{thread_id}/events")
+async def session_events_subscribe(slug: str, thread_id: str, request: Request) -> StreamingResponse:
+    """订阅 Agent / Worker 子会话 trace 事件（与 Plan 主 channel 隔离）。"""
+    _ws(slug)
+    channel = f"session:{thread_id}"
+    queue = HUB.subscribe(channel)
+
+    async def gen():
+        try:
+            yield format_sse({"type": "subscribed", "channel": channel, "thread_id": thread_id})
+            async for chunk in merge_sse_streams(
+                queue,
+                timeout_sec=86400,
+                is_disconnected=request.is_disconnected,
+            ):
+                yield chunk
+        finally:
+            HUB.unsubscribe(channel, queue)
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/api/workspaces/{slug}/sessions/{thread_id}/edits")
@@ -1162,7 +1325,7 @@ def format_survey_answers(body: SurveyFormatBody) -> dict[str, str]:
 
 @app.post("/api/workspaces/{slug}/survey/resolve")
 def resolve_survey_from_text(body: SurveyResolveBody) -> dict[str, Any]:
-    """从助手回复解析 survey（JSON 块或 Markdown 编号列表）。"""
+    """从助手回复解析 survey（仅 <<<llgraph-survey>>> JSON 块）。"""
     from llgraph.console.runtime.agent_service import _survey_spec_to_dict
     from llgraph.survey.survey_prompt import resolve_survey_from_assistant
 
@@ -1195,11 +1358,13 @@ def create_session(slug: str, body: CreateSessionBody) -> dict[str, str]:
 @app.delete("/api/workspaces/{slug}/sessions/{thread_id}")
 def delete_session_endpoint(slug: str, thread_id: str) -> dict[str, Any]:
     """删除 Agent 或 Plan 会话（Plan 含 Worker 级联，委托 llgraph）。"""
+    from llgraph.console.runtime.session_lock import delete_lock_block_reason
     from llgraph.console.session_service import delete_session_for_web
 
     workspace = _ws(slug)
-    if LOCKS.get(thread_id) is not None:
-        raise HTTPException(status_code=409, detail="会话正在使用中，请稍后再试")
+    block = delete_lock_block_reason(thread_id)
+    if block:
+        raise HTTPException(status_code=409, detail=block)
     result = delete_session_for_web(str(workspace), thread_id)
     if not result.get("ok"):
         status = 409 if result.get("error") and "正在执行" in str(result.get("error")) else 400
@@ -1216,7 +1381,12 @@ def batch_delete_sessions_endpoint(slug: str, body: BatchDeleteSessionsBody) -> 
     ids = [tid.strip() for tid in body.thread_ids if tid and tid.strip()]
     if not ids:
         raise HTTPException(status_code=400, detail="thread_ids 不能为空")
-    locked = [tid for tid in ids if LOCKS.get(tid) is not None]
+    from llgraph.console.runtime.session_lock import delete_lock_block_reason
+
+    locked: list[str] = []
+    for tid in ids:
+        if delete_lock_block_reason(tid):
+            locked.append(tid)
     if locked:
         raise HTTPException(
             status_code=409,
@@ -1229,30 +1399,73 @@ def batch_delete_sessions_endpoint(slug: str, body: BatchDeleteSessionsBody) -> 
 
 
 @app.post("/api/workspaces/{slug}/sessions/{thread_id}/chat")
-async def agent_chat_stream(slug: str, thread_id: str, body: ChatBody) -> StreamingResponse:
-    """Agent 对话 SSE 流。"""
-    workspace = _ws(slug)
-    loop = asyncio.get_event_loop()
-    channel = f"agent:{thread_id}"
-    queue = HUB.subscribe(channel)
+async def agent_chat(
+    slug: str,
+    thread_id: str,
+    message: Annotated[str, Form()] = "",
+    allow_write: Annotated[str, Form()] = "false",
+    images: Annotated[list[UploadFile] | None, File()] = None,
+) -> dict[str, Any]:
+    """启动 Agent 一轮对话（multipart 上传图片）；事件经 Session 长连接推送。"""
+    try:
+        workspace = _ws(slug)
+        loop = asyncio.get_event_loop()
+        session_channel = f"session:{thread_id}"
+        for _ in range(60):
+            if HUB.has_subscribers(session_channel):
+                break
+            await asyncio.sleep(0.05)
 
-    req = AgentChatRequest(
-        workspace=workspace,
-        thread_id=thread_id,
-        message=body.message,
-        allow_write=body.allow_write,
-        channel=channel,
-    )
-    start_agent_chat_async(req, loop, queue)
+        if is_agent_chat_running(thread_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Agent 对话进行中，请等待结束或先停止",
+            )
 
-    async def gen():
+        from llgraph.core.user_message_content import normalize_uploaded_images
+
+        upload_items: list[tuple[str, bytes]] = []
+        for upload in images or []:
+            raw = await upload.read()
+            if not raw:
+                continue
+            media_type = upload.content_type or "application/octet-stream"
+            upload_items.append((media_type, raw))
+
         try:
-            async for chunk in merge_sse_streams(queue):
-                yield chunk
-        finally:
-            HUB.unsubscribe(channel, queue)
+            parsed_images = normalize_uploaded_images(upload_items)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+        text = message.strip()
+        if not text and not parsed_images:
+            raise HTTPException(status_code=400, detail="消息与图片不能同时为空")
+
+        write_flag = str(allow_write).strip().lower() in ("true", "1", "yes", "on")
+
+        req = AgentChatRequest(
+            workspace=workspace,
+            thread_id=thread_id,
+            message=message,
+            images=parsed_images,
+            allow_write=write_flag,
+        )
+        start_agent_chat_async(req, loop)
+        return {"ok": True, "thread_id": thread_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).exception("agent_chat failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/workspaces/{slug}/sessions/{thread_id}/abort")
+def agent_chat_abort(slug: str, thread_id: str) -> dict[str, Any]:
+    """停止进行中的 Agent 对话（ReAct 步间取消）。"""
+    _ws(slug)
+    return abort_agent_chat(thread_id)
 
 
 # ── 交互：Plan ──
@@ -1263,6 +1476,7 @@ async def plan_start_stream(
     slug: str,
     thread_id: str,
     body: ChatBody,
+    request: Request,
 ) -> StreamingResponse:
     """启动/续跑 Plan（goal 或空继续）。"""
     workspace = _ws(slug)
@@ -1293,7 +1507,7 @@ async def plan_start_stream(
 
     async def gen():
         try:
-            async for chunk in merge_sse_streams(queue):
+            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
                 yield chunk
         finally:
             HUB.unsubscribe(channel, queue)
@@ -1306,6 +1520,7 @@ async def plan_confirm_stream(
     slug: str,
     thread_id: str,
     body: PlanConfirmBody,
+    request: Request,
 ) -> StreamingResponse:
     """Plan 确认 Survey 决策。"""
     workspace = _ws(slug)
@@ -1328,7 +1543,7 @@ async def plan_confirm_stream(
 
     async def gen():
         try:
-            async for chunk in merge_sse_streams(queue):
+            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
                 yield chunk
         finally:
             HUB.unsubscribe(channel, queue)
@@ -1341,6 +1556,7 @@ async def plan_continue_stream(
     slug: str,
     thread_id: str,
     body: ChatBody,
+    request: Request,
 ) -> StreamingResponse:
     """Plan task_step_confirm 后继续。"""
     workspace = _ws(slug)
@@ -1357,7 +1573,7 @@ async def plan_continue_stream(
 
     async def gen():
         try:
-            async for chunk in merge_sse_streams(queue):
+            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
                 yield chunk
         finally:
             HUB.unsubscribe(channel, queue)
@@ -1370,6 +1586,7 @@ async def plan_discuss_stream(
     slug: str,
     thread_id: str,
     body: ChatBody,
+    request: Request,
 ) -> StreamingResponse:
     """Plan 终止后基于最终报告问答。"""
     workspace = _ws(slug)
@@ -1386,12 +1603,30 @@ async def plan_discuss_stream(
 
     async def gen():
         try:
-            async for chunk in merge_sse_streams(queue):
+            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
                 yield chunk
         finally:
             HUB.unsubscribe(channel, queue)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/workspaces/{slug}/plans/{thread_id}/cancel")
+def plan_cancel(slug: str, thread_id: str) -> dict[str, Any]:
+    """立即停止 Plan（跳过所有未完成 Work，不再调度新 batch）。"""
+    return cancel_plan(_ws(slug), thread_id)
+
+
+@app.post("/api/workspaces/{slug}/plans/{thread_id}/abort")
+def plan_abort(slug: str, thread_id: str) -> dict[str, Any]:
+    """取消 Plan（标记 cancelled，未完成 task 跳过）。"""
+    return abort_plan(_ws(slug), thread_id)
+
+
+@app.post("/api/workspaces/{slug}/plans/{thread_id}/tasks/{task_id}/cancel")
+def plan_task_cancel(slug: str, thread_id: str, task_id: str) -> dict[str, Any]:
+    """停止/跳过单个 Work task。"""
+    return cancel_plan_task(_ws(slug), thread_id, task_id)
 
 
 @app.get("/api/workspaces/{slug}/plans/{thread_id}/tasks/{task_id}/runnable")
@@ -1406,6 +1641,7 @@ async def plan_run_task_stream(
     thread_id: str,
     task_id: str,
     body: ChatBody,
+    request: Request,
 ) -> StreamingResponse:
     """手动执行单个 Work task。"""
     workspace = _ws(slug)
@@ -1423,7 +1659,7 @@ async def plan_run_task_stream(
 
     async def gen():
         try:
-            async for chunk in merge_sse_streams(queue):
+            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
                 yield chunk
         finally:
             HUB.unsubscribe(channel, queue)
@@ -1432,7 +1668,7 @@ async def plan_run_task_stream(
 
 
 @app.get("/api/workspaces/{slug}/plans/{thread_id}/events")
-async def plan_events_subscribe(slug: str, thread_id: str) -> StreamingResponse:
+async def plan_events_subscribe(slug: str, thread_id: str, request: Request) -> StreamingResponse:
     """订阅 Plan trace / 状态事件（长连接）。"""
     channel = f"plan:{thread_id}"
     queue = HUB.subscribe(channel)
@@ -1442,7 +1678,11 @@ async def plan_events_subscribe(slug: str, thread_id: str) -> StreamingResponse:
             yield format_sse({"type": "subscribed", "channel": channel})
             detail = load_plan_detail(_ws(slug), thread_id)
             yield format_sse({"type": "plan_state", "phase": detail.get("phase")})
-            async for chunk in merge_sse_streams(queue, timeout_sec=86400):
+            async for chunk in merge_sse_streams(
+                queue,
+                timeout_sec=86400,
+                is_disconnected=request.is_disconnected,
+            ):
                 yield chunk
         finally:
             HUB.unsubscribe(channel, queue)

@@ -1,5 +1,47 @@
 const BASE = '/api';
 
+const SSE_RECONNECT_MS = 1500;
+
+/** EventSource 断线后自动重连（切标签/网络抖动时恢复订阅）。 */
+function subscribeReconnectingSSE(
+  url: string,
+  onEvent: (data: Record<string, unknown>) => void,
+): () => void {
+  let es: EventSource | null = null;
+  let closed = false;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const connect = () => {
+    if (closed) {
+      return;
+    }
+    es = new EventSource(url);
+    es.onmessage = (ev) => {
+      try {
+        onEvent(JSON.parse(ev.data) as Record<string, unknown>);
+      } catch {
+        /* ignore */
+      }
+    };
+    es.onerror = () => {
+      es?.close();
+      es = null;
+      if (!closed) {
+        retryTimer = setTimeout(connect, SSE_RECONNECT_MS);
+      }
+    };
+  };
+
+  connect();
+  return () => {
+    closed = true;
+    if (retryTimer !== null) {
+      clearTimeout(retryTimer);
+    }
+    es?.close();
+  };
+}
+
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, init);
   if (!res.ok) {
@@ -30,6 +72,7 @@ export interface TreeNode {
   kind: 'agent' | 'plan' | 'worker';
   thread_id: string;
   title: string;
+  title_full?: string;
   updated_at?: string | null;
   phase?: string;
   plan_id?: string;
@@ -143,6 +186,10 @@ export interface MessageItem {
   content: unknown;
   /** 后端提取的用户可见正文（thinking 块已剥离） */
   display_text?: string;
+  /** 用户消息附带的图片（image_ref 预览） */
+  images?: Array<{ media_type: string; url?: string; id?: string }>;
+  /** 内部消息种类，如 think_nudge */
+  kind?: string;
   name?: string;
   tool_calls?: unknown;
   raw?: Record<string, unknown>;
@@ -199,6 +246,17 @@ export interface WorkerDetail {
   edits: Array<Record<string, unknown>>;
 }
 
+export interface PlanConfirmHistoryEntry {
+  at: string;
+  action: 'approve' | 'revise' | 'cancel' | string;
+  allow_worker_write: boolean;
+  revise_note?: string;
+  plan_version?: number;
+  title?: string;
+  task_count?: number;
+  tasks?: Array<{ id: string; title: string }>;
+}
+
 export interface PlanDetail {
   thread_id: string;
   plan_id: string;
@@ -216,9 +274,17 @@ export interface PlanDetail {
   };
   updated_at?: string | null;
   job?: { running?: boolean; error?: string | null };
+  plan?: {
+    execution?: { allow_worker_write?: boolean };
+  };
   plan_state?: {
+    plan_version?: number;
     user_messages?: string[];
     revision_note?: string | null;
+    allow_worker_write?: boolean;
+    discuss_messages?: Array<{ role: string; content: string }>;
+    pending_interrupt?: Record<string, unknown>;
+    confirm_history?: PlanConfirmHistoryEntry[];
   };
 }
 
@@ -440,6 +506,7 @@ export const api = {
       registered: boolean;
       output: string;
       trace_mode: string;
+      display_mode?: 'modal' | 'agent';
     }>(`/workspaces/${slug}/meta`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -483,24 +550,60 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ thread_ids: threadIds }),
     }),
-  messages: (slug: string, threadId: string, offset = 0, limit = 200) =>
+  messages: (slug: string, threadId: string, offset = 0, limit = 200, tail = true) =>
     fetchJson<{ messages: MessageItem[]; total: number }>(
-      `/workspaces/${slug}/sessions/${threadId}/messages?offset=${offset}&limit=${limit}`,
+      `/workspaces/${slug}/sessions/${threadId}/messages?offset=${offset}&limit=${limit}&tail=${tail ? '1' : '0'}`,
+    ),
+  sessionMeta: (slug: string, threadId: string) =>
+    fetchJson<{
+      thread_id: string;
+      title: string;
+      message_total: number;
+      allow_write?: boolean;
+      running?: boolean;
+      lock: { owner: string; since: number } | null;
+    }>(`/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}`),
+  touchSession: (slug: string, threadId: string) =>
+    fetchJson<{ thread_id: string; updated_at?: string | null }>(
+      `/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/touch`,
+      { method: 'POST' },
     ),
   lastTrace: (slug: string, threadId: string) =>
-    fetchJson<{ log_lines: string[]; steps: Record<string, unknown>[] }>(
-      `/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/last-trace`,
-    ),
+    fetchJson<{
+      log_lines: string[];
+      steps: Record<string, unknown>[];
+      turns?: Record<string, unknown>[];
+      live_ts?: string;
+    }>(`/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/last-trace`),
   plan: (slug: string, threadId: string) =>
     fetchJson<PlanDetail>(`/workspaces/${slug}/plans/${threadId}`),
   worker: (slug: string, threadId: string, taskId: string) =>
     fetchJson<WorkerDetail>(`/workspaces/${slug}/plans/${threadId}/tasks/${taskId}`),
-  agentChat: (slug: string, threadId: string, message: string, allowWrite: boolean, onEvent: SSEHandler, signal?: AbortSignal) =>
-    consumeSSE(
+  startAgentChat: (
+    slug: string,
+    threadId: string,
+    message: string,
+    allowWrite: boolean,
+    imageFiles?: File[],
+  ) => {
+    const form = new FormData();
+    form.append('message', message);
+    form.append('allow_write', allowWrite ? 'true' : 'false');
+    for (const file of imageFiles ?? []) {
+      form.append('images', file);
+    }
+    return fetchJson<{ ok: boolean; thread_id: string }>(
       `/workspaces/${slug}/sessions/${threadId}/chat`,
-      { message, allow_write: allowWrite },
-      onEvent,
-      signal,
+      {
+        method: 'POST',
+        body: form,
+      },
+    );
+  },
+  abortAgentChat: (slug: string, threadId: string) =>
+    fetchJson<{ ok: boolean; message: string }>(
+      `/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/abort`,
+      { method: 'POST' },
     ),
   planStart: (slug: string, threadId: string, message: string, allowWrite: boolean, onEvent: SSEHandler, signal?: AbortSignal) =>
     consumeSSE(
@@ -543,6 +646,21 @@ export const api = {
       onEvent,
       signal,
     ),
+  planCancel: (slug: string, threadId: string) =>
+    fetchJson<{ ok: boolean; message: string }>(
+      `/workspaces/${slug}/plans/${encodeURIComponent(threadId)}/cancel`,
+      { method: 'POST' },
+    ),
+  planAbort: (slug: string, threadId: string) =>
+    fetchJson<{ ok: boolean; message: string }>(
+      `/workspaces/${slug}/plans/${encodeURIComponent(threadId)}/abort`,
+      { method: 'POST' },
+    ),
+  planTaskCancel: (slug: string, threadId: string, taskId: string) =>
+    fetchJson<{ ok: boolean; message: string }>(
+      `/workspaces/${slug}/plans/${encodeURIComponent(threadId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
+      { method: 'POST' },
+    ),
   setWebSearch: (
     slug: string,
     enabled: boolean,
@@ -564,6 +682,12 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled, thread_id: threadId, allow_write: allowWrite }),
+    }),
+  setWriteMode: (slug: string, enabled: boolean, threadId = '') =>
+    fetchJson<{ enabled: boolean; message: string }>(`/workspaces/${slug}/write-mode`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled, thread_id: threadId }),
     }),
   contextUsage: (slug: string, allowWrite = false, threadId = '') =>
     fetchJson<ContextUsage>(
@@ -615,19 +739,20 @@ export const api = {
     slug: string,
     threadId: string,
     onEvent: (data: Record<string, unknown>) => void,
-  ): (() => void) => {
-    const es = new EventSource(
+  ): (() => void) =>
+    subscribeReconnectingSSE(
       `${BASE}/workspaces/${slug}/plans/${encodeURIComponent(threadId)}/events`,
-    );
-    es.onmessage = (ev) => {
-      try {
-        onEvent(JSON.parse(ev.data) as Record<string, unknown>);
-      } catch {
-        /* ignore */
-      }
-    };
-    return () => es.close();
-  },
+      onEvent,
+    ),
+  subscribeSessionEvents: (
+    slug: string,
+    threadId: string,
+    onEvent: (data: Record<string, unknown>) => void,
+  ): (() => void) =>
+    subscribeReconnectingSSE(
+      `${BASE}/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/events`,
+      onEvent,
+    ),
   codeSearch: (
     slug: string,
     query: string,
@@ -641,7 +766,7 @@ export const api = {
         body: JSON.stringify({
           query,
           mode: opts.mode || 'parallel',
-          top_k: opts.top_k ?? 15,
+          top_k: opts.top_k ?? 8,
           path_prefix: opts.path_prefix || '.',
         }),
       },

@@ -49,6 +49,7 @@ service-account*.json
 # --- Web UI（可选 ``llgraph web``）---
 web-ui/node_modules/
 web-ui/dist/
+web-ui/tsconfig.tsbuildinfo
 .run/
 
 # --- 评审 / 本地产出 ---

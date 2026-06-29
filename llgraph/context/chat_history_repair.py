@@ -13,10 +13,15 @@ from llgraph.context.message_dispatch_profile import (
     canonical_persist_profile,
 )
 from llgraph.context.message_normalize import _message_text
+from llgraph.context.tool_call_id import (
+    canonical_tool_call_id,
+    gateway_safe_tool_call_id,
+    normalize_tool_call_id_raw,
+)
 
 _REPAIR_TOOL_RESULT = "（上一轮工具调用未完成，已跳过；请继续当前问题。）"
 _REASONING_PLACEHOLDER = "（历史思考过程未落盘，占位以满足 Kimi 等网关校验。）"
-_TOOL_CALL_ID_UNSAFE = re.compile(r"[^a-zA-Z0-9_-]+")
+_EMPTY_ASSISTANT_PLACEHOLDER = " "
 
 
 @dataclass
@@ -30,6 +35,7 @@ class ChatHistorySanitizeReport:
     patched_reasoning_content: int = 0
     stripped_thinking_blocks: int = 0
     sanitized_tool_call_ids: int = 0
+    patched_empty_assistant: int = 0
 
     @property
     def changed(self) -> bool:
@@ -41,6 +47,7 @@ class ChatHistorySanitizeReport:
             or self.patched_reasoning_content > 0
             or self.stripped_thinking_blocks > 0
             or self.sanitized_tool_call_ids > 0
+            or self.patched_empty_assistant > 0
         )
 
 
@@ -107,34 +114,15 @@ def ai_message_has_tool_calls(msg: AIMessage) -> bool:
 
 
 def _normalize_tool_call_id(tool_call_id: object | None) -> str | None:
-    if tool_call_id is None:
-        return None
-    text = str(tool_call_id).strip()
-    return text or None
+    return normalize_tool_call_id_raw(tool_call_id)
 
 
 def _canonical_tool_call_id(tool_call_id: str) -> str:
-    """
-    统一 tool_call_id 匹配键（functions.foo:2 与 functions_foo_2 等价）。
-
-    @param tool_call_id 原始 id
-    @return 规范化 id
-    """
-    text = tool_call_id.strip()
-    if not text:
-        return "tool_call"
-    safe = _TOOL_CALL_ID_UNSAFE.sub("_", text)
-    return safe.replace(".", "_") or "tool_call"
+    return canonical_tool_call_id(tool_call_id)
 
 
 def _gateway_safe_tool_call_id(tool_call_id: str) -> str:
-    """
-    将 tool_call_id 规范为 Anthropic/Claude 网关可接受字符集（如拒绝 ':'）。
-
-    @param tool_call_id 原始 id
-    @return 规范化 id
-    """
-    return _canonical_tool_call_id(tool_call_id)
+    return gateway_safe_tool_call_id(tool_call_id)
 
 
 def _lookup_tool_message(
@@ -272,6 +260,19 @@ def _extract_reasoning_text(msg: AIMessage) -> str:
     return ""
 
 
+def _ai_has_persisted_thinking(msg: AIMessage) -> bool:
+    """
+    是否含可回传的 thinking（llgraph.thinking_text / content 块 / reasoning_content）。
+
+    @param msg assistant 消息
+    @return 是否有非占位 thinking
+    """
+    from llgraph.core.gateway_kimi_patch import resolve_kimi_reasoning_content
+
+    reasoning = resolve_kimi_reasoning_content(msg)
+    return bool(reasoning.strip()) and reasoning != _REASONING_PLACEHOLDER
+
+
 def ensure_tool_ai_reasoning_content(msg: AIMessage) -> tuple[AIMessage, bool]:
     """
     为带 tool_calls 的 AI 补 reasoning_content（Kimi k2 等 thinking 模式必填）。
@@ -280,6 +281,32 @@ def ensure_tool_ai_reasoning_content(msg: AIMessage) -> tuple[AIMessage, bool]:
     @return (消息, 是否改写)
     """
     if not ai_message_has_tool_calls(msg):
+        return msg, False
+
+    extra = dict(getattr(msg, "additional_kwargs", None) or {})
+    existing = extra.get("reasoning_content")
+    if isinstance(existing, str) and existing.strip():
+        return msg, False
+
+    from llgraph.core.gateway_kimi_patch import resolve_kimi_reasoning_content
+
+    reasoning = resolve_kimi_reasoning_content(msg)
+    extra["reasoning_content"] = reasoning
+    return msg.model_copy(update={"additional_kwargs": extra}), True
+
+
+def ensure_thinking_only_ai_reasoning_content(msg: AIMessage) -> tuple[AIMessage, bool]:
+    """
+    为 thinking-only（无 tool、无 visible text）的 AI 补 reasoning_content。
+
+    Think step 续跑时 Kimi 需将 reasoning 写回历史。
+
+    @param msg assistant 消息
+    @return (消息, 是否改写)
+    """
+    if ai_message_has_tool_calls(msg):
+        return msg, False
+    if not _ai_has_persisted_thinking(msg):
         return msg, False
 
     extra = dict(getattr(msg, "additional_kwargs", None) or {})
@@ -387,7 +414,7 @@ def patch_tool_ai_reasoning_contents(
     messages: list[BaseMessage],
 ) -> tuple[list[BaseMessage], int]:
     """
-    批量补全 tool 轮 AI 的 reasoning_content。
+    批量补全 tool 轮与 thinking-only AI 的 reasoning_content。
 
     @param messages 消息列表
     @return (新列表, 补全条数)
@@ -397,6 +424,8 @@ def patch_tool_ai_reasoning_contents(
     for msg in messages:
         if isinstance(msg, AIMessage):
             fixed, changed = ensure_tool_ai_reasoning_content(msg)
+            if not changed:
+                fixed, changed = ensure_thinking_only_ai_reasoning_content(fixed)
             if changed:
                 patched += 1
             out.append(fixed)
@@ -501,7 +530,7 @@ def _append_single_tool_round(
         ai_piece = norm.model_copy(
             update={
                 "tool_calls": [tc],
-                "content": base_content if idx == 0 else "",
+                "content": base_content if idx == 0 else _EMPTY_ASSISTANT_PLACEHOLDER,
                 "additional_kwargs": dict(base_extra),
             },
         )
@@ -518,6 +547,159 @@ def _append_single_tool_round(
                 ),
             )
             report.patched_tool_results += 1
+
+
+def _assistant_dispatch_text(msg: AIMessage) -> str:
+    """@param msg assistant 消息 @return 出站 content 文本（含 thinking 块）"""
+    return _message_text(getattr(msg, "content", "")).strip()
+
+
+def rehydrate_native_thinking_block(msg: AIMessage) -> tuple[AIMessage, bool]:
+    """
+    将 llgraph.thinking_text 还原为 content 内 thinking 块（Claude native 协议）。
+
+    @param msg assistant 消息
+    @return (消息, 是否改写)
+    """
+    extra = dict(getattr(msg, "additional_kwargs", None) or {})
+    meta = extra.get("llgraph")
+    if not isinstance(meta, dict):
+        return msg, False
+    thinking = meta.get("thinking_text")
+    if not isinstance(thinking, str) or not thinking.strip():
+        return msg, False
+
+    content = getattr(msg, "content", "")
+    text_parts: list[str] = []
+    if isinstance(content, list):
+        has_thinking = False
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = str(block.get("type", "")).lower()
+            if kind in ("thinking", "reasoning", "reasoning_text", "redacted_thinking"):
+                has_thinking = True
+                continue
+            if kind == "text":
+                text = block.get("text")
+                if text:
+                    text_parts.append(str(text))
+        if has_thinking:
+            return msg, False
+    elif isinstance(content, str):
+        stripped = content.strip()
+        if stripped and stripped != _EMPTY_ASSISTANT_PLACEHOLDER.strip():
+            text_parts.append(stripped)
+    else:
+        return msg, False
+
+    blocks: list[dict[str, str]] = [
+        {"type": "thinking", "thinking": thinking.strip()},
+    ]
+    merged_text = "\n\n".join(text_parts).strip()
+    if merged_text:
+        blocks.append({"type": "text", "text": merged_text})
+    return msg.model_copy(update={"content": blocks}), True
+
+
+def rehydrate_all_native_thinking_blocks(
+    messages: list[BaseMessage],
+) -> tuple[list[BaseMessage], int]:
+    """
+    批量还原 native thinking 块。
+
+    @param messages 消息列表
+    @return (新列表, 改写条数)
+    """
+    changed = 0
+    out: list[BaseMessage] = []
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            out.append(msg)
+            continue
+        fixed, did = rehydrate_native_thinking_block(msg)
+        if did:
+            changed += 1
+        out.append(fixed)
+    return out, changed
+
+
+def persist_all_ai_thinking_to_meta(
+    messages: list[BaseMessage],
+) -> tuple[list[BaseMessage], int]:
+    """
+    批量将 AI content 内 thinking 块写入 llgraph.thinking_text（canonical 落盘）。
+
+    所有模型均执行，避免 ensure_nonempty 覆盖 content 时丢失 thinking；
+    **是否回传到网关** 由 dispatch profile 决定（见 dispatch_preserves_thinking_on_outbound）。
+
+    @param messages 消息列表
+    @return (新列表, 改写条数)
+    """
+    from llgraph.context.message_canonical import persist_ai_thinking_in_message
+
+    changed = 0
+    out: list[BaseMessage] = []
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            out.append(msg)
+            continue
+        fixed, did = persist_ai_thinking_in_message(msg)
+        if did:
+            changed += 1
+        out.append(fixed)
+    return out, changed
+
+
+def _assistant_has_thinking_blocks(msg: AIMessage) -> bool:
+    """content 列表内是否含 thinking/reasoning 块。"""
+    content = getattr(msg, "content", "")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("type", "")).lower() in (
+            "thinking",
+            "reasoning",
+            "reasoning_text",
+            "redacted_thinking",
+        ):
+            return True
+    return False
+
+
+def ensure_nonempty_assistant_messages(
+    messages: list[BaseMessage],
+) -> tuple[list[BaseMessage], int]:
+    """
+    补齐 content 为空的 assistant（火山等网关 400：assistant must not be empty）。
+
+    已 rehydrate 的 thinking 块不覆盖。
+
+    @param messages 消息列表
+    @return (新列表, 补齐条数)
+    """
+    patched = 0
+    out: list[BaseMessage] = []
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            out.append(msg)
+            continue
+        text = _assistant_dispatch_text(msg)
+        if text:
+            out.append(msg)
+            continue
+        if _assistant_has_thinking_blocks(msg):
+            out.append(msg)
+            continue
+        if ai_message_has_tool_calls(msg):
+            patched += 1
+            out.append(msg.model_copy(update={"content": _EMPTY_ASSISTANT_PLACEHOLDER}))
+            continue
+        patched += 1
+        out.append(msg.model_copy(update={"content": _EMPTY_ASSISTANT_PLACEHOLDER}))
+    return out, patched
 
 
 def rebuild_provider_safe_messages(
@@ -589,17 +771,26 @@ def rebuild_provider_safe_messages(
         safe.append(msg)
         i += 1
 
+    safe, _persisted_thinking = persist_all_ai_thinking_to_meta(safe)
+    from llgraph.core.model_thinking_profile import dispatch_rehydrates_native_thinking_blocks
+
+    if dispatch_rehydrates_native_thinking_blocks(effective):
+        safe, _rehydrated = rehydrate_all_native_thinking_blocks(safe)
     if effective.patch_tool_ai_reasoning:
+        # Kimi k2 等：补 reasoning_content，thinking-only 续跑可回灌网关
         safe, reasoning_patched = patch_tool_ai_reasoning_contents(safe)
         report.patched_reasoning_content = reasoning_patched
     else:
         safe, _stripped = strip_tool_ai_reasoning_contents(safe)
     if effective.strip_assistant_thinking_blocks:
+        # Claude/GPT 等：出站剥离 content 内 thinking 块（meta 仍保留 thinking_text）
         safe, stripped = strip_assistant_thinking_blocks(safe)
         report.stripped_thinking_blocks = stripped
     # 出站前始终规范化 tool_call_id（Kimi 落盘 id 常含 ':'，Claude/Bedrock 会 400）
     safe, sanitized = sanitize_gateway_tool_call_ids(safe)
     report.sanitized_tool_call_ids = sanitized
+    safe, nonempty = ensure_nonempty_assistant_messages(safe)
+    report.patched_empty_assistant = nonempty
     return safe, report
 
 
@@ -738,6 +929,50 @@ def ensure_agent_chat_history_sanitized(
         from llgraph.terminal.ops_notice import ops_notice
 
         ops_notice(f"历史消息已修复: {'；'.join(parts)}。")
+    return report
+
+
+def ensure_agent_chat_history_dispatch_safe(
+    agent: Any,
+    workspace: Any,
+    thread_id: str,
+) -> ChatHistorySanitizeReport:
+    """
+    按当前模型出站规则清理 checkpoint 消息并写回（修复空 assistant 等 400）。
+
+    @param agent LangGraph agent
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @return 清理报告
+    """
+    from pathlib import Path
+
+    from llgraph.core.llm_settings import resolve_effective_model
+
+    empty = ChatHistorySanitizeReport()
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = agent.get_state(config)
+    except Exception:
+        return empty
+    messages = list((state.values or {}).get("messages") or [])
+    if not messages:
+        return empty
+
+    ws = Path(workspace).expanduser().resolve() if workspace is not None else None
+    model_id = resolve_effective_model(ws)
+    safe, report = sanitize_chat_history_for_dispatch(messages, ws, model_id)
+    if not _messages_changed(messages, safe):
+        return report
+
+    try:
+        agent.update_state(config, {"messages": safe})
+        if ws is not None:
+            from llgraph.session.session_file_store import save_session_messages
+
+            save_session_messages(ws, thread_id, safe)
+    except Exception:
+        return empty
     return report
 
 

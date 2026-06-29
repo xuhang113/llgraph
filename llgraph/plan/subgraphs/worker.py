@@ -71,6 +71,8 @@ def build_worker_subgraph(
         tools,
         worker_system_prompt(ctx, task, allow_write=allow_write),
         workspace=ctx.workspace,
+        thread_key=sub_thread,
+        subgraph_kind="worker",
     )
 
 
@@ -81,6 +83,7 @@ def run_worker_subagent(
     task_id: str,
     allow_write: bool,
     user_prompt: str,
+    plan_state: dict[str, Any] | None = None,
 ) -> tuple[str, list[Any], list[str]]:
     """
     在父图 worker node 内 invoke Worker 子图。
@@ -102,7 +105,19 @@ def run_worker_subagent(
         sub_thread=sub_thread,
         role_label=f"Worker {task_id}",
         spec=WORKER_SUBGRAPH_SPEC,
+        allow_write=allow_write,
+        plan_state=plan_state,
     )
     messages = collect_subgraph_messages(subgraph, sub_thread)
+    from llgraph.plan.subgraph_messages import collect_and_persist_subgraph_messages
+
+    collect_and_persist_subgraph_messages(
+        ctx.workspace,
+        ctx.thread_id,
+        task_id,
+        subgraph,
+        sub_thread,
+        fallback_messages=messages,
+    )
     files_changed = edit_tracker.unique_paths() if edit_tracker is not None else []
     return text, messages, files_changed

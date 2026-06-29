@@ -7,11 +7,17 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from llgraph.session.jsonl_read import count_jsonl_lines
 from llgraph.session.session_file_store import session_has_messages_file
 from llgraph.session.session_meta import (
     backfill_session_titles,
+    disambiguate_session_titles,
+    format_display_session_title,
     get_session_title,
+    load_session_meta,
     resolve_session_display_title,
+    resolve_session_full_title,
+    session_meta_json_path,
 )
 from llgraph.session.user_storage import (
     format_storage_location_hint,
@@ -29,6 +35,7 @@ class SessionSummary:
 
     thread_id: str
     title: str
+    title_full: str
     title_is_stored: bool
     updated_at: str | None
     message_count: int
@@ -43,6 +50,32 @@ def _parse_iso(value: str | None) -> str | None:
     if not value or not str(value).strip():
         return None
     return str(value).strip()
+
+
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    raw = _parse_iso(value)
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _max_iso(*values: str | None) -> str | None:
+    best: datetime | None = None
+    for raw in values:
+        dt = _parse_iso_datetime(raw)
+        if dt is None:
+            continue
+        if best is None or dt > best:
+            best = dt
+    if best is None:
+        return None
+    return best.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _mtime_iso(path: Path) -> str | None:
@@ -95,13 +128,7 @@ def _discover_disk_session_ids(workspace: Path) -> set[str]:
 
 
 def _count_messages_file(path: Path) -> int:
-    if not path.is_file():
-        return 0
-    try:
-        with path.open(encoding="utf-8") as handle:
-            return sum(1 for line in handle if line.strip())
-    except OSError:
-        return 0
+    return count_jsonl_lines(path)
 
 
 def _load_jsonl_sessions(workspace: Path) -> dict[str, tuple[int, str | None]]:
@@ -152,6 +179,46 @@ def list_workspace_session_ids(
     return [tid for tid in all_ids if session_has_substantive_content(root, tid)]
 
 
+def _plan_main_has_substantive_content(workspace: Path, thread_id: str) -> bool:
+    """
+    Plan 主会话是否已有实质内容（plan_state / plan.json 等，非仅 meta 空壳）。
+
+    @param workspace 工作区根
+    @param thread_id plan-xxxxxxxx
+    @return 是否有规划状态或落盘 plan
+    """
+    from llgraph.session.session_delete import is_plan_main_thread
+
+    if not is_plan_main_thread(thread_id):
+        return False
+    root = workspace.expanduser().resolve()
+    state_path = session_thread_dir(root, thread_id) / "plan_state.json"
+    if state_path.is_file():
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if isinstance(data, dict):
+            if data.get("opening_goal") or data.get("task_results") or data.get("user_messages"):
+                return True
+            plan = data.get("plan")
+            if isinstance(plan, dict) and (
+                plan.get("goal") or plan.get("tasks") or plan.get("title")
+            ):
+                return True
+    from llgraph.plan.config import resolve_plan_settings
+    from llgraph.plan.plan_store import plan_json_path
+    from llgraph.session.session_meta import load_session_meta
+
+    meta = load_session_meta(root, thread_id)
+    plan_id = str(meta.get("plan_id") or "").strip()
+    if plan_id:
+        settings = resolve_plan_settings(root)
+        if plan_json_path(root, plan_id, plans_dir=settings.plans_dir).is_file():
+            return True
+    return False
+
+
 def session_has_substantive_content(workspace: Path, thread_id: str) -> bool:
     """
     是否为「有实质内容」的会话（非仅启动/列表产生的空壳目录）。
@@ -160,6 +227,10 @@ def session_has_substantive_content(workspace: Path, thread_id: str) -> bool:
     @param thread_id 线程 ID
     @return 是否有对话、归档或编辑记录
     """
+    from llgraph.session.session_delete import is_plan_subsession_thread
+
+    if is_plan_subsession_thread(thread_id):
+        return False
     root = workspace.expanduser().resolve()
     msg_path = session_messages_path(root, thread_id)
     if msg_path.is_file() and _count_messages_file(msg_path) > 0:
@@ -172,6 +243,8 @@ def session_has_substantive_content(workspace: Path, thread_id: str) -> bool:
     _, archive_path, _ = _session_artifact_paths(root, thread_id)
     if archive_path.is_file() and _count_messages_file(archive_path) > 0:
         return True
+    if _plan_main_has_substantive_content(root, thread_id):
+        return True
     return False
 
 
@@ -183,10 +256,17 @@ def list_empty_session_ids(workspace: Path) -> list[str]:
     @return 空壳会话 ID 列表
     """
     root = workspace.expanduser().resolve()
+    from llgraph.session.session_delete import is_plan_subsession_thread
+
     disk_ids = _discover_disk_session_ids(root)
     msg_map = _load_jsonl_sessions(root)
     all_ids = sorted(disk_ids | set(msg_map.keys()))
-    return [tid for tid in all_ids if not session_has_substantive_content(root, tid)]
+    return [
+        tid
+        for tid in all_ids
+        if not is_plan_subsession_thread(tid)
+        and not session_has_substantive_content(root, tid)
+    ]
 
 
 def discover_sessions(workspace: Path) -> list[SessionSummary]:
@@ -231,25 +311,39 @@ def discover_sessions(workspace: Path) -> list[SessionSummary]:
             msg_count = _count_messages_file(session_messages_path(root, tid))
             msg_updated = _mtime_iso(session_messages_path(root, tid))
 
-        updated_candidates = [
+        meta = load_session_meta(root, tid)
+        meta_path = session_meta_json_path(root, tid)
+        msg_path = session_messages_path(root, tid)
+        from llgraph.session.web_trace_store import (
+            last_web_trace_path,
+            live_web_trace_path,
+            web_trace_history_path,
+        )
+
+        updated_at = _max_iso(
             msg_updated,
+            _mtime_iso(msg_path),
+            _parse_iso(meta.get("updated_at")),
+            _mtime_iso(meta_path),
             _mtime_iso(manifest_path),
             _mtime_iso(archive_path),
             _mtime_iso(edits_dir / "edits.jsonl"),
             started,
-        ]
-        updated_at = max((x for x in updated_candidates if x), default=None)
+            _mtime_iso(live_web_trace_path(root, tid)),
+            _mtime_iso(web_trace_history_path(root, tid)),
+            _mtime_iso(last_web_trace_path(root, tid)),
+        )
 
         stored_title = get_session_title(root, tid)
-        display_title = (
-            stored_title
-            if stored_title
-            else resolve_session_display_title(root, tid)
-        )
+        full_title = resolve_session_full_title(root, tid)
+        display_title = format_display_session_title(full_title)
+        if not display_title:
+            display_title = resolve_session_display_title(root, tid)
         summaries.append(
             SessionSummary(
                 thread_id=tid,
                 title=display_title,
+                title_full=full_title,
                 title_is_stored=bool(stored_title),
                 updated_at=updated_at,
                 message_count=msg_count,
@@ -262,10 +356,29 @@ def discover_sessions(workspace: Path) -> list[SessionSummary]:
         )
 
     summaries.sort(
-        key=lambda s: s.updated_at or "",
+        key=lambda s: _parse_iso_datetime(s.updated_at)
+        or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-    return summaries
+    display_titles = disambiguate_session_titles(
+        [(s.thread_id, s.title) for s in summaries]
+    )
+    return [
+        SessionSummary(
+            thread_id=s.thread_id,
+            title=display_titles[i],
+            title_full=s.title_full,
+            title_is_stored=s.title_is_stored,
+            updated_at=s.updated_at,
+            message_count=s.message_count,
+            has_manifest=s.has_manifest,
+            has_archive=s.has_archive,
+            has_edits=s.has_edits,
+            workspace_hint=s.workspace_hint,
+            sources=s.sources,
+        )
+        for i, s in enumerate(summaries)
+    ]
 
 
 def format_sessions_list(workspace: Path, *, current_thread_id: str | None = None) -> str:

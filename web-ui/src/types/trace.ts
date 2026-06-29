@@ -1,3 +1,75 @@
+export interface TraceTurn {
+  id: string;
+  turn_index: number;
+  label: string;
+  steps: TraceStep[];
+  live?: boolean;
+}
+
+export function parseTraceTurnsFromRemote(
+  turnsRaw: unknown,
+  fallbackSteps: TraceStep[] = [],
+): TraceTurn[] {
+  if (Array.isArray(turnsRaw) && turnsRaw.length > 0) {
+    return turnsRaw
+      .filter((item): item is Record<string, unknown> => item != null && typeof item === 'object')
+      .map((row, index) => {
+        const stepsRaw = row.steps;
+        const steps: TraceStep[] = Array.isArray(stepsRaw)
+          ? stepsRaw
+              .filter((item): item is Record<string, unknown> => item != null && typeof item === 'object')
+              .map((step, stepIndex) => ({
+                step_id: Number(step.step_id ?? stepIndex + 1),
+                kind: String(step.kind ?? ''),
+                title: String(step.title ?? ''),
+                elapsed: Number(step.elapsed ?? 0),
+                summary: String(step.summary ?? ''),
+                body_lines: Array.isArray(step.body_lines) ? step.body_lines.map(String) : [],
+                usage: (step.usage as StepUsage | null | undefined) ?? null,
+              }))
+          : [];
+        const turnIndex = Number(row.turn_index ?? index + 1);
+        return {
+          id: `turn-${turnIndex}`,
+          turn_index: turnIndex,
+          label: String(row.label ?? `第 ${turnIndex} 轮`),
+          steps,
+          live: Boolean(row.live),
+        };
+      });
+  }
+  if (fallbackSteps.length > 0) {
+    return [{ id: 'turn-1', turn_index: 1, label: '第 1 轮', steps: fallbackSteps }];
+  }
+  return [];
+}
+
+/** 已完成轮次 + 当前轮（live）合并为展示列表。 */
+export function buildDisplayTraceTurns(
+  completedTurns: TraceTurn[],
+  currentSteps: TraceStep[],
+  opts: { busy: boolean; currentLabel?: string },
+): TraceTurn[] {
+  const completed = completedTurns.filter((turn) => !turn.live);
+  if (currentSteps.length === 0) {
+    return completed;
+  }
+  const turnIndex = completed.length + 1;
+  const label =
+    opts.currentLabel ||
+    (opts.busy ? `第 ${turnIndex} 轮 · 进行中` : `第 ${turnIndex} 轮`);
+  return [
+    ...completed,
+    {
+      id: 'turn-live',
+      turn_index: turnIndex,
+      label,
+      steps: currentSteps,
+      live: opts.busy,
+    },
+  ];
+}
+
 export interface StepUsage {
   input_tokens?: number;
   output_tokens?: number;
@@ -86,11 +158,31 @@ export interface TraceLineItem {
   text: string;
 }
 
+/** 按 step_id 合并步骤，避免 turn_done / live 重复追加。 */
+export function mergeTraceStepsUnique(
+  panelSteps: TraceStep[],
+  incomingSteps: TraceStep[],
+): TraceStep[] {
+  if (incomingSteps.length === 0) {
+    return panelSteps;
+  }
+  const byId = new Map<number, TraceStep>();
+  for (const step of panelSteps) {
+    byId.set(step.step_id, step);
+  }
+  for (const step of incomingSteps) {
+    if (!byId.has(step.step_id)) {
+      byId.set(step.step_id, step);
+    }
+  }
+  return [...byId.values()].sort((a, b) => a.step_id - b.step_id);
+}
+
 /** 无逐行 SSE 时，用步骤摘要合成面板日志行。 */
 export function stepsToPanelLogLines(steps: TraceStep[]): TraceLineItem[] {
-  return steps.map((step) => ({
-    id: `syn-${step.step_id}`,
-    text: `${stepMarker(step)} #${step.step_id} ${step.title}  ${step.summary}`.trim(),
+  return steps.map((step, index) => ({
+    id: `syn-${step.step_id}-${index}`,
+    text: `${stepMarker(step)} #${index + 1} ${step.title}  ${step.summary}`.trim(),
   }));
 }
 
@@ -106,4 +198,30 @@ export function partitionTraceMiscLines(lines: string[]): string[] {
     misc.push(line);
   }
   return misc;
+}
+
+/** 有结构化步骤时仅保留用户消息 / 预处理类 misc（隐藏工具里程碑重复日志）。 */
+export function filterTraceMiscWhenSteps(miscLines: string[], stepCount: number): string[] {
+  if (stepCount <= 0) {
+    return miscLines;
+  }
+  return miscLines.filter((line) => {
+    if (line.includes('用户消息')) {
+      return true;
+    }
+    if (/准备中|加载历史|压缩上下文|本轮暂无步骤/.test(line)) {
+      return true;
+    }
+    return false;
+  });
+}
+
+/** 供贴底滚动依赖：步数 + 最后一步内容变化时更新。 */
+export function traceStepsFingerprint(steps: TraceStep[]): string {
+  if (steps.length === 0) {
+    return '0';
+  }
+  const last = steps[steps.length - 1]!;
+  const bodyLines = steps.reduce((sum, s) => sum + (s.body_lines?.length ?? 0), 0);
+  return `${steps.length}:${last.step_id}:${bodyLines}:${last.summary?.length ?? 0}:${last.elapsed}`;
 }

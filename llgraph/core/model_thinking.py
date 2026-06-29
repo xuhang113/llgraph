@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from copy import deepcopy
 from typing import Any
 
@@ -10,20 +9,66 @@ from pathlib import Path
 
 from llgraph.core.gateway_models import load_model_catalog
 
+_THINKING_DISABLED_PAYLOAD: dict[str, Any] = {"type": "disabled"}
+
+
+def _explicit_thinking_disabled_payload(
+    workspace: Path | None,
+    model_id: str | None,
+) -> dict[str, Any] | None:
+    """
+    支持 thinking 的模型在关闭时须显式传 type=disabled（避免网关默认开启）。
+
+    @param workspace 工作区根
+    @param model_id 模型 id
+    @return disabled payload；不支持 thinking 时 None（省略字段）
+    """
+    if not model_id or not str(model_id).strip():
+        return None
+    from llgraph.core.model_thinking_profile import resolve_model_thinking_spec
+
+    if not resolve_model_thinking_spec(str(model_id).strip()).supports_thinking:
+        return None
+    return dict(_THINKING_DISABLED_PAYLOAD)
+
+
+def _thinking_payload_is_enabled(payload: dict[str, Any] | None) -> bool:
+    if not payload:
+        return False
+    kind = str(payload.get("type", "")).strip().lower()
+    if kind == "disabled":
+        return False
+    if payload.get("enabled") is False:
+        return False
+    return True
+
+
+def _model_thinking_default_on(model_id: str) -> bool:
+    """
+    未配置时是否默认开启 thinking（仅 Kimi 族默认开）。
+
+    @param model_id 模型 id
+    @return 是否默认开启
+    """
+    mid = model_id.strip().lower()
+    return "kimi" in mid
+
 
 def _heuristic_thinking_payload(model_id: str) -> dict[str, Any] | None:
     """
-    未显式配置时的模型族默认 thinking。
+    未显式配置时的模型族默认 thinking payload。
 
-    仅 Kimi k 系列默认开启；其它模型默认关闭（省 token、减少 tail 膨胀）。
+    仅 Kimi 默认开启；其它支持 thinking 的模型需在 catalog / 运行时显式启用。
 
     @param model_id 模型 id
     @return thinking 请求体；None 表示不发送
     """
-    mid = model_id.strip().lower()
-    if "kimi" in mid or re.search(r"k2\.[56]", mid):
-        return {"type": "enabled", "keep": "all"}
-    return None
+    from llgraph.core.model_thinking_profile import resolve_model_thinking_spec
+
+    spec = resolve_model_thinking_spec(model_id)
+    if not spec.supports_thinking or not _model_thinking_default_on(model_id):
+        return None
+    return spec.default_payload
 
 
 def _coerce_thinking_dict(raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -91,6 +136,8 @@ def model_supports_thinking(workspace: Path | None, model_id: str | None) -> boo
     @param model_id 模型 id
     @return 是否展示 thinking 开关
     """
+    from llgraph.core.model_thinking_profile import resolve_model_thinking_spec
+
     if not model_id or not str(model_id).strip():
         return False
     effective = str(model_id).strip()
@@ -103,7 +150,7 @@ def model_supports_thinking(workspace: Path | None, model_id: str | None) -> boo
             if parsed is not _USE_DEFAULT:
                 return True
             break
-    return _heuristic_thinking_payload(effective) is not None
+    return resolve_model_thinking_spec(model_id).supports_thinking
 
 
 def is_thinking_enabled(workspace: Path | None, model_id: str | None) -> bool:
@@ -114,7 +161,7 @@ def is_thinking_enabled(workspace: Path | None, model_id: str | None) -> bool:
     @param model_id 模型 id
     @return 是否发往网关 thinking 参数
     """
-    return resolve_model_thinking_payload(workspace, model_id) is not None
+    return _thinking_payload_is_enabled(resolve_model_thinking_payload(workspace, model_id))
 
 
 def _resolve_config_thinking_payload(
@@ -184,18 +231,28 @@ def resolve_model_thinking_payload(
 
     @param workspace 工作区根
     @param model_id 模型 id
-    @return thinking 字典；None 表示不发送
+    @return thinking 字典；None 表示不发送；支持 thinking 且关闭时为 {type: disabled}
     """
+    effective = str(model_id).strip() if model_id and str(model_id).strip() else ""
+
     if _runtime_thinking is False:
-        return None
+        return _explicit_thinking_disabled_payload(workspace, model_id)
     base = _resolve_config_thinking_payload(workspace, model_id)
     if _runtime_thinking is True:
         if base is not None:
             return base
-        if not model_id or not str(model_id).strip():
+        if not effective:
             return None
-        heuristic = _heuristic_thinking_payload(str(model_id).strip())
-        return heuristic if heuristic is not None else {"type": "enabled"}
+        from llgraph.core.model_thinking_profile import resolve_model_thinking_spec
+
+        spec = resolve_model_thinking_spec(effective)
+        if spec.default_payload is not None:
+            return spec.default_payload
+        if spec.supports_thinking:
+            return {"type": "enabled"}
+        return None
+    if base is None:
+        return _explicit_thinking_disabled_payload(workspace, model_id)
     return base
 
 

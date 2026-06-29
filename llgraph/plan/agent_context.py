@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from llgraph.session.session_file_store import load_session_messages
@@ -133,12 +135,35 @@ def load_agent_context_for_plan(
     )
 
 
+def format_plan_for_revision_prompt(plan: dict[str, Any]) -> str:
+    """
+    将当前 plan.json 摘要序列化，供修订时作为基线。
+
+    @param plan plan dict
+    @return JSON 文本；无 tasks 时返回空串
+    """
+    if not isinstance(plan, dict):
+        return ""
+    tasks = plan.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return ""
+    import json
+
+    payload = {
+        "title": str(plan.get("title") or ""),
+        "goal": str(plan.get("goal") or ""),
+        "tasks": tasks,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def build_planner_user_prompt(
     *,
     opening_goal: str,
     agent_context: str = "",
     revision_note: str = "",
     plan_version: int = 1,
+    current_plan: dict[str, Any] | None = None,
 ) -> str:
     """
     组装 Planner 用户提示（含可选 Agent 会话摘录）。
@@ -147,6 +172,7 @@ def build_planner_user_prompt(
     @param agent_context 来源 Agent 对话摘录
     @param revision_note 修订说明
     @param plan_version 计划版本
+    @param current_plan 修订前的 plan.json（含 tasks）
     @return 完整 user prompt
     """
     blocks: list[str] = []
@@ -160,6 +186,14 @@ def build_planner_user_prompt(
     revision = (revision_note or "").strip()
     if revision:
         blocks.append(f"请根据修订说明更新计划（v{plan_version}）：\n{revision}")
+        plan_snapshot = format_plan_for_revision_prompt(current_plan or {})
+        if plan_snapshot:
+            blocks.append("\n--- 当前计划（须在此基础上修改，勿清空已有 Work）---")
+            blocks.append(plan_snapshot)
+        blocks.append(
+            "\n说明：最终报告由系统「汇总(Synthesize)」节点自动生成，不要把它写成 Work 任务。"
+            "回复末尾必须输出完整 ```json plan 代码块（含 title 与 tasks 数组）。"
+        )
         if goal:
             blocks.append(f"\n原目标：{goal}")
     elif goal:

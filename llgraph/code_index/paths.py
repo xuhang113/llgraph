@@ -11,7 +11,10 @@ EMBED_CACHE_FILENAME = "embed_cache.db"
 META_FILENAME = "index_meta.json"
 
 DEFAULT_VECTOR_DIM = 1536
-TEXT_PREVIEW_MAX = 200
+# 索引存储与检索展示：Cursor 风格极短摘要（路径+行号为主，正文靠 read_file）
+TEXT_PREVIEW_MAX = 80
+SEARCH_SNIPPET_MAX = 80
+DEFAULT_SEARCH_TOP_K = 8
 
 # 行窗口切块（约 400–600 token，按字符近似）
 CHUNK_TARGET_CHARS = 2400

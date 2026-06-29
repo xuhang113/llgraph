@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from llgraph.code_index.paths import DEFAULT_SEARCH_TOP_K
+from llgraph.code_index.search_format import format_search_hit, truncate_search_snippet
 from llgraph.code_index.search_path_filter import is_junk_search_path
 from llgraph.code_index.vector_search import perform_vector_search
 from llgraph.config.logging_settings import get_search_logger
@@ -58,7 +60,7 @@ def collect_vector_hits(
             continue
         start = hit.get("start_line", 0)
         doc_id = f"{rel}:{start}"
-        preview = hit.get("text_preview", "")
+        preview = truncate_search_snippet(hit.get("text_preview", ""))
         out.append((doc_id, preview))
     return out, ""
 
@@ -74,17 +76,15 @@ def format_hit(hit: dict, rank: int) -> str:
     rel = hit.get("rel_path", "")
     start = hit.get("start_line", 0)
     end = hit.get("end_line", 0)
-    preview = hit.get("text_preview", "")
-    dist = hit.get("_distance", "")
-    dist_s = f" dist={dist:.4f}" if isinstance(dist, (int, float)) else ""
-    return f"{rank}. {rel}:{start}-{end}{dist_s}\n   {preview}"
+    location = f"{rel}:{start}-{end}" if end and end != start else f"{rel}:{start}"
+    return format_search_hit(rank, location, hit.get("text_preview", ""))
 
 
 def search_semantic(
     workspace: Path,
     query: str,
     *,
-    top_k: int = 15,
+    top_k: int = DEFAULT_SEARCH_TOP_K,
     path_prefix: str = ".",
     source: str = "cli",
     tool: str = "search_code_semantic",
@@ -127,16 +127,18 @@ def search_semantic(
     if not hits:
         return "未找到语义相关代码块。"
 
-    lines = [f"语义检索 Top{len(hits)}（索引 {outcome.chunk_count} chunks）:", ""]
     rank = 0
+    hit_lines: list[str] = []
     for hit in hits:
         rel = str(hit.get("rel_path", ""))
         if is_junk_search_path(rel):
             continue
         rank += 1
-        lines.append(format_hit(hit, rank))
+        hit_lines.append(format_hit(hit, rank))
         if rank >= top_k:
             break
     if rank == 0:
         return "未找到语义相关代码块（结果均为索引噪声，可 llgraph index 重建）。"
+    lines = [f"语义检索 Top{rank}:", ""] + hit_lines
+    lines.append("\n精读: read_file / read_files；勿重复语义检索。")
     return "\n".join(lines)

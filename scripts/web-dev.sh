@@ -35,16 +35,22 @@ EOF
 }
 
 ensure_env() {
-  if [[ ! -d .venv ]]; then
-    python3 -m venv .venv
-  fi
-  # shellcheck disable=SC1091
-  source .venv/bin/activate
-  pip install -q -e ".[web]"
-  if [[ ! -d web-ui/node_modules ]]; then
-    (cd web-ui && npm install)
-  fi
+  bash "$ROOT/scripts/setup.sh" web -q
+  resolve_llgraph_cmd
   mkdir -p "$RUN_DIR"
+}
+
+resolve_llgraph_cmd() {
+  if [[ -x "$ROOT/.venv/bin/llgraph" ]]; then
+    LLGRAPH_CMD=("$ROOT/.venv/bin/llgraph")
+  elif command -v uv >/dev/null 2>&1; then
+    LLGRAPH_CMD=(uv run llgraph)
+  elif command -v llgraph >/dev/null 2>&1; then
+    LLGRAPH_CMD=(llgraph)
+  else
+    echo "错误: 找不到 llgraph 命令（请先运行 ./scripts/setup.sh web）" >&2
+    exit 1
+  fi
 }
 
 pid_alive() {
@@ -145,7 +151,7 @@ cmd_start() {
   if $dev_mode; then
     ensure_port_free "$API_PORT"
     ensure_port_free "$VITE_PORT"
-    nohup llgraph web --host "$API_HOST" --port "$API_PORT" >>"$API_LOG" 2>&1 &
+    nohup "${LLGRAPH_CMD[@]}" web --host "$API_HOST" --port "$API_PORT" >>"$API_LOG" 2>&1 &
     echo $! >"$API_PID_FILE"
     nohup npm --prefix web-ui run dev -- --host 127.0.0.1 --port "$VITE_PORT" >>"$VITE_LOG" 2>&1 &
     echo $! >"$VITE_PID_FILE"
@@ -159,19 +165,33 @@ cmd_start() {
   ensure_port_free "$API_PORT"
   export LLGRAPH_WEB_STATIC="$ROOT/web-ui/dist"
   nohup env LLGRAPH_WEB_STATIC="$LLGRAPH_WEB_STATIC" \
-    llgraph web --host "$API_HOST" --port "$API_PORT" >>"$API_LOG" 2>&1 &
+    "${LLGRAPH_CMD[@]}" web --host "$API_HOST" --port "$API_PORT" >>"$API_LOG" 2>&1 &
   echo $! >"$API_PID_FILE"
   echo "打开: http://$API_HOST:$API_PORT"
+}
+
+wait_api() {
+  local url="http://$API_HOST:$API_PORT/api/health"
+  local i
+  for i in $(seq 1 40); do
+    if curl -sf "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "错误: API 未在 $url 就绪（请检查 llgraph web 日志）" >&2
+  return 1
 }
 
 cmd_dev() {
   ensure_env
   ensure_port_free "$API_PORT"
-  llgraph web --host "$API_HOST" --port "$API_PORT" &
+  "${LLGRAPH_CMD[@]}" web --host "$API_HOST" --port "$API_PORT" &
   local api_pid=$!
   echo $api_pid >"$API_PID_FILE"
   trap 'kill "$api_pid" 2>/dev/null || true; rm -f "$API_PID_FILE"' EXIT INT TERM
   echo "API: http://$API_HOST:$API_PORT"
+  wait_api
   echo "UI:  http://127.0.0.1:$VITE_PORT"
   (cd web-ui && npm run dev -- --host 127.0.0.1 --port "$VITE_PORT")
 }

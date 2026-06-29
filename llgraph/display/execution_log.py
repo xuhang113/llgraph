@@ -49,6 +49,30 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _format_ts_display(ts: object) -> str:
+    """
+    将落盘 UTC 时间转为本地时间展示（与 trace 侧栏 HH:MM:SS 一致）。
+
+    @param ts ISO8601 字符串（通常带 Z）
+    @return 本地 YYYY-MM-DD HH:MM:SS
+    """
+    if not ts:
+        return "?"
+    text = str(ts).strip()
+    if not text:
+        return "?"
+    try:
+        if text.endswith("Z"):
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        else:
+            dt = datetime.fromisoformat(text)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return text
+
+
 def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(record, ensure_ascii=False) + "\n"
@@ -259,6 +283,85 @@ def log_index_event(
     )
 
 
+def _turn_log_messages_and_usage(
+    workspace: Path,
+    *,
+    with_memory: bool,
+    agent: Any,
+    thread_id: str,
+) -> tuple[int, dict[str, Any], bool]:
+    """
+    汇总 turn 日志共用的消息 token 估算与网关 usage。
+
+    @param workspace 工作区根
+    @param with_memory 是否读 agent 状态
+    @param agent LangGraph agent
+    @param thread_id 线程 ID
+    @return (messages_tokens_est, usage, prompt_cache_used)
+    """
+    messages: list[Any] = []
+    if with_memory:
+        config = {"configurable": {"thread_id": thread_id}}
+        try:
+            state = agent.get_state(config)
+            messages = list((state.values or {}).get("messages") or [])
+        except Exception:
+            messages = []
+
+    messages_tokens_est = estimate_tokens(messages) if messages else 0
+    usage = extract_usage_from_messages(messages)
+    cache_read = usage.get("totals", {}).get("cache_read_input_tokens", 0)
+    cache_create = usage.get("totals", {}).get("cache_creation_input_tokens", 0)
+    prompt_cache_used = cache_read > 0 or cache_create > 0
+    return messages_tokens_est, usage, prompt_cache_used
+
+
+def _message_preview(text: str, *, limit: int = 200) -> str:
+    one_line = " ".join(str(text or "").split())
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[: limit - 3] + "..."
+
+
+def _trace_context_fields(trace_context: dict[str, Any] | None) -> dict[str, Any]:
+    if not trace_context:
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("trace_step_count", "last_trace_step_id", "last_trace_step_summary"):
+        if key in trace_context:
+            out[key] = trace_context[key]
+    return out
+
+
+def log_turn_start(
+    workspace: Path,
+    *,
+    thread_id: str,
+    user_message: str,
+    trace_mode: str | None = None,
+) -> None:
+    """
+    记录单轮对话开始（便于对照 turn/turn_error 排查 hang 与中断）。
+
+    @param workspace 工作区根
+    @param thread_id 线程 ID
+    @param user_message 用户输入
+    @param trace_mode 过程展示模式
+    """
+    if not resolve_execution_log_enabled(workspace):
+        return
+    append_execution_event(
+        workspace,
+        {
+            "event": "turn_start",
+            "thread_id": thread_id,
+            "model": resolve_effective_model(workspace),
+            "trace_mode": trace_mode,
+            "user_message_preview": _message_preview(user_message),
+        },
+    )
+
+
 def log_turn_end(
     workspace: Path,
     *,
@@ -271,6 +374,8 @@ def log_turn_end(
     spill: Any | None = None,
     spill_count_at_start: int = 0,
     trace_mode: str | None = None,
+    trace_context: dict[str, Any] | None = None,
+    user_message: str | None = None,
 ) -> None:
     """
     记录单轮对话结束（token、压缩、工具、落盘）。
@@ -289,27 +394,19 @@ def log_turn_end(
     if not resolve_execution_log_enabled(workspace):
         return
 
-    messages: list[Any] = []
-    if with_memory:
-        config = {"configurable": {"thread_id": thread_id}}
-        try:
-            state = agent.get_state(config)
-            messages = list((state.values or {}).get("messages") or [])
-        except Exception:
-            messages = []
-
-    messages_tokens_est = estimate_tokens(messages) if messages else 0
-    usage = extract_usage_from_messages(messages)
-    cache_read = usage.get("totals", {}).get("cache_read_input_tokens", 0)
-    cache_create = usage.get("totals", {}).get("cache_creation_input_tokens", 0)
-    prompt_cache_used = cache_read > 0 or cache_create > 0
-
+    messages_tokens_est, usage, prompt_cache_used = _turn_log_messages_and_usage(
+        workspace,
+        with_memory=with_memory,
+        agent=agent,
+        thread_id=thread_id,
+    )
     unique_tools = list(dict.fromkeys(tool_names))
 
     append_execution_event(
         workspace,
         {
             "event": "turn",
+            "outcome": "ok",
             "thread_id": thread_id,
             "model": resolve_effective_model(workspace),
             "duration_sec": round(duration_sec, 3),
@@ -324,6 +421,83 @@ def log_turn_end(
                 spill,
                 spill_count_at_start=spill_count_at_start,
             ),
+            **_trace_context_fields(trace_context),
+            **({"user_message_preview": _message_preview(user_message)} if user_message else {}),
+        },
+    )
+
+
+def log_turn_failure(
+    workspace: Path,
+    *,
+    thread_id: str,
+    with_memory: bool,
+    agent: Any,
+    duration_sec: float,
+    error: BaseException,
+    tool_names: list[str] | None = None,
+    compress_report: CompressReport | None = None,
+    spill: Any | None = None,
+    spill_count_at_start: int = 0,
+    trace_mode: str | None = None,
+    outcome: str = "error",
+    trace_context: dict[str, Any] | None = None,
+    user_message: str | None = None,
+) -> None:
+    """
+    记录单轮对话异常中断（与 turn 事件字段对齐，便于 Log 面板排查）。
+
+    @param workspace 工作区根
+    @param thread_id 线程 ID
+    @param with_memory 是否持久化会话
+    @param agent LangGraph agent
+    @param duration_sec 本轮已耗时
+    @param error 捕获的异常
+    @param tool_names 中断前已调用工具名（顺序保留）
+    @param compress_report 本轮前自动压缩报告
+    @param spill 工具结果落盘器
+    @param spill_count_at_start 本轮开始前 spill 次数
+    @param trace_mode 过程展示模式
+    @param outcome error | cancelled | timeout
+    @param trace_context trace 摘要（步数/最后一步）
+    @param user_message 用户输入（仅预览）
+    """
+    if not resolve_execution_log_enabled(workspace):
+        return
+
+    messages_tokens_est, usage, prompt_cache_used = _turn_log_messages_and_usage(
+        workspace,
+        with_memory=with_memory,
+        agent=agent,
+        thread_id=thread_id,
+    )
+    names = list(tool_names or [])
+    unique_tools = list(dict.fromkeys(names))
+    message = str(error).strip() or type(error).__name__
+
+    append_execution_event(
+        workspace,
+        {
+            "event": "turn_error",
+            "outcome": outcome,
+            "thread_id": thread_id,
+            "model": resolve_effective_model(workspace),
+            "duration_sec": round(duration_sec, 3),
+            "trace_mode": trace_mode,
+            "tools": unique_tools,
+            "tool_call_count": len(names),
+            "messages_tokens_est": messages_tokens_est,
+            "usage": usage,
+            "prompt_cache_used": prompt_cache_used,
+            "compress": _compress_payload(compress_report),
+            "spill": _spill_payload(
+                spill,
+                spill_count_at_start=spill_count_at_start,
+            ),
+            "error_type": type(error).__name__,
+            "error_message": message[:2000],
+            **_trace_context_fields(trace_context),
+            **({"user_message_preview": _message_preview(user_message)} if user_message else {}),
         },
     )
 
@@ -366,9 +540,18 @@ def format_execution_record(record: dict[str, Any]) -> str:
     @param record JSON 事件
     @return 可读一行
     """
-    ts = record.get("ts", "?")
+    ts = _format_ts_display(record.get("ts"))
     event = record.get("event", "?")
-    if event == "turn":
+    if event == "turn_start":
+        preview = str(record.get("user_message_preview") or "").replace("\n", " ")
+        if len(preview) > 80:
+            preview = preview[:77] + "..."
+        return (
+            f"{ts} turn_start [{record.get('thread_id', '?')[:8]}] "
+            f"model={record.get('model', '?')} "
+            f"{preview or '—'}"
+        )
+    if event in ("turn", "turn_error"):
         tools = record.get("tools") or []
         tool_part = ",".join(tools[:4]) if tools else "—"
         if len(tools) > 4:
@@ -395,9 +578,26 @@ def format_execution_record(record: dict[str, Any]) -> str:
         spill_part = ""
         if spill.get("delta_count"):
             spill_part = f" | spill+{spill['delta_count']}"
+        label = "turn" if event == "turn" else f"turn_error({record.get('outcome', 'error')})"
+        dur = record.get("duration_sec")
+        dur_part = f" {dur}s" if dur is not None else ""
+        err_part = ""
+        if event == "turn_error":
+            err_type = record.get("error_type") or "Error"
+            err_msg = str(record.get("error_message") or "").replace("\n", " ")
+            if len(err_msg) > 120:
+                err_msg = err_msg[:117] + "..."
+            err_part = f" | {err_type}: {err_msg}" if err_msg else f" | {err_type}"
+        trace_part = ""
+        step_count = record.get("trace_step_count")
+        last_step = record.get("last_trace_step_id")
+        if step_count is not None:
+            trace_part = f" | trace_steps={step_count}"
+            if last_step is not None:
+                trace_part += f" last=#{last_step}"
         return (
-            f"{ts} turn [{record.get('thread_id', '?')[:8]}] "
-            f"{usage_part} {cache_flag} tools={tool_part}{cmp_part}{spill_part}"
+            f"{ts} {label} [{record.get('thread_id', '?')[:8]}]{dur_part} "
+            f"{usage_part} {cache_flag} tools={tool_part}{cmp_part}{spill_part}{trace_part}{err_part}"
         )
     if event == "compress":
         c = record.get("compress") or {}

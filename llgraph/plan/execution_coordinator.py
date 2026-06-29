@@ -8,6 +8,7 @@ from typing import Callable
 
 _registry_lock = threading.Lock()
 _jobs: dict[str, "PlanBackgroundJob"] = {}
+_cancelled_tasks: dict[str, set[str]] = {}
 
 
 @dataclass
@@ -43,6 +44,64 @@ def is_cancel_requested(thread_id: str) -> bool:
     with _registry_lock:
         job = _jobs.get(thread_id)
         return bool(job and job.cancel_requested)
+
+
+def request_cancel_task(thread_id: str, task_id: str) -> None:
+    """
+    请求停止单个 Work task（当前 batch 结束后生效；in-flight 轮询检查）。
+
+    @param thread_id plan-* thread
+    @param task_id 如 w1
+    """
+    key = (task_id or "").strip()
+    if not key:
+        return
+    with _registry_lock:
+        _cancelled_tasks.setdefault(thread_id, set()).add(key)
+
+
+def is_task_cancel_requested(thread_id: str, task_id: str) -> bool:
+    """@param thread_id plan thread @param task_id work id @return 是否请求取消该 task"""
+    key = (task_id or "").strip()
+    if not key:
+        return False
+    with _registry_lock:
+        return key in _cancelled_tasks.get(thread_id, set())
+
+
+def clear_cancelled_tasks(thread_id: str, *, task_ids: list[str] | None = None) -> None:
+    """
+    清除 task 取消标记。
+
+    @param thread_id plan thread
+    @param task_ids 指定 id；None 表示清空该 plan 下全部
+    """
+    with _registry_lock:
+        if task_ids is None:
+            _cancelled_tasks.pop(thread_id, None)
+            return
+        bucket = _cancelled_tasks.get(thread_id)
+        if not bucket:
+            return
+        for tid in task_ids:
+            bucket.discard(str(tid).strip())
+        if not bucket:
+            _cancelled_tasks.pop(thread_id, None)
+
+
+def request_cancel_all_tasks(thread_id: str, task_ids: list[str]) -> None:
+    """
+    请求停止 Plan 下多个 Work task。
+
+    @param thread_id plan-* thread
+    @param task_ids 如 t1,t2
+    """
+    keys = [str(tid).strip() for tid in task_ids if str(tid).strip()]
+    if not keys:
+        return
+    with _registry_lock:
+        bucket = _cancelled_tasks.setdefault(thread_id, set())
+        bucket.update(keys)
 
 
 def request_cancel(thread_id: str) -> bool:
@@ -87,6 +146,12 @@ def start_background(
                 job.error = str(exc)
             finally:
                 job.running = False
+                try:
+                    from llgraph.console.runtime.session_lock import release_stale_web_lock
+
+                    release_stale_web_lock(thread_id)
+                except Exception:
+                    pass
                 if on_complete is not None:
                     try:
                         on_complete()

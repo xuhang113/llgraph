@@ -27,6 +27,8 @@ _ERROR_PREFIXES = (
     "MCP 调用失败",
 )
 
+_READ_TOOLS = frozenset({"read_file", "read_files"})
+
 
 @dataclass
 class SpillRecord:
@@ -80,6 +82,12 @@ class ContextSpill:
             disabled=disabled or not settings.enabled,
         )
 
+    def _spill_char_limit(self, tool_name: str) -> int:
+        """@param tool_name 工具名 @return 触发 spill 的字符上限"""
+        if tool_name in _READ_TOOLS:
+            return self.settings.read_tool_result_max_chars
+        return self.settings.tool_result_max_chars
+
     def _should_spill(self, tool_name: str, content: str) -> bool:
         """判断是否应对结果落盘。"""
         if self.disabled or not self.settings.enabled:
@@ -89,7 +97,7 @@ class ContextSpill:
         text = content.strip()
         if not text:
             return False
-        if len(text) <= self.settings.tool_result_max_chars:
+        if len(text) <= self._spill_char_limit(tool_name):
             return False
         if len(text) <= _SHORT_RESULT_MAX_CHARS:
             return False
@@ -126,15 +134,23 @@ class ContextSpill:
 
         lines = content.splitlines()
         total_lines = len(lines) if lines else (1 if content else 0)
-        preview_n = self.settings.tool_result_preview_lines
-        tail_lines = lines[-preview_n:] if lines else [content[:500]]
-        clipped: list[str] = []
-        for line in tail_lines:
-            if len(line) > 200:
-                clipped.append(line[:200] + "…")
-            else:
-                clipped.append(line)
-        preview = "\n".join(clipped)
+        tail_n = self.settings.tool_result_preview_lines
+        head_n = (
+            self.settings.tool_result_preview_head_lines
+            if tool_name in _READ_TOOLS
+            else 0
+        )
+        head_preview = ""
+        if head_n > 0 and lines:
+            head_lines = lines[:head_n]
+            if tail_n > 0 and len(lines) > head_n + tail_n:
+                head_preview = self._clip_preview_lines(head_lines)
+        tail_lines = lines[-tail_n:] if lines else [content[:500]]
+        tail_preview = self._clip_preview_lines(tail_lines)
+
+        hit_preview = ""
+        if tool_name in _READ_TOOLS and self.settings.spill_hit_context_lines > 0:
+            hit_preview = self._build_read_hit_preview(content)
 
         rel_path = spill_path.relative_to(self.workspace).as_posix()
         self.records.append(
@@ -151,8 +167,43 @@ class ContextSpill:
             tool_name=tool_name,
             total_lines=total_lines,
             total_chars=len(content),
-            preview=preview,
+            preview=tail_preview,
+            head_preview=head_preview,
+            hit_preview=hit_preview,
         )
+
+    def _build_read_hit_preview(self, read_content: str) -> str:
+        """@param read_content read 工具原始输出 @return 历史命中 ±N 行预览"""
+        from llgraph.context.search_hit_lines import (
+            build_hit_anchor_preview,
+            collect_search_hits_from_messages,
+            extract_read_source_paths,
+        )
+        from llgraph.core.tool_execution_context import get_tool_execution_messages
+
+        source_paths = set(extract_read_source_paths(read_content))
+        if not source_paths:
+            return ""
+        hits = collect_search_hits_from_messages(get_tool_execution_messages())
+        if not hits:
+            return ""
+        return build_hit_anchor_preview(
+            self.workspace,
+            source_paths=source_paths,
+            hits_by_path=hits,
+            radius=self.settings.spill_hit_context_lines,
+        )
+
+    @staticmethod
+    def _clip_preview_lines(lines: list[str]) -> str:
+        """@param lines 预览行 @return 截断后的文本"""
+        clipped: list[str] = []
+        for line in lines:
+            if len(line) > 200:
+                clipped.append(line[:200] + "…")
+            else:
+                clipped.append(line)
+        return "\n".join(clipped)
 
     @staticmethod
     def format_pointer(
@@ -162,6 +213,8 @@ class ContextSpill:
         total_lines: int,
         total_chars: int,
         preview: str,
+        head_preview: str = "",
+        hit_preview: str = "",
     ) -> str:
         """
         生成工具结果指针模板。
@@ -171,18 +224,37 @@ class ContextSpill:
         @param total_lines 总行数
         @param total_chars 总字符数
         @param preview 末 N 行预览
+        @param head_preview read 工具可选开头预览（package/import 等）
+        @param hit_preview read 落盘时历史检索命中区预览
         @return 给模型的指针文本
         """
-        return (
-            f"[工具结果已落盘 — {tool_name}]\n"
-            f"全文路径（相对工作区）: {rel_path}\n"
-            f"规模: {total_lines} 行 / {total_chars} 字符\n"
-            f"说明: 下文仅为末尾预览；需要全文或指定段落时请 read_file(path, start_line, end_line)，"
-            f"或对落盘文件 grep_files（勿重复 read 源码）。\n"
-            f"--- 末尾预览 ---\n"
-            f"{preview}\n"
-            f"--- 预览结束 ---"
-        )
+        is_read = tool_name in _READ_TOOLS
+        if is_read:
+            hint = (
+                "需要中间段落时用 read_file(path, start_line, end_line) 按行读取；"
+                "勿对同一文件整文件重复 read。"
+            )
+        else:
+            hint = (
+                "需要全文或指定段落时请 read_file(path, start_line, end_line)，"
+                "或对落盘文件 grep_files。"
+            )
+        parts = [
+            f"[工具结果已落盘 — {tool_name}]",
+            f"全文路径（相对工作区）: {rel_path}",
+            f"规模: {total_lines} 行 / {total_chars} 字符",
+            f"说明: {hint}",
+        ]
+        if head_preview.strip():
+            parts.append("--- 开头预览 ---")
+            parts.append(head_preview.strip())
+        if hit_preview.strip():
+            parts.append("--- 命中区预览（历史 grep/parallel 行 ±上下文） ---")
+            parts.append(hit_preview.strip())
+        parts.append("--- 末尾预览 ---")
+        parts.append(preview.strip())
+        parts.append("--- 预览结束 ---")
+        return "\n".join(parts)
 
     def spilled_bytes_on_disk(self) -> int:
         """
@@ -251,6 +323,50 @@ def apply_spill_to_tools(tools: list[Any], spill: ContextSpill | None) -> list[A
     return wrapped
 
 
+def mask_tool_message_to_dispatch_pointer(msg: ToolMessage) -> ToolMessage:
+    """
+    将 ToolMessage 替换为出站用短指针（保留 tool_call_id），用于 dispatch tool 链压缩。
+
+    @param msg 工具消息
+    @return 指针或原样（已是指针时）
+    """
+    content = msg.content if isinstance(msg.content, str) else str(msg.content)
+    if (
+        "[历史工具输出已归档]" in content
+        or "[历史工具输出已省略" in content
+        or "[历史 read 已归档]" in content
+        or "[工具结果已落盘" in content
+    ):
+        return msg
+
+    path_match = re.search(r"全文路径[^:]*:\s*(\S+)", content)
+    if path_match:
+        rel = path_match.group(1)
+        short = (
+            f"[历史工具输出已归档] 详见 {rel}；"
+            f"需要时用 read_file 或 grep_files 读取。"
+        )
+    else:
+        read_hdr = re.search(r"^---\s+(.+?)\s+\(行\s+\d+", content, re.MULTILINE)
+        if read_hdr:
+            rel = read_hdr.group(1).strip()
+            short = (
+                f"[历史 read 已归档] 源文件 `{rel}`（原长 {len(content)} 字符）；"
+                f"需要时用 read_file(path, start_line, end_line) 按行读取，或 grep_files 搜关键字。"
+            )
+        else:
+            tool_name = getattr(msg, "name", None) or "tool"
+            short = (
+                f"[历史 {tool_name} 已归档] 原长 {len(content)} 字符；"
+                f"需要时重新调用该工具或 read_file/grep_files 按需读取。"
+            )
+    return ToolMessage(
+        content=short,
+        tool_call_id=msg.tool_call_id,
+        name=getattr(msg, "name", None),
+    )
+
+
 def mask_tool_message_content(
     msg: ToolMessage,
     workspace: Path,
@@ -270,6 +386,9 @@ def mask_tool_message_content(
         return msg
     if "[历史工具输出已归档]" in content or "[历史工具输出已省略" in content:
         return msg
+    if "[工具结果已落盘" in content:
+        return msg
+
     path_match = re.search(r"全文路径[^:]*:\s*(\S+)", content)
     if path_match:
         rel = path_match.group(1)
@@ -278,10 +397,18 @@ def mask_tool_message_content(
             f"需要时用 read_file 或 grep_files 读取。"
         )
     else:
-        short = (
-            f"[历史工具输出已省略，原长 {len(content)} 字符] "
-            f"详见 manifest archive_path 或重新执行工具。"
-        )
+        read_hdr = re.search(r"^---\s+(.+?)\s+\(行\s+\d+", content, re.MULTILINE)
+        if read_hdr:
+            rel = read_hdr.group(1).strip()
+            short = (
+                f"[历史 read 已归档] 源文件 `{rel}`（原长 {len(content)} 字符）；"
+                f"需要时用 read_file(path, start_line, end_line) 按行读取，或 grep_files 搜关键字。"
+            )
+        else:
+            short = (
+                f"[历史工具输出已省略，原长 {len(content)} 字符] "
+                f"详见 manifest archive_path 或重新执行工具。"
+            )
     return ToolMessage(
         content=short,
         tool_call_id=msg.tool_call_id,

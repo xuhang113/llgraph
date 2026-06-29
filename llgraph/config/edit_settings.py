@@ -58,7 +58,6 @@ class EditSettings:
     snapshot_on_first_edit: bool
     write_chunk_max_chars: int
     write_failures_before_hint: int
-    confirm_writes: str
 
 
 def resolve_edit_settings(workspace: Path) -> EditSettings:
@@ -91,14 +90,6 @@ def resolve_edit_settings(workspace: Path) -> EditSettings:
     except (TypeError, ValueError):
         fail_hint = 2
 
-    confirm_raw = edits.get("confirm_writes", "interactive")
-    if isinstance(confirm_raw, str):
-        confirm_writes = confirm_raw.strip().lower()
-    else:
-        confirm_writes = "interactive"
-    if confirm_writes not in ("interactive", "always", "never"):
-        confirm_writes = "interactive"
-
     return EditSettings(
         prefer_search_replace=_parse_bool(edits.get("prefer_search_replace"), True),
         require_unique_match=_parse_bool(edits.get("require_unique_match"), True),
@@ -107,5 +98,4 @@ def resolve_edit_settings(workspace: Path) -> EditSettings:
         snapshot_on_first_edit=_parse_bool(edits.get("snapshot_on_first_edit"), True),
         write_chunk_max_chars=chunk_max,
         write_failures_before_hint=fail_hint,
-        confirm_writes=confirm_writes,
     )

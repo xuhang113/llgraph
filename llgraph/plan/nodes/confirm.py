@@ -9,7 +9,7 @@ from langgraph.types import interrupt
 from llgraph.plan.plan_registry import init_plan_session_meta
 from llgraph.plan.plan_store import save_plan
 from llgraph.plan.runtime import PlanRuntimeContext
-from llgraph.plan.state import PlanPhase
+from llgraph.plan.state import PlanPhase, TaskStatus
 from llgraph.plan.workflow_view import build_workflow_snapshot
 
 
@@ -31,6 +31,20 @@ def _apply_confirm_decision(
     plan_id = str(plan.get("plan_id") or state.get("plan_id") or "")
 
     if action in ("cancel", "rejected", "reject"):
+        tasks_out: list[dict[str, Any]] = []
+        for task in plan.get("tasks") if isinstance(plan.get("tasks"), list) else []:
+            if not isinstance(task, dict):
+                continue
+            row = dict(task)
+            status = str(row.get("status") or TaskStatus.PENDING)
+            if status not in (TaskStatus.DONE, TaskStatus.SKIPPED):
+                row["status"] = TaskStatus.SKIPPED
+                row["error"] = str(row.get("error") or "Plan 已取消")
+            tasks_out.append(row)
+        if tasks_out:
+            plan["tasks"] = tasks_out
+            if plan_id:
+                save_plan(ctx.workspace, plan, plans_dir=ctx.settings.plans_dir)
         snapshot = build_workflow_snapshot(
             thread_id=ctx.thread_id,
             phase=PlanPhase.CANCELLED,
@@ -39,6 +53,7 @@ def _apply_confirm_decision(
         )
         return {
             "phase": PlanPhase.CANCELLED,
+            "plan": plan,
             "workflow_snapshot": snapshot,
             "cancel_requested": True,
         }
@@ -105,6 +120,11 @@ def confirm_node(state: dict[str, Any], ctx: PlanRuntimeContext) -> dict[str, An
 
     if phase != PlanPhase.AWAITING_CONFIRM:
         return {}
+
+    from llgraph.plan.execution_coordinator import is_cancel_requested
+
+    if is_cancel_requested(ctx.thread_id) or state.get("cancel_requested"):
+        return _apply_confirm_decision(state, ctx, {"action": "cancel"})
 
     tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
     payload = {

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from llgraph.core.agent_config import load_agent_config
+from llgraph.core.react_limits import parse_react_max_turns
 
 
 @dataclass(frozen=True)
@@ -45,10 +46,10 @@ def resolve_plan_settings(workspace: Path) -> PlanSettings:
         enabled=bool(plan.get("enabled", True)),
         plans_dir=str(plan.get("plans_dir") or ".llgraph/plans"),
         planner_readonly=bool(planner.get("readonly", True)),
-        planner_max_turns=int(planner.get("max_turns") or 40),
-        worker_max_turns=int(worker.get("max_turns") or 30),
+        planner_max_turns=parse_react_max_turns(planner.get("max_turns")),
+        worker_max_turns=parse_react_max_turns(worker.get("max_turns")),
         default_allow_write=bool(worker.get("default_allow_write", False)),
-        max_parallel_workers=max(1, int(supervisor.get("max_parallel_workers") or 3)),
+        max_parallel_workers=max(1, int(supervisor.get("max_parallel_workers") or 4)),
         confirm_via_survey=bool(plan.get("confirm_via_survey", True)),
         auto_run_after_confirm=bool(plan.get("auto_run_after_confirm", True)),
         step_confirm_each_task=bool(plan.get("step_confirm_each_task", False)),

@@ -2,23 +2,41 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from llgraph.core.llm import create_gateway_llm
 from llgraph.core.llm_response import llm_response_text, normalize_stored_llm_text
 from llgraph.plan.plan_lifecycle import can_discuss
-from llgraph.plan.plan_state_store import load_plan_state, save_plan_state
+from llgraph.plan.plan_state_store import save_plan_state
 from llgraph.plan.runtime import PlanRuntimeContext
+from llgraph.plan.task_results_hydrate import hydrate_task_results
 
 
-def _build_discuss_system(state: dict[str, Any]) -> str:
-    plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
+def _discuss_messages(state: dict[str, Any]) -> list[dict[str, str]]:
+    raw = state.get("discuss_messages")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role") or "").strip()
+        content = str(row.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            out.append({"role": role, "content": content})
+    return out
+
+
+def _build_discuss_system(state: dict[str, Any], *, workspace: Path, plans_dir: str) -> str:
+    hydrated = hydrate_task_results(workspace, state, plans_dir=plans_dir)
+    plan = hydrated.get("plan") if isinstance(hydrated.get("plan"), dict) else {}
     title = str(plan.get("title") or "未命名计划")
     goal = str(plan.get("goal") or "")
-    report = normalize_stored_llm_text(state.get("final_report"))
-    task_results = state.get("task_results") if isinstance(state.get("task_results"), dict) else {}
+    report = normalize_stored_llm_text(hydrated.get("final_report"))
+    task_results = hydrated.get("task_results") if isinstance(hydrated.get("task_results"), dict) else {}
     lines = [f"计划「{title}」", f"目标: {goal}", "", "## 最终报告", report]
     if task_results:
         lines.append("")
@@ -52,17 +70,36 @@ def run_plan_discuss(
         if phase != "completed":
             return "Plan 尚未完成汇总，请等待执行结束或使用 /plan continue。"
         return "尚无最终报告，请 /plan continue 完成汇总后再追问。"
+
+    question = user_message.strip()
     llm = create_gateway_llm(ctx.workspace)
-    response = llm.invoke(
-        [
-            SystemMessage(content=_build_discuss_system(state)),
-            HumanMessage(content=user_message.strip()),
-        ]
-    )
-    text = llm_response_text(response).strip()
-    user_messages = list(state.get("user_messages") or [])
-    user_messages.append(user_message.strip())
-    state = dict(state)
-    state["user_messages"] = user_messages
-    save_plan_state(ctx.workspace, ctx.thread_id, state)
-    return text or "（无回复）"
+    messages: list[Any] = [
+        SystemMessage(
+            content=_build_discuss_system(
+                state,
+                workspace=ctx.workspace,
+                plans_dir=ctx.settings.plans_dir,
+            )
+        )
+    ]
+    for row in _discuss_messages(state):
+        if row["role"] == "user":
+            messages.append(HumanMessage(content=row["content"]))
+        else:
+            messages.append(AIMessage(content=row["content"]))
+    messages.append(HumanMessage(content=question))
+
+    response = llm.invoke(messages)
+    text = llm_response_text(response).strip() or "（无回复）"
+
+    history = _discuss_messages(state)
+    history.append({"role": "user", "content": question})
+    history.append({"role": "assistant", "content": text})
+
+    merged = dict(state)
+    user_messages = list(merged.get("user_messages") or [])
+    user_messages.append(question)
+    merged["user_messages"] = user_messages
+    merged["discuss_messages"] = history
+    save_plan_state(ctx.workspace, ctx.thread_id, merged)
+    return text

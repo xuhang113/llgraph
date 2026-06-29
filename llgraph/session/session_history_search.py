@@ -207,10 +207,13 @@ def _excerpt(text: str, max_chars: int) -> str:
     return text[: max_chars - 20].rstrip() + "\n…（已截断，完整内容见 read_file 对应归档行）"
 
 
+from llgraph.session.jsonl_read import open_jsonl_for_read
+
+
 def _iter_archive_lines(path: Path) -> list[tuple[int, str, str]]:
     rows: list[tuple[int, str, str]] = []
     try:
-        with path.open(encoding="utf-8") as handle:
+        with open_jsonl_for_read(path) as handle:
             for line_no, line in enumerate(handle, start=1):
                 line = line.strip()
                 if not line:
@@ -232,7 +235,7 @@ def _iter_archive_lines(path: Path) -> list[tuple[int, str, str]]:
 def _iter_messages_jsonl(path: Path) -> list[tuple[int, str, str]]:
     rows: list[tuple[int, str, str]] = []
     try:
-        with path.open(encoding="utf-8") as handle:
+        with open_jsonl_for_read(path) as handle:
             for line_no, line in enumerate(handle, start=1):
                 line = line.strip()
                 if not line:

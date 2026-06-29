@@ -47,12 +47,36 @@ def estimate_tokens(messages: list[Any]) -> int:
     """
     启发式 token 估算（字符数 / 3）。
 
+    HumanMessage 含 image_ref 时仅计文字；内联 image 仅计文字 + 粗算视觉占位。
+
     @param messages 消息列表
     @return 估算 token
     """
+    from langchain_core.messages import HumanMessage
+
+    from llgraph.core.user_message_content import (
+        human_content_has_image_refs,
+        human_content_has_inline_images,
+        human_content_text_for_llm,
+    )
+
     total = 0
     for msg in messages:
         content = getattr(msg, "content", msg)
+        if isinstance(msg, HumanMessage) and isinstance(content, list):
+            text = human_content_text_for_llm(content)
+            total += len(text)
+            if human_content_has_inline_images(content):
+                n = sum(
+                    1
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "image"
+                )
+                total += n * 1500
+            continue
+        if isinstance(msg, HumanMessage) and human_content_has_image_refs(content):
+            total += len(human_content_text_for_llm(content))
+            continue
         if isinstance(content, str):
             total += len(content)
         elif isinstance(content, list):

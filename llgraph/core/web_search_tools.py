@@ -30,16 +30,20 @@ class WebSearchInput(BaseModel):
     )
 
 
-def _format_tavily_response(payload: dict) -> str:
+def _format_tavily_response(payload: dict, *, include_answer: bool) -> str:
     """
     将 Tavily 响应格式化为模型可读文本。
 
+    include_answer 且 Tavily 返回摘要时，结果列表仅保留标题与链接，不塞网页原文。
+
     @param payload Tavily search 响应
+    @param include_answer 是否已向 Tavily 请求 include_answer
     @return 多行文本
     """
     lines: list[str] = []
     answer = payload.get("answer")
-    if isinstance(answer, str) and answer.strip():
+    has_answer = isinstance(answer, str) and bool(answer.strip())
+    if has_answer:
         lines.append("## 摘要")
         lines.append(answer.strip())
         lines.append("")
@@ -60,7 +64,8 @@ def _format_tavily_response(payload: dict) -> str:
             if score is not None:
                 header += f"\n   relevance: {score}"
             lines.append(header)
-            if content:
+            # 有 Tavily 摘要时不再透传大段网页原文，降低脏数据/审核风险
+            if content and not (include_answer and has_answer):
                 lines.append(f"   {content}")
             lines.append("")
 
@@ -149,7 +154,7 @@ def _run_web_search(workspace: Path, query: str, max_results: int | None) -> str
         settings.search_depth,
         extras,
     )
-    return _format_tavily_response(payload)
+    return _format_tavily_response(payload, include_answer=settings.include_answer)
 
 
 def create_web_search_tools(workspace: Path) -> list[StructuredTool]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from llgraph.plan.state import TaskStatus
@@ -111,6 +112,36 @@ def validate_task_runnable(
         return False, f"{task_id} 当前状态为 {status}，无法执行", []
 
     return True, "", []
+
+
+def reset_task_if_empty_write_done(
+    workspace: Path,
+    plan: dict[str, Any],
+    task_id: str,
+    *,
+    plan_id: str,
+    plans_dir: str,
+) -> tuple[dict[str, Any], bool]:
+    """
+    可写 task 误标 done 且无 files_changed 时重置为 pending，便于重跑。
+
+    @return (plan, 是否重置)
+    """
+    from llgraph.plan.plan_store import load_task_result, update_task_status
+
+    task = find_task(plan, task_id)
+    if task is None:
+        return plan, False
+    if bool(task.get("readonly")):
+        return plan, False
+    if str(task.get("status") or "") != TaskStatus.DONE:
+        return plan, False
+    result = load_task_result(workspace, plan_id, task_id, plans_dir=plans_dir)
+    files = result.get("files_changed") if isinstance(result.get("files_changed"), list) else []
+    if any(str(f).strip() for f in files):
+        return plan, False
+    plan = update_task_status(dict(plan), task_id, TaskStatus.PENDING, error=None)
+    return plan, True
 
 
 def pick_forced_tasks(

@@ -41,6 +41,16 @@ class ContextSettings:
     compress_strategy: str
     compress_during_react: bool
     compress_summary_chunk_chars: int
+    dispatch_tool_chain_compress: bool
+    dispatch_keep_full_tool_messages: int
+    read_tool_result_max_chars: int
+    read_file_max_bytes: int
+    read_file_max_lines: int
+    tool_result_preview_head_lines: int
+    dispatch_dedupe_read_paths: bool
+    dispatch_min_tool_rounds: int
+    grep_context_lines: int
+    spill_hit_context_lines: int
 
 
 def is_auto_compress_strategy(strategy: str) -> bool:
@@ -96,7 +106,34 @@ CONTEXT_CONFIG_DOCS: dict[str, str] = {
     "auto_compress_ratio": "自动触发压缩的上下文占用比例阈值（auto 默认 0.85，legacy 默认 0.65）。",
     "keep_recent_turns": "legacy 策略压缩后至少保留的 user 轮数下限。",
     "incremental_tool_prune": "是否将较早 ToolMessage 超长输出替换为指针（默认 true）。",
-    "keep_recent_tool_messages": "incremental_tool_prune 保留全文 ToolMessage 条数（默认 12）。",
+    "keep_recent_tool_messages": "incremental_tool_prune 落盘会话时保留全文 ToolMessage 条数（auto 默认 4）。",
+    "dispatch_tool_chain_compress": (
+        "发往模型前是否压缩 tool 链：较早 ToolMessage 替换为指针，仅最近 N 条保留全文（默认 true）。"
+    ),
+    "dispatch_keep_full_tool_messages": (
+        "dispatch_tool_chain_compress 时出站保留全文的 ToolMessage 条数（默认 2）。"
+    ),
+    "spill_exempt_tools": "不参与落盘的工具名；默认空（read_file/read_files 超长也会落盘+指针）。",
+    "tool_result_max_chars": "grep/shell 等工具 spill 阈值（auto 默认 12000）。",
+    "read_tool_result_max_chars": (
+        "read_file/read_files 单独 spill 阈值（auto 默认 36000）；"
+        "高于 tool_result_max_chars，减少「仅尾部预览→反复 read」。"
+    ),
+    "read_file_max_bytes": (
+        "read_file/read_files 单文件磁盘读取字节上限（auto 默认 600000，约 6000 行×100 字符）；"
+        "超过需 start_line/end_line 分段。"
+    ),
+    "read_file_max_lines": (
+        "read_file/read_files 单次返回最大行数（auto 默认 6000，通用推荐区间 4000~8000 的中位）；"
+        "超出截断并提示继续 read。"
+    ),
+    "tool_result_preview_head_lines": "read 落盘时除尾部外保留的开头预览行数（auto 默认 25，含 package/import）。",
+    "dispatch_dedupe_read_paths": "出站时同路径旧 read 替换为短指针，仅保留最新一次全文（auto 默认 true）。",
+    "dispatch_min_tool_rounds": (
+        "单 user 长 ReAct 时，出站至少保留的 tool 段数；超 token 预算后裁剪更早段（auto 默认 12）。"
+    ),
+    "grep_context_lines": "grep_files / ripgrep 每条命中上下附加上下文行数（auto 默认 5）。",
+    "spill_hit_context_lines": "read 落盘时，对历史 grep/parallel 命中行在源文件 ±N 行嵌入预览（auto 默认 100）。",
 }
 
 
@@ -160,12 +197,15 @@ class SpillSettings:
 
     enabled: bool
     tool_result_max_chars: int
+    read_tool_result_max_chars: int
     tool_result_preview_lines: int
+    tool_result_preview_head_lines: int
     spill_dir: str
     spill_exempt_tools: tuple[str, ...]
+    spill_hit_context_lines: int
 
 
-_DEFAULT_SPILL_EXEMPT_TOOLS = ("read_file", "read_files")
+_DEFAULT_SPILL_EXEMPT_TOOLS: tuple[str, ...] = ()
 
 
 def _parse_spill_exempt_tools(ctx: dict) -> tuple[str, ...]:
@@ -173,13 +213,14 @@ def _parse_spill_exempt_tools(ctx: dict) -> tuple[str, ...]:
     解析不参与落盘的工具名列表。
 
     @param ctx agent.json context 段
-    @return 工具名元组
+    @return 工具名元组；未配置时默认空（read 也走 spill）
     """
-    raw = ctx.get("spill_exempt_tools", list(_DEFAULT_SPILL_EXEMPT_TOOLS))
+    if "spill_exempt_tools" not in ctx:
+        return _DEFAULT_SPILL_EXEMPT_TOOLS
+    raw = ctx.get("spill_exempt_tools")
     if not isinstance(raw, list):
         return _DEFAULT_SPILL_EXEMPT_TOOLS
-    names = tuple(str(item).strip() for item in raw if str(item).strip())
-    return names if names else _DEFAULT_SPILL_EXEMPT_TOOLS
+    return tuple(str(item).strip() for item in raw if str(item).strip())
 
 
 def resolve_context_settings(workspace: Path) -> ContextSettings:
@@ -263,11 +304,43 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     if isinstance(archive, str):
         archive = archive.strip().lower() not in ("0", "false", "no")
 
-    max_tool_chars = ctx.get("tool_result_max_chars", 40_000)
+    default_max_tool_chars = 12_000 if is_auto_compress_strategy(compress_strategy) else 40_000
+    max_tool_chars = ctx.get("tool_result_max_chars", default_max_tool_chars)
     try:
         max_tool_chars = max(500, int(max_tool_chars))
     except (TypeError, ValueError):
-        max_tool_chars = 40_000
+        max_tool_chars = default_max_tool_chars
+
+    default_read_max = 36_000 if is_auto_compress_strategy(compress_strategy) else max_tool_chars
+    read_max_raw = ctx.get("read_tool_result_max_chars", default_read_max)
+    try:
+        read_max_chars = max(max_tool_chars, int(read_max_raw))
+    except (TypeError, ValueError):
+        read_max_chars = default_read_max
+
+    default_read_file_bytes = (
+        600_000 if is_auto_compress_strategy(compress_strategy) else 200_000
+    )
+    read_file_bytes_raw = ctx.get("read_file_max_bytes", default_read_file_bytes)
+    try:
+        read_file_max_bytes = max(50_000, int(read_file_bytes_raw))
+    except (TypeError, ValueError):
+        read_file_max_bytes = default_read_file_bytes
+
+    default_read_file_lines = (
+        6000 if is_auto_compress_strategy(compress_strategy) else 2000
+    )
+    read_file_lines_raw = ctx.get("read_file_max_lines", default_read_file_lines)
+    try:
+        read_file_max_lines = max(200, int(read_file_lines_raw))
+    except (TypeError, ValueError):
+        read_file_max_lines = default_read_file_lines
+
+    preview_head = ctx.get("tool_result_preview_head_lines", 25)
+    try:
+        preview_head = max(0, min(80, int(preview_head)))
+    except (TypeError, ValueError):
+        preview_head = 25
 
     preview_lines = ctx.get("tool_result_preview_lines", 40)
     try:
@@ -305,11 +378,52 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     if isinstance(incremental_prune, str):
         incremental_prune = incremental_prune.strip().lower() not in ("0", "false", "no")
 
-    keep_tools = ctx.get("keep_recent_tool_messages", 12)
+    default_keep_tools = 4 if is_auto_compress_strategy(compress_strategy) else 12
+    keep_tools = ctx.get("keep_recent_tool_messages", default_keep_tools)
     try:
         keep_tools = max(2, int(keep_tools))
     except (TypeError, ValueError):
-        keep_tools = 12
+        keep_tools = default_keep_tools
+
+    dispatch_chain_compress = ctx.get("dispatch_tool_chain_compress", True)
+    if isinstance(dispatch_chain_compress, str):
+        dispatch_chain_compress = dispatch_chain_compress.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+        )
+
+    default_dispatch_keep_tools = 4 if is_auto_compress_strategy(compress_strategy) else 2
+    dispatch_keep_tools = ctx.get("dispatch_keep_full_tool_messages", default_dispatch_keep_tools)
+    try:
+        dispatch_keep_tools = max(1, int(dispatch_keep_tools))
+    except (TypeError, ValueError):
+        dispatch_keep_tools = default_dispatch_keep_tools
+
+    dedupe_reads = ctx.get("dispatch_dedupe_read_paths", is_auto_compress_strategy(compress_strategy))
+    if isinstance(dedupe_reads, str):
+        dispatch_dedupe_read_paths = dedupe_reads.strip().lower() not in ("0", "false", "no")
+    else:
+        dispatch_dedupe_read_paths = bool(dedupe_reads)
+
+    default_min_tool_rounds = 12 if is_auto_compress_strategy(compress_strategy) else 24
+    min_tool_rounds_raw = ctx.get("dispatch_min_tool_rounds", default_min_tool_rounds)
+    try:
+        dispatch_min_tool_rounds = max(4, int(min_tool_rounds_raw))
+    except (TypeError, ValueError):
+        dispatch_min_tool_rounds = default_min_tool_rounds
+
+    grep_ctx_raw = ctx.get("grep_context_lines", 5)
+    try:
+        grep_context_lines = max(0, min(20, int(grep_ctx_raw)))
+    except (TypeError, ValueError):
+        grep_context_lines = 5
+
+    spill_hit_raw = ctx.get("spill_hit_context_lines", 100)
+    try:
+        spill_hit_context_lines = max(0, min(300, int(spill_hit_raw)))
+    except (TypeError, ValueError):
+        spill_hit_context_lines = 100
 
     trigger_cap: int | None = None
     trigger_raw = ctx.get("compress_trigger_max_tokens")
@@ -337,11 +451,12 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     except (TypeError, ValueError):
         dispatch_keep = default_dispatch_keep
 
-    dispatch_min = ctx.get("dispatch_min_user_turns", 2)
+    default_dispatch_min = 1 if is_auto_compress_strategy(compress_strategy) else 2
+    dispatch_min = ctx.get("dispatch_min_user_turns", default_dispatch_min)
     try:
         dispatch_min = max(1, min(16, int(dispatch_min)))
     except (TypeError, ValueError):
-        dispatch_min = 2
+        dispatch_min = default_dispatch_min
 
     dispatch_max = ctx.get("dispatch_max_user_turns", 8)
     try:
@@ -378,7 +493,11 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         compress_retrieval_top_k=retrieval_top_k,
         compress_tool_mask_max_chars=mask_chars,
         tool_result_max_chars=max_tool_chars,
+        read_tool_result_max_chars=read_max_chars,
+        read_file_max_bytes=read_file_max_bytes,
+        read_file_max_lines=read_file_max_lines,
         tool_result_preview_lines=preview_lines,
+        tool_result_preview_head_lines=preview_head,
         spill_dir=spill_dir,
         spill_enabled=bool(spill_on),
         spill_exempt_tools=spill_exempt_tools,
@@ -397,6 +516,12 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         compress_strategy=compress_strategy,
         compress_during_react=compress_during_react,
         compress_summary_chunk_chars=compress_summary_chunk_chars,
+        dispatch_tool_chain_compress=bool(dispatch_chain_compress),
+        dispatch_keep_full_tool_messages=dispatch_keep_tools,
+        dispatch_dedupe_read_paths=dispatch_dedupe_read_paths,
+        dispatch_min_tool_rounds=dispatch_min_tool_rounds,
+        grep_context_lines=grep_context_lines,
+        spill_hit_context_lines=spill_hit_context_lines,
     )
 
 
@@ -411,7 +536,10 @@ def resolve_spill_settings(workspace: Path) -> SpillSettings:
     return SpillSettings(
         enabled=ctx.spill_enabled,
         tool_result_max_chars=ctx.tool_result_max_chars,
+        read_tool_result_max_chars=ctx.read_tool_result_max_chars,
         tool_result_preview_lines=ctx.tool_result_preview_lines,
+        tool_result_preview_head_lines=ctx.tool_result_preview_head_lines,
         spill_dir=ctx.spill_dir,
         spill_exempt_tools=ctx.spill_exempt_tools,
+        spill_hit_context_lines=ctx.spill_hit_context_lines,
     )

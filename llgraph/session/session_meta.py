@@ -8,9 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from llgraph.session.jsonl_read import open_jsonl_for_read
 from llgraph.session.user_storage import session_messages_path, session_thread_dir, user_sessions_root
 
-_TITLE_MAX_LEN = 30
+_TITLE_DISPLAY_MAX_LEN = 24
+_TITLE_FULL_MAX_LEN = 30
 _TITLE_SOURCE_MANUAL = "manual"
 _TITLE_SOURCE_AUTO = "auto"
 _TITLE_SOURCE_FALLBACK = "fallback"
@@ -28,6 +30,12 @@ _SKIP_AUTO_TITLE_MESSAGES = frozenset({
     "/sessions",
     "/session",
 })
+
+_INJECTED_USER_BLOCK_PATTERNS: tuple[tuple[str, int], ...] = (
+    (r"<workspace-context>[\s\S]*?</workspace-context>\s*", re.IGNORECASE),
+    (r"<session-manifest>[\s\S]*?</session-manifest>\s*", re.IGNORECASE),
+    (r"<custom-command[\s\S]*?</custom-command>\s*", re.IGNORECASE),
+)
 
 
 def session_meta_json_path(workspace: Path, thread_id: str) -> Path:
@@ -86,11 +94,57 @@ def save_session_meta(
         pass
 
 
-def normalize_session_title(text: str) -> str:
+def touch_session_activity(workspace: Path, thread_id: str, **extra: Any) -> None:
     """
-    规范化标题：去空白、压平换行、截断至 30 字内。
+    刷新 meta.updated_at，供 Web 侧栏按最近活动排序（发消息、Agent 轮次结束等）。
+
+    @param workspace 工作区根
+    @param thread_id 会话 thread
+    @param extra 可选合并字段
+    """
+    if not thread_id.strip():
+        return
+    save_session_meta(workspace, thread_id, dict(extra))
+
+
+def strip_injected_context_from_user_message(text: str) -> str:
+    """
+    去掉 user 消息中的 workspace-context / manifest 等注入块（标题生成用）。
+
+    @param text 原始 user 消息
+    @return 用户可见正文
+    """
+    out = str(text or "").strip()
+    if not out:
+        return ""
+    for pattern, flags in _INJECTED_USER_BLOCK_PATTERNS:
+        out = re.sub(pattern, "", out, flags=flags)
+    return out.strip()
+
+
+def _looks_like_injected_title_fragment(text: str) -> bool:
+    """标题是否像 XML 注入块残片（如 `<workspace-c`）。"""
+    t = str(text or "").strip().lower()
+    return (
+        t.startswith("<workspace")
+        or t.startswith("<session-manifest")
+        or t.startswith("<custom-command")
+        or t.startswith("<")
+    )
+
+
+def normalize_session_title(
+    text: str,
+    *,
+    max_len: int = _TITLE_DISPLAY_MAX_LEN,
+    use_ellipsis: bool = True,
+) -> str:
+    """
+    规范化标题：去空白、压平换行、截断至 max_len。
 
     @param text 原始文本
+    @param max_len 最大长度
+    @param use_ellipsis 超长时是否追加 …
     @return 可用标题；过短返回空串
     """
     if not text or not str(text).strip():
@@ -98,9 +152,103 @@ def normalize_session_title(text: str) -> str:
     line = str(text).strip().splitlines()[0].strip()
     line = re.sub(r"\s+", " ", line)
     line = line.strip("#").strip()
-    if len(line) > _TITLE_MAX_LEN:
-        line = line[: _TITLE_MAX_LEN - 1].rstrip() + "…"
+    if len(line) > max_len:
+        if use_ellipsis and max_len > 1:
+            line = line[: max_len - 1].rstrip() + "…"
+        else:
+            line = line[:max_len].rstrip()
     return line if len(line) >= 2 else ""
+
+
+def format_display_session_title(full_title: str) -> str:
+    """
+    侧栏/列表用的短标题（≤24 字）。
+
+    @param full_title 完整标题
+    @return 展示标题
+    """
+    return normalize_session_title(
+        full_title,
+        max_len=_TITLE_DISPLAY_MAX_LEN,
+        use_ellipsis=True,
+    )
+
+
+def extract_title_candidate(text: str) -> str:
+    """
+    从首条用户消息提取标题候选（首句/去代码块/简化 curl 等）。
+
+    @param text 用户消息
+    @return 候选文本；无法提取返回空串
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    cleaned = strip_injected_context_from_user_message(raw)
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"```[\s\S]*?```", " ", cleaned)
+    cleaned = re.sub(r"`[^`\n]+`", " ", cleaned)
+    line = cleaned.splitlines()[0].strip()
+    line = re.sub(r"\s+", " ", line).strip("#").strip()
+    if not line or _looks_like_injected_title_fragment(line):
+        return ""
+
+    curl_match = re.match(
+        r"curl\b.+?(https?://[^\s'\"]+)",
+        line,
+        flags=re.IGNORECASE,
+    )
+    if curl_match:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(curl_match.group(1))
+        path = (parsed.path or "").strip("/")
+        if path:
+            line = path.split("/")[-1] or path
+        elif parsed.netloc:
+            line = parsed.netloc
+
+    if line.startswith("/") and " " not in line[:96]:
+        segments = [s for s in line.strip("/").split("/") if s]
+        if segments:
+            line = segments[-1]
+
+    for sep in ("。", "！", "？", ".", "!", "?"):
+        if sep in line:
+            line = line.split(sep, 1)[0].strip()
+            break
+
+    return line
+
+
+def disambiguate_session_titles(entries: list[tuple[str, str]]) -> list[str]:
+    """
+    列表展示时，为重复标题追加 thread 短后缀以便区分。
+
+    @param entries (thread_id, title) 列表
+    @return 展示用标题（与 entries 同序）
+    """
+    from collections import Counter
+
+    titles = [title for _, title in entries]
+    counts = Counter(titles)
+    out: list[str] = []
+    for thread_id, title in entries:
+        if counts[title] <= 1:
+            out.append(title)
+            continue
+        suffix = short_thread_suffix(thread_id)
+        tag = f" · {suffix}"
+        room = _TITLE_DISPLAY_MAX_LEN - len(tag)
+        if room < 4:
+            out.append(f"{title[:8]}…{tag}")
+            continue
+        base = title
+        if len(base) > room:
+            base = base[: room - 1].rstrip() + "…"
+        out.append(base + tag)
+    return out
 
 
 def should_use_message_for_auto_title(text: str) -> bool:
@@ -110,7 +258,7 @@ def should_use_message_for_auto_title(text: str) -> bool:
     @param text 用户消息
     @return 是否采用
     """
-    stripped = str(text or "").strip()
+    stripped = strip_injected_context_from_user_message(text)
     if not stripped:
         return False
     from llgraph.terminal.keys import is_exit_command
@@ -122,7 +270,29 @@ def should_use_message_for_auto_title(text: str) -> bool:
         return False
     if lower.startswith("/") and len(stripped) < 48:
         return False
+    if _looks_like_injected_title_fragment(stripped.splitlines()[0]):
+        return False
     return len(stripped) >= 2
+
+
+def suggest_full_title_from_text(text: str) -> str:
+    """
+    从用户首条消息生成完整标题（编辑/悬停用，≤30 字）。
+
+    @param text 用户消息
+    @return 建议标题
+    """
+    if not should_use_message_for_auto_title(text):
+        return ""
+    visible = strip_injected_context_from_user_message(text)
+    candidate = extract_title_candidate(visible or text)
+    if candidate and _looks_like_injected_title_fragment(candidate):
+        candidate = ""
+    return normalize_session_title(
+        candidate or visible or text,
+        max_len=_TITLE_FULL_MAX_LEN,
+        use_ellipsis=False,
+    )
 
 
 def suggest_title_from_text(text: str) -> str:
@@ -132,9 +302,8 @@ def suggest_title_from_text(text: str) -> str:
     @param text 用户消息
     @return 建议标题
     """
-    if not should_use_message_for_auto_title(text):
-        return ""
-    return normalize_session_title(text)
+    full = suggest_full_title_from_text(text)
+    return format_display_session_title(full) if full else ""
 
 
 def short_thread_suffix(thread_id: str) -> str:
@@ -155,7 +324,7 @@ def default_session_title(thread_id: str) -> str:
     无对话内容时的默认标题。
 
     @param thread_id 线程 ID
-    @return 默认标题（≤30 字）
+    @return 默认标题（≤24 字）
     """
     suffix = short_thread_suffix(thread_id)
     return normalize_session_title(f"会话 {suffix}") or f"会话 {suffix[:8]}"
@@ -192,7 +361,11 @@ def set_session_title(
     @param source manual 不会被自动覆盖；auto/fallback 可被首条用户消息覆盖
     @return (是否成功, 提示)
     """
-    normalized = normalize_session_title(title)
+    normalized = normalize_session_title(
+        title,
+        max_len=_TITLE_FULL_MAX_LEN,
+        use_ellipsis=False,
+    )
     if not normalized:
         return False, "标题至少需要 2 个有效字符。"
     save_session_meta(
@@ -226,7 +399,7 @@ def _peek_first_human_title_from_jsonl_file(path: Path) -> str | None:
     if not path.is_file():
         return None
     try:
-        with path.open(encoding="utf-8") as handle:
+        with open_jsonl_for_read(path) as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
@@ -235,10 +408,10 @@ def _peek_first_human_title_from_jsonl_file(path: Path) -> str | None:
                 content = _extract_human_content_from_jsonl_row(row)
                 if not content.strip():
                     continue
-                title = suggest_title_from_text(content)
+                title = suggest_full_title_from_text(content)
                 if title:
                     return title
-                break
+                continue
     except (OSError, json.JSONDecodeError):
         return None
     return None
@@ -284,12 +457,12 @@ def _peek_title_from_anchor(workspace: Path, thread_id: str) -> str | None:
     if not isinstance(sections, dict):
         goal = data.get("session_goal") if isinstance(data, dict) else None
         if goal:
-            return suggest_title_from_text(str(goal))
+            return suggest_full_title_from_text(str(goal))
         return None
     goal = sections.get("session_goal") or ""
     if goal:
         first = str(goal).strip().splitlines()[0]
-        return suggest_title_from_text(first)
+        return suggest_full_title_from_text(first)
     return None
 
 
@@ -404,6 +577,51 @@ def backfill_session_titles(workspace: Path, thread_ids: list[str]) -> int:
     return count
 
 
+def _sync_plan_json_title_after_auto(
+    workspace: Path,
+    thread_id: str,
+    title: str,
+) -> None:
+    """
+    Plan 会话自动标题写入后，同步 plan.json（替换 Plan {plan_id} 占位）。
+
+    @param workspace 工作区根
+    @param thread_id plan thread
+    @param title 自动标题
+    """
+    meta = load_session_meta(workspace, thread_id)
+    is_plan = meta.get("session_kind") == "plan" or thread_id.startswith("plan-")
+    if not is_plan:
+        return
+    plan_id = str(meta.get("plan_id") or "").strip()
+    if not plan_id:
+        return
+    from llgraph.plan.config import resolve_plan_settings
+    from llgraph.plan.plan_store import is_placeholder_plan_title, load_plan, save_plan
+
+    settings = resolve_plan_settings(workspace)
+    plan = load_plan(workspace, plan_id, plans_dir=settings.plans_dir)
+    if not plan:
+        return
+    current = str(plan.get("title") or "")
+    if not is_placeholder_plan_title(current, plan_id):
+        return
+    plan["title"] = title
+    save_plan(workspace, plan, plans_dir=settings.plans_dir)
+
+
+def sync_plan_json_title_from_session_meta(workspace: Path, thread_id: str) -> None:
+    """
+    将 meta 中已有自动标题同步到 plan.json（plan 文件晚于 meta 创建时补写）。
+
+    @param workspace 工作区根
+    @param thread_id plan thread
+    """
+    title = get_session_title(workspace, thread_id)
+    if title:
+        _sync_plan_json_title_after_auto(workspace, thread_id, title)
+
+
 def ensure_session_title_auto(
     workspace: Path,
     thread_id: str,
@@ -411,6 +629,8 @@ def ensure_session_title_auto(
 ) -> str | None:
     """
     若尚无标题且非手动锁定，用首条用户消息自动生成标题。
+
+    已有任意非空标题（含 auto/fallback）时不再覆盖。
 
     @param workspace 工作区根
     @param thread_id 线程 ID
@@ -420,27 +640,65 @@ def ensure_session_title_auto(
     meta = load_session_meta(workspace, thread_id)
     if meta.get("title_source") == _TITLE_SOURCE_MANUAL:
         return None
+    existing = get_session_title(workspace, thread_id)
+    if existing and str(existing).strip():
+        return None
     if not should_use_message_for_auto_title(user_message):
         return None
-    suggested = suggest_title_from_text(user_message)
+    suggested = suggest_full_title_from_text(user_message)
     if not suggested:
         return None
     set_session_title(workspace, thread_id, suggested, source="auto")
+    _sync_plan_json_title_after_auto(workspace, thread_id, suggested)
     return suggested
+
+
+def resolve_session_full_title(workspace: Path, thread_id: str) -> str:
+    """
+    完整会话标题（编辑/悬停/存储用，优先首条用户消息全文摘要）。
+
+    @param workspace 工作区根
+    @param thread_id 线程 ID
+    @return 完整标题
+    """
+    meta = load_session_meta(workspace, thread_id)
+    source = meta.get("title_source")
+    stored = get_session_title(workspace, thread_id)
+    if source == _TITLE_SOURCE_MANUAL and stored:
+        return str(stored).strip()
+
+    from_msg = peek_title_from_messages_jsonl(workspace, thread_id)
+    if from_msg:
+        return from_msg
+
+    for fn in (
+        _peek_title_from_archive_jsonl,
+        _peek_title_from_anchor,
+        _peek_title_from_edits,
+        _peek_title_from_started_at,
+    ):
+        title = fn(workspace, thread_id)
+        if title:
+            return str(title).strip()
+
+    if stored and not _looks_like_injected_title_fragment(str(stored)):
+        return str(stored).strip()
+
+    inferred = infer_session_title(workspace, thread_id)
+    if inferred:
+        return str(inferred).strip()
+
+    return default_session_title(thread_id) or "未命名会话"
 
 
 def resolve_session_display_title(workspace: Path, thread_id: str) -> str:
     """
-    列表展示用标题：meta → 推断 → 默认「会话 xxxxxxxx」。
+    列表展示用标题：完整标题截断至 ≤24 字。
 
     @param workspace 工作区根
     @param thread_id 线程 ID
     @return 展示标题
     """
-    stored = get_session_title(workspace, thread_id)
-    if stored:
-        return stored
-    inferred = infer_session_title(workspace, thread_id)
-    if inferred:
-        return inferred
-    return "未命名会话"
+    full = resolve_session_full_title(workspace, thread_id)
+    short = format_display_session_title(full)
+    return short or "未命名会话"

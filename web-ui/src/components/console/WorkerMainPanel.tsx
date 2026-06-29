@@ -1,3 +1,4 @@
+import type { TraceStep } from '../../types/trace';
 import type { ChatMessage } from './ChatThread';
 import ChatThread from './ChatThread';
 
@@ -15,10 +16,14 @@ interface Props {
   taskId: string;
   taskTitle: string;
   taskStatus: string;
+  taskReadonly?: boolean;
   messages: ChatMessage[];
   traceLines: string;
+  liveTraceSteps?: TraceStep[];
   busy: boolean;
   onBack: () => void;
+  onStop?: () => void;
+  onRun?: () => void;
 }
 
 export default function WorkerMainPanel({
@@ -26,13 +31,18 @@ export default function WorkerMainPanel({
   taskId,
   taskTitle,
   taskStatus,
+  taskReadonly = false,
   messages,
   traceLines,
+  liveTraceSteps = [],
   busy,
   onBack,
+  onStop,
+  onRun,
 }: Props) {
   const statusClass = `badge status-${taskStatus}`;
   const statusText = STATUS_LABEL[taskStatus] || taskStatus;
+  const modeLabel = taskReadonly ? '只读' : '可写';
 
   return (
     <div className="cursor-worker-main">
@@ -47,9 +57,20 @@ export default function WorkerMainPanel({
             {taskTitle && taskTitle !== taskId ? ` · ${taskTitle}` : ''}
           </h2>
         </div>
+        <span className={`badge${taskReadonly ? '' : ' badge-running'}`}>{modeLabel}</span>
         <span className={statusClass}>{statusText}</span>
         {busy && taskStatus === 'running' && (
           <span className="badge badge-running">刷新中…</span>
+        )}
+        {taskStatus === 'running' && onStop && (
+          <button type="button" className="cursor-btn-danger cursor-btn-sm" onClick={onStop}>
+            停止
+          </button>
+        )}
+        {(taskStatus === 'pending' || taskStatus === 'failed' || taskStatus === 'skipped') && onRun && (
+          <button type="button" className="cursor-btn-ghost cursor-btn-sm" onClick={onRun}>
+            执行
+          </button>
         )}
       </div>
 
@@ -57,13 +78,12 @@ export default function WorkerMainPanel({
         <ChatThread
           messages={messages}
           liveTraceText={traceLines}
-          liveTraceSteps={[]}
-          liveThinkingText=""
+          liveTraceSteps={liveTraceSteps}
           streamText=""
           busy={busy && taskStatus === 'running'}
           traceMode="steps"
         />
-        {messages.length === 0 && !traceLines.trim() && (
+        {messages.length === 0 && !traceLines.trim() && liveTraceSteps.length === 0 && (
           <div className="cursor-worker-main-empty">
             {taskStatus === 'pending'
               ? '任务尚未开始，等待 Plan 调度…'

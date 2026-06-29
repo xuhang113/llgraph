@@ -5,6 +5,7 @@ import {
   type FileChangesSummary,
   type PlanFileChangesSummary,
 } from '../../api/client';
+import { useAppDialog } from '../AppDialog';
 
 export type FileChangesMode = 'agent' | 'plan' | 'worker';
 
@@ -38,6 +39,7 @@ export default function FileChangesPanel({
   onStop,
   onChangesUpdated,
 }: Props) {
+  const { alert, confirm } = useAppDialog();
   const [expanded, setExpanded] = useState(false);
   const [agentChanges, setAgentChanges] = useState<FileChangesSummary | null>(null);
   const [planChanges, setPlanChanges] = useState<PlanFileChangesSummary | null>(null);
@@ -103,7 +105,7 @@ export default function FileChangesPanel({
     }
   };
 
-  const applyUndoResult = (
+  const applyUndoResult = async (
     res: {
       ok: boolean;
       summary: { restored: number; deleted: number; skipped: number; failed: number };
@@ -120,15 +122,21 @@ export default function FileChangesPanel({
       setPlanChanges(res.plan_changes);
     }
     const { restored, deleted, skipped, failed } = res.summary;
-    if (failed > 0 || skipped > 0) {
+    const effective = restored + deleted;
+    if (failed > 0 || skipped > 0 || effective === 0) {
       const lines =
-        res.results
-          ?.filter((item) => item.action === 'failed' || item.action === 'skipped')
-          .map((item) => `${item.rel_path}: ${item.detail || item.action}`) ?? [];
-      window.alert(
-        [`${scope}回滚未完成（成功 ${restored + deleted}，跳过 ${skipped}，失败 ${failed}）。`, ...lines].join(
-          '\n',
-        ),
+        res.results?.map((item) => `${item.rel_path}: ${item.detail || item.action}`) ?? [];
+      await alert(
+        effective === 0 && failed === 0 && skipped === 0
+          ? [
+              `${scope}回滚未生效：没有文件被还原或删除。`,
+              '账本路径与磁盘不一致时会出现此情况（例如 Agent 用 shell 写到了别的路径）。',
+              ...lines,
+            ].join('\n')
+          : [
+              `${scope}回滚未完成（成功 ${effective}，跳过 ${skipped}，失败 ${failed}）。`,
+              ...lines,
+            ].join('\n'),
       );
       return;
     }
@@ -154,33 +162,40 @@ export default function FileChangesPanel({
         : mode === 'worker' && taskId
           ? `Work ${taskId}`
           : '本会话';
-    if (!window.confirm(`确定回滚 ${scope} 的所有文件改动？\n将还原快照或删除本会话新建的文件。`)) {
+    if (
+      !(await confirm({
+        title: '回滚文件改动',
+        message: `确定回滚 ${scope} 的所有文件改动？\n将还原快照或删除本会话新建的文件。`,
+        confirmLabel: '回滚',
+        danger: true,
+      }))
+    ) {
       return;
     }
     setActionBusy(true);
     try {
       if (mode === 'plan' && planThreadId) {
         const res = await api.planUndo(slug, planThreadId, 'all');
-        applyUndoResult({ ...res, changes: undefined }, scope);
+        await applyUndoResult({ ...res, changes: undefined }, scope);
         if (res.plan_changes) {
           setPlanChanges(res.plan_changes);
         }
       } else if (mode === 'worker' && planThreadId && taskId) {
         const res = await api.planUndo(slug, planThreadId, 'all', taskId);
-        applyUndoResult({ ...res, changes: undefined }, scope);
+        await applyUndoResult({ ...res, changes: undefined }, scope);
         if (res.plan_changes) {
           setPlanChanges(res.plan_changes);
         }
       } else {
         const res = await api.undoFiles(slug, sessionThreadId, 'all');
-        applyUndoResult(res, scope);
+        await applyUndoResult(res, scope);
       }
       setSelectedPath(null);
       setDiffText('');
       await refresh();
       onChangesUpdated?.();
     } catch (err) {
-      window.alert(err instanceof Error ? err.message : String(err));
+      await alert(err instanceof Error ? err.message : String(err));
     } finally {
       setActionBusy(false);
     }
@@ -190,7 +205,7 @@ export default function FileChangesPanel({
     if (!slug) {
       return;
     }
-    if (!window.confirm(`回滚文件 ${path}？`)) {
+    if (!(await confirm({ message: `回滚文件 ${path}？`, confirmLabel: '回滚', danger: true }))) {
       return;
     }
     setActionBusy(true);
@@ -199,20 +214,20 @@ export default function FileChangesPanel({
         const item = flatItems.find((p) => p.path === path);
         if (item?.task_id) {
           const res = await api.planUndo(slug, planThreadId, path, item.task_id);
-          applyUndoResult({ ...res, changes: undefined }, path);
+          await applyUndoResult({ ...res, changes: undefined }, path);
           if (res.plan_changes) {
             setPlanChanges(res.plan_changes);
           }
         }
       } else if (mode === 'worker' && planThreadId && taskId) {
         const res = await api.planUndo(slug, planThreadId, path, taskId);
-        applyUndoResult({ ...res, changes: undefined }, path);
+        await applyUndoResult({ ...res, changes: undefined }, path);
         if (res.plan_changes) {
           setPlanChanges(res.plan_changes);
         }
       } else {
         const res = await api.undoFiles(slug, threadId, path);
-        applyUndoResult(res, path);
+        await applyUndoResult(res, path);
       }
       if (selectedPath === path) {
         setSelectedPath(null);
@@ -221,7 +236,7 @@ export default function FileChangesPanel({
       await refresh();
       onChangesUpdated?.();
     } catch (err) {
-      window.alert(err instanceof Error ? err.message : String(err));
+      await alert(err instanceof Error ? err.message : String(err));
     } finally {
       setActionBusy(false);
     }
@@ -359,7 +374,13 @@ export default function FileChangesPanel({
                       if (!slug || !planThreadId) {
                         return;
                       }
-                      if (!window.confirm(`回滚 Work ${group.task_id} 的全部文件改动？`)) {
+                      if (
+                        !(await confirm({
+                          message: `回滚 Work ${group.task_id} 的全部文件改动？`,
+                          confirmLabel: '回滚',
+                          danger: true,
+                        }))
+                      ) {
                         return;
                       }
                       setActionBusy(true);
@@ -368,7 +389,7 @@ export default function FileChangesPanel({
                         await refresh();
                         onChangesUpdated?.();
                       } catch (err) {
-                        window.alert(err instanceof Error ? err.message : String(err));
+                        await alert(err instanceof Error ? err.message : String(err));
                       } finally {
                         setActionBusy(false);
                       }

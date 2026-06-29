@@ -1,10 +1,12 @@
-import type { TraceStep } from '../../types/trace';
-import { partitionTraceMiscLines } from '../../types/trace';
+import type { TraceStep, TraceTurn } from '../../types/trace';
+import { filterTraceMiscWhenSteps, partitionTraceMiscLines } from '../../types/trace';
 import TraceStepList from './TraceStepList';
+import TraceTurnList from './TraceTurnList';
 
 interface Props {
   text: string;
   steps?: TraceStep[];
+  turns?: TraceTurn[];
   liveThinking?: string;
   /** 进行中：默认展开 */
   live?: boolean;
@@ -28,22 +30,26 @@ function miscLineClass(line: string): string {
   return 'cursor-trace-misc';
 }
 
-export default function TraceFold({ text, steps = [], liveThinking = '', live = false }: Props) {
+export default function TraceFold({ text, steps = [], turns = [], liveThinking = '', live = false }: Props) {
   const miscLines = partitionTraceMiscLines(text.split('\n'));
   const stepCount = steps.length;
-  const miscCount = miscLines.length;
+  const turnCount = turns.length;
+  const turnStepCount = turns.reduce((sum, turn) => sum + turn.steps.length, 0);
+  const displayMisc = filterTraceMiscWhenSteps(miscLines, stepCount);
+  const miscCount = displayMisc.length;
   const thinkingChars = liveThinking.trim().length;
-  const totalHint = stepCount + miscCount + (thinkingChars > 0 ? 1 : 0);
+  const totalSteps = turnCount > 0 ? turnStepCount : stepCount;
+  const totalHint = totalSteps + miscCount + (thinkingChars > 0 ? 1 : 0);
 
   const summary = live
     ? `▶ 执行过程${
         totalHint > 0
-          ? `（${thinkingChars > 0 ? `thinking ${thinkingChars} 字` : stepCount > 0 ? `${stepCount} 步` : `${miscCount} 行`}）`
+          ? `（${thinkingChars > 0 ? `thinking ${thinkingChars} 字` : totalSteps > 0 ? `${totalSteps} 步` : `${miscCount} 行`}）`
           : '…'
       }`
-    : `▶ Trace${totalHint > 0 ? `（${stepCount > 0 ? `${stepCount} 步` : `${miscCount} 行`}，点击展开）` : ''}`;
+    : `▶ Trace${totalHint > 0 ? `（${totalSteps > 0 ? `${totalSteps} 步` : `${miscCount} 行`}，点击展开）` : ''}`;
 
-  const hasStructured = stepCount > 0 || miscCount > 0 || thinkingChars > 0;
+  const hasStructured = totalSteps > 0 || miscCount > 0 || thinkingChars > 0;
   const showRawFallback = !stepCount && text.trim();
   const thinkingPreview =
     thinkingChars > THINKING_PREVIEW_CHARS
@@ -62,12 +68,25 @@ export default function TraceFold({ text, steps = [], liveThinking = '', live = 
             <pre className="cursor-trace-thinking-body">{thinkingPreview}</pre>
           </details>
         )}
-        {miscLines.map((line, index) => (
-          <div key={index} className={miscLineClass(line)}>
-            {line}
+        {displayMisc.length > 0 && (
+          <div className="cursor-trace-misc-block">
+            {displayMisc.map((line, index) => (
+              <div key={index} className={miscLineClass(line)}>
+                {line}
+              </div>
+            ))}
           </div>
-        ))}
-        <TraceStepList steps={steps} defaultOpenLast={live} />
+        )}
+        {turnCount > 0 ? (
+          <TraceTurnList turns={turns} defaultOpenLast={live} />
+        ) : (
+          stepCount > 0 && (
+            <div className="cursor-trace-steps">
+              <div className="cursor-trace-steps-label">步骤（可展开详情）</div>
+              <TraceStepList steps={steps} defaultOpenLast={live} />
+            </div>
+          )
+        )}
         {showRawFallback && !hasStructured && (
           <pre className="cursor-trace-fold-body">{text}</pre>
         )}

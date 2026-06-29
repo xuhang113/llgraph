@@ -93,14 +93,16 @@ def _infer_node_statuses(
             statuses[key] = NodeStatus.DONE
     elif phase == PlanPhase.CANCELLED:
         statuses["confirm"] = NodeStatus.FAILED
-    if current_node == "planner":
-        statuses["planner"] = NodeStatus.RUNNING
-    if current_node == "confirm":
-        statuses["confirm"] = NodeStatus.WAITING
-    if current_node == "supervisor":
-        statuses["supervisor"] = NodeStatus.RUNNING
-    if current_node == "synthesize":
-        statuses["synthesize"] = NodeStatus.RUNNING
+    if phase not in (PlanPhase.COMPLETED, PlanPhase.CANCELLED):
+        if current_node == "planner":
+            statuses["planner"] = NodeStatus.RUNNING
+        if current_node == "confirm":
+            statuses["confirm"] = NodeStatus.WAITING
+        if current_node == "supervisor":
+            statuses["supervisor"] = NodeStatus.RUNNING
+        if current_node == "synthesize":
+            statuses["supervisor"] = NodeStatus.DONE
+            statuses["synthesize"] = NodeStatus.RUNNING
     return statuses
 
 

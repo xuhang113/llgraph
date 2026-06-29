@@ -180,6 +180,40 @@ def _apply_kimi_tool_assistant_fields(
     )
 
 
+def _ai_message_has_persisted_thinking(msg: AIMessage | None) -> bool:
+    """
+    是否含可注入网关的非占位 thinking 文本。
+
+    @param msg assistant 消息
+    @return 是否有 persisted thinking
+    """
+    if msg is None:
+        return False
+    reasoning = resolve_kimi_reasoning_content(msg)
+    return bool(reasoning.strip()) and reasoning != _REASONING_PLACEHOLDER
+
+
+def _formatted_assistant_needs_thinking_inject(
+    block: dict[str, Any],
+    source: AIMessage | None,
+) -> bool:
+    """
+    判断是否应为 thinking-only assistant 注入 reasoning。
+
+    @param block formatted assistant
+    @param source 对应 LangChain AIMessage
+    @return 是否注入
+    """
+    if not _ai_message_has_persisted_thinking(source):
+        return False
+    if _formatted_assistant_has_tool_use(block):
+        return False
+    existing = block.get("reasoning_content")
+    if isinstance(existing, str) and existing.strip():
+        return False
+    return True
+
+
 def inject_reasoning_into_formatted_messages(
     source_messages: list[BaseMessage],
     formatted_messages: list[dict[str, Any]],
@@ -189,41 +223,49 @@ def inject_reasoning_into_formatted_messages(
     """
     为 formatted assistant 消息补上 reasoning_content（可选 content.thinking）。
 
+    tool 轮与 thinking-only 续跑轮均会注入（后者用于 Think step 历史回传）。
+
     @param source_messages 原始 LangChain 消息（出站修链后）
     @param formatted_messages Anthropic 格式 messages
     @param include_thinking_block 是否补 content.thinking（Kimi 必填）
     @return 注入条数
     """
-    tool_ai_messages = [
-        msg
-        for msg in source_messages
-        if isinstance(msg, AIMessage) and ai_message_has_tool_calls(msg)
-    ]
-
+    source_ais = [msg for msg in source_messages if isinstance(msg, AIMessage)]
     ai_idx = 0
     injected = 0
     for block in formatted_messages:
         if block.get("role") != "assistant":
             continue
-        if not _formatted_assistant_has_tool_use(block):
-            continue
-        source = (
-            tool_ai_messages[ai_idx]
-            if ai_idx < len(tool_ai_messages)
-            else None
-        )
+        source = source_ais[ai_idx] if ai_idx < len(source_ais) else None
         ai_idx += 1
 
-        existing = block.get("reasoning_content")
-        if isinstance(existing, str) and existing.strip():
-            reasoning = existing.strip()
-        else:
-            reasoning = (
-                resolve_kimi_reasoning_content(source)
-                if source is not None
-                else _REASONING_PLACEHOLDER
+        if _formatted_assistant_has_tool_use(block):
+            existing = block.get("reasoning_content")
+            if isinstance(existing, str) and existing.strip():
+                reasoning = existing.strip()
+            else:
+                reasoning = (
+                    resolve_kimi_reasoning_content(source)
+                    if source is not None
+                    else _REASONING_PLACEHOLDER
+                )
+            _apply_tool_assistant_reasoning_fields(
+                block,
+                reasoning,
+                source,
+                include_thinking_block=include_thinking_block,
             )
+            injected += 1
+            continue
 
+        if not _formatted_assistant_needs_thinking_inject(block, source):
+            continue
+
+        reasoning = (
+            resolve_kimi_reasoning_content(source)
+            if source is not None
+            else _REASONING_PLACEHOLDER
+        )
         _apply_tool_assistant_reasoning_fields(
             block,
             reasoning,
@@ -321,6 +363,38 @@ def should_inject_reasoning_payload(
     return profile.patch_tool_ai_reasoning
 
 
+def should_inject_thinking_only_reasoning(
+    workspace: Path | None,
+    model_id: str | None,
+) -> bool:
+    """
+    是否对 thinking-only assistant 注入 reasoning（Think step 续跑）。
+
+    @param workspace 工作区根
+    @param model_id 模型 id
+    @return 是否注入
+    """
+    from llgraph.context.message_dispatch_profile import (
+        dispatch_preserves_thinking_on_outbound,
+        resolve_dispatch_profile,
+    )
+
+    profile = resolve_dispatch_profile(workspace, model_id, thinking_enabled=True)
+    return dispatch_preserves_thinking_on_outbound(profile) and profile.patch_tool_ai_reasoning
+
+
+def model_requires_content_thinking_block(model_id: str | None) -> bool:
+    """
+    是否在 HTTP payload content 内补 thinking 块。
+
+    @param model_id 模型 id
+    @return 是否补块
+    """
+    from llgraph.core.model_thinking_profile import model_uses_reasoning_content_injection
+
+    return is_kimi_thinking_model(model_id) or model_uses_reasoning_content_injection(model_id)
+
+
 def patch_gateway_kimi_reasoning_payload() -> None:
     """
     包装 ChatAnthropic._get_request_payload，按 profile 写入 reasoning 相关字段。
@@ -353,7 +427,7 @@ def patch_gateway_kimi_reasoning_payload() -> None:
             source = self._convert_input(input_).to_messages()
         except Exception:
             source = []
-        include_thinking_block = is_kimi_thinking_model(model_text)
+        include_thinking_block = model_requires_content_thinking_block(model_text)
         inject_reasoning_into_formatted_messages(
             source,
             formatted,

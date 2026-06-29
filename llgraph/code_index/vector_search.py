@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from llgraph.code_index.embedder import embed_query
+from llgraph.code_index.paths import DEFAULT_SEARCH_TOP_K
 from llgraph.code_index.store import get_index_status, search_vectors
 from llgraph.config.logging_settings import get_search_logger
 
@@ -28,7 +29,7 @@ def perform_vector_search(
     workspace: Path,
     query: str,
     *,
-    top_k: int = 15,
+    top_k: int = DEFAULT_SEARCH_TOP_K,
     path_prefix: str = ".",
     source: str = "unknown",
     tool: str = "vector",

@@ -25,8 +25,9 @@ _SKIP_DIR_NAMES = frozenset({
     ".cursor",
 })
 
-# 单文件读取上限（字节）
-MAX_READ_BYTES = 200_000
+# 单文件读取默认上限（字节 / 行）；工作区可在 agent.json context 覆盖
+DEFAULT_READ_FILE_MAX_BYTES = 600_000
+DEFAULT_READ_FILE_MAX_LINES = 6000
 
 # 内容检索最多返回条数
 MAX_GREP_MATCHES = 80
@@ -50,6 +51,8 @@ class WorkspaceContext:
         allow_write: bool = False,
         extra_skip_dirs: frozenset[str] | None = None,
         sandbox_policy: SandboxPolicy | None = None,
+        max_read_bytes: int | None = None,
+        max_read_lines: int | None = None,
     ) -> None:
         root = Path(workspace_root).expanduser().resolve()
         if not root.is_dir():
@@ -58,6 +61,14 @@ class WorkspaceContext:
         self.allow_write = allow_write
         self._extra_skip_dirs = extra_skip_dirs or frozenset()
         self.sandbox_policy = sandbox_policy
+        self.max_read_bytes = max(
+            50_000,
+            int(max_read_bytes or DEFAULT_READ_FILE_MAX_BYTES),
+        )
+        self.max_read_lines = max(
+            200,
+            int(max_read_lines or DEFAULT_READ_FILE_MAX_LINES),
+        )
 
     def resolve_path(self, relative_path: str, *, for_write: bool = False) -> Path:
         """

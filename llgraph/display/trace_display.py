@@ -149,27 +149,73 @@ def _short_path_for_trace(path_text: str, *, max_len: int = _PATH_TRACE_MAX_LEN)
     return f"…/{name}"
 
 
-def _short_tool_target(args: Any) -> str:
-    """
-    工具调用摘要中的关键参数（路径、查询等）。
+def _clip_trace_text(text: str, *, max_len: int = 48) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
 
+
+def _format_trace_path(path_text: str) -> str:
+    text = path_text.strip()
+    if text in (".", "./"):
+        return "."
+    if len(text) > _PATH_TRACE_MAX_LEN:
+        return _short_path_for_trace(text)
+    return text
+
+
+def _short_tool_target(tool_name: str, args: Any) -> str:
+    """
+    工具调用摘要中的关键参数（优先展示能区分同工具多次调用的字段）。
+
+    @param tool_name 工具名
     @param args 工具参数字典
     @return 短描述；无则空串
     """
     if not isinstance(args, dict):
         return ""
-    for key in ("path", "query", "pattern", "command", "url"):
+    name = (tool_name or "").strip()
+
+    if name == "grep_files":
+        parts: list[str] = []
+        pattern = args.get("pattern")
+        if isinstance(pattern, str) and pattern.strip():
+            parts.append(_clip_trace_text(pattern.strip()))
+        path = args.get("path", ".")
+        path_text = path.strip() if isinstance(path, str) else "."
+        if path_text and path_text not in (".", "./"):
+            parts.append(f"path={_format_trace_path(path_text)}")
+        file_glob = args.get("file_glob")
+        if isinstance(file_glob, str) and file_glob.strip():
+            parts.append(f"glob={file_glob.strip()}")
+        return ", ".join(parts)
+
+    if name == "glob_files":
+        parts = []
+        glob_pattern = args.get("glob_pattern")
+        if isinstance(glob_pattern, str) and glob_pattern.strip():
+            parts.append(_clip_trace_text(glob_pattern.strip()))
+        path = args.get("path", ".")
+        path_text = path.strip() if isinstance(path, str) else "."
+        if path_text and path_text not in (".", "./"):
+            parts.append(f"path={_format_trace_path(path_text)}")
+        return ", ".join(parts)
+
+    if name == "read_files":
+        paths = args.get("paths")
+        if isinstance(paths, list) and paths:
+            if len(paths) == 1 and isinstance(paths[0], str) and paths[0].strip():
+                return _format_trace_path(paths[0].strip())
+            return f"{len(paths)} files"
+
+    for key in ("query", "pattern", "command", "url", "path"):
         val = args.get(key)
         if not isinstance(val, str) or not val.strip():
             continue
         text = val.strip()
-        if key == "path" and len(text) > _PATH_TRACE_MAX_LEN:
-            shortened = _short_path_for_trace(text)
-            if shortened:
-                return shortened
-        if len(text) > 48:
-            return text[:45] + "…"
-        return text
+        if key == "path":
+            return _format_trace_path(text)
+        return _clip_trace_text(text)
     return ""
 
 
@@ -188,7 +234,7 @@ def _format_planned_tools_summary(tool_calls: list, *, verbose: bool = False) ->
     parts: list[str] = []
     for call in tool_calls:
         name = call.get("name", "?")
-        target = _short_tool_target(call.get("args") or {})
+        target = _short_tool_target(str(name), call.get("args") or {})
         if target:
             parts.append(f"{name}({target})")
         else:
@@ -222,56 +268,28 @@ def _format_turn_skills_line(
     return "⭐ 本会话技能: " + ", ".join(labels)
 
 
-def _short_tool_target(args: Any) -> str:
-    """
-    工具调用摘要中的关键参数（路径、查询等）。
-
-    @param args 工具参数字典
-    @return 短描述；无则空串
-    """
-    if not isinstance(args, dict):
-        return ""
-    for key in ("path", "query", "pattern", "command", "url"):
-        val = args.get(key)
-        if not isinstance(val, str) or not val.strip():
+def _tool_call_args_by_id(messages: list) -> dict[str, dict[str, Any]]:
+    """从最近一条带 tool_calls 的 AIMessage 提取 id → args。"""
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
             continue
-        text = val.strip()
-        if key == "path" and len(text) > _PATH_TRACE_MAX_LEN:
-            shortened = _short_path_for_trace(text)
-            if shortened:
-                return shortened
-        if len(text) > 44:
-            return text[:41] + "…"
-        return text
-    return ""
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if not tool_calls:
+            continue
+        out: dict[str, dict[str, Any]] = {}
+        for call in tool_calls:
+            call_id = call.get("id")
+            if isinstance(call_id, str) and call_id:
+                out[call_id] = call.get("args") or {}
+        return out
+    return {}
 
 
-def _format_planned_tools_summary(tool_calls: list, *, verbose: bool = False) -> str:
-    """
-    模型决策步摘要：强调「拟调用」、尚未执行。
-
-    @param tool_calls LangGraph tool_calls
-    @param verbose 是否 verbose 模式
-    @return 折叠行摘要
-    """
-    if not tool_calls:
-        return "无工具调用"
-    if verbose:
-        return f"{len(tool_calls)} 个工具"
-    parts: list[str] = []
-    for call in tool_calls:
-        name = call.get("name", "?")
-        target = _short_tool_target(call.get("args") or {})
-        if target:
-            parts.append(f"{name}({target})")
-        else:
-            parts.append(str(name))
-    if len(parts) == 1:
-        return f"拟调用 {parts[0]}"
-    joined = ", ".join(parts[:3])
-    if len(parts) > 3:
-        joined += f" 等 {len(parts)} 个"
-    return f"拟调用 {joined}"
+def _format_tool_step_title(tool_name: str, args: Any) -> str:
+    target = _short_tool_target(tool_name, args)
+    if target:
+        return f"执行 {tool_name}({target})"
+    return f"执行 {tool_name}"
 
 
 def _tool_output_looks_like_error(text: str) -> bool:
@@ -439,7 +457,7 @@ def emit_trace_milestone(session: TraceSession, text: str) -> None:
 
 def print_invoke_prelude(trace_session: TraceSession | None) -> None:
     """
-    Agent 轮次开始前立即输出，避免大会话压缩/修链期间终端看似无响应。
+    Agent 轮次开始前立即输出，避免大会话压缩/修链期间终端/Web 看似无响应。
 
     @param trace_session 过程展示配置
     """
@@ -447,13 +465,11 @@ def print_invoke_prelude(trace_session: TraceSession | None) -> None:
     if trace.is_silent():
         return
     if trace.mode == TraceMode.REPLY:
-        print(_c(f"[{_timestamp()}] ▶ 处理中…", "33"), flush=True)
+        emit_trace_milestone(trace, "处理中…")
         return
-    print(
-        _c(f"[{_timestamp()}] ", "90")
-        + _c("▶ 准备中…", "33")
-        + _c("  加载历史 / 压缩上下文 / 修链（大会话可能需 1～2 分钟）", "90"),
-        flush=True,
+    emit_trace_milestone(
+        trace,
+        "准备中…  加载历史 / 压缩上下文 / 修链（大会话可能需 1～2 分钟）",
     )
 
 
@@ -688,7 +704,7 @@ class TurnTracePrinter:
             self._thinking_header_printed = True
             self._line(
                 _c(f"[{_timestamp()}] ", "90")
-                + _c("▶ 思考中（thinking 流式）…", "33"),
+                + _c("▶ Think（thinking 流式）…", "33"),
             )
 
     def _reset_thinking_capture(self, *, keep_finalized: bool = False) -> None:
@@ -714,7 +730,7 @@ class TurnTracePrinter:
             char_count = len(text)
             step_id = self._register_step(
                 "thinking",
-                "模型思考",
+                "Think",
                 elapsed,
                 f"{char_count} 字",
                 body_lines=body,
@@ -723,7 +739,7 @@ class TurnTracePrinter:
             if self._session.shows_process() and not self._session.is_verbose():
                 self._print_step_summary(
                     step_id,
-                    "模型思考",
+                    "Think",
                     elapsed,
                     f"{char_count} 字",
                     step_marker="◎",
@@ -1020,20 +1036,22 @@ class TurnTracePrinter:
                         _c(f"[{_timestamp()}] ", "90")
                         + _c("⏳ web_search 等待 Tavily 响应（通常 5～25 秒）…", "33"),
                     )
+                else:
+                    tool_names = [
+                        str(c.get("name"))
+                        for c in tool_calls
+                        if c.get("name")
+                    ]
+                    if tool_names:
+                        label = " · ".join(tool_names[:3])
+                        if len(tool_names) > 3:
+                            label += f" 等{len(tool_names)}个"
+                        emit_trace_milestone(self._session, f"执行 {label}…")
             self._streamed_reply = False
         elif text and not self._streamed_reply:
             self._final_text = text
             if self._session.shows_process() and not self._session.is_verbose():
                 self._emit_final_reply_block(text)
-        elif not tool_calls and not text:
-            # 最终轮 thinking-only：暂存，on_turn_end 无正文时降级展示
-            thinking_only = _extract_thinking_from_message_chunk(last)
-            if (
-                thinking_only
-                and _thinking_worth_trace_step(thinking_only)
-                and not self._thinking_finalized
-            ):
-                self._last_thinking_text = thinking_only
 
         self._step_start = time.perf_counter()
 
@@ -1060,15 +1078,18 @@ class TurnTracePrinter:
                 + _c(f"  ({_format_duration(elapsed)})", "90"),
             )
 
+        args_by_id = _tool_call_args_by_id(messages)
         for msg in tool_msgs:
             name = msg.name or "tool"
+            tool_args = args_by_id.get(getattr(msg, "tool_call_id", "") or "", {})
+            step_title = _format_tool_step_title(name, tool_args)
             full_text = _message_text(msg.content)
             lines = full_text.splitlines() if full_text else ["(无输出)"]
             is_error = _tool_output_looks_like_error(full_text)
             preview_limit = 80 if is_error and verbose else _ALL_TOOL_OUTPUT_LINES
             if verbose:
                 self._line(
-                    _c(f"{_TRACE_L2}└ {name}", "36")
+                    _c(f"{_TRACE_L2}└ {step_title}", "36")
                     + _c(f"  ({len(lines)} 行输出)", "90"),
                 )
                 self._print_preview_block(lines, limit=preview_limit)
@@ -1076,14 +1097,14 @@ class TurnTracePrinter:
                 output_summary = f"{len(lines)} 行输出"
                 step_id = self._register_step(
                     "tool",
-                    f"执行 {name}",
+                    step_title,
                     elapsed,
                     output_summary,
                     body_lines=lines,
                 )
                 self._print_step_summary(
                     step_id,
-                    f"执行 {name}",
+                    step_title,
                     elapsed,
                     f"· {output_summary}",
                 )
@@ -1099,15 +1120,19 @@ class TurnTracePrinter:
 
         @param text 助手最终正文
         """
-        if not text.strip():
+        from llgraph.context.message_normalize import format_agent_chat_display_text
+
+        cleaned = format_agent_chat_display_text(text)
+        if not cleaned.strip():
+            self._stream_end()
             return
         elapsed = time.perf_counter() - self._step_start
         self._printed_final_header = True
         self._streamed_reply = True
         self._survey_filter.reset()
-        visible = self._survey_filter.feed(text)
+        visible = self._survey_filter.feed(cleaned)
         if not visible.strip():
-            visible = strip_survey_for_display(text).strip()
+            visible = cleaned.strip()
         if not visible:
             self._stream_end()
             return
@@ -1185,10 +1210,15 @@ class TurnTracePrinter:
         self._reply_body_printed = True
 
     def on_text_chunk(self, chunk_text: str) -> None:
+        if not chunk_text:
+            return
+        from llgraph.adapters.inbound.xml_tool_call import strip_inbound_tool_call_markup
+
+        chunk_text = strip_inbound_tool_call_markup(chunk_text)
+        if not chunk_text:
+            return
         if not self._session.shows_reply_stream():
             self._final_text += chunk_text
-            return
-        if not chunk_text:
             return
         self._finalize_thinking_step(reset_after=True)
         # Markdown 渲染开启时累积全文，结束时一次性渲染（避免流式半截 MD）
@@ -1241,7 +1271,9 @@ class TurnTracePrinter:
                     self._print_reply_body(tail)
                 self._stream_end()
             if not self._reply_body_printed and self._final_text.strip():
-                body = strip_survey_for_display(self._final_text).strip()
+                from llgraph.context.message_normalize import format_agent_chat_display_text
+
+                body = format_agent_chat_display_text(self._final_text)
                 if body:
                     self._print_reply_body(body)
             total = time.perf_counter() - self._turn_start
@@ -1275,21 +1307,10 @@ class TurnTracePrinter:
                         " · /trace token 关步骤 token"
                     )
                     self._line(_c(hint, "90"))
-        if not self._final_text.strip() and self._last_thinking_text.strip():
-            fallback = self._last_thinking_text.strip()
-            wrapped = (
-                "（模型未输出可见正文，以下为 thinking 降级展示）\n\n"
-                + fallback
-            )
-            self._final_text = wrapped
-            if (
-                not self._session.is_silent()
-                and not self._printed_final_header
-            ):
-                self._emit_final_reply_block(wrapped)
-
         raw = self._final_text.strip()
-        display = strip_survey_for_display(self._final_text).strip()
+        from llgraph.context.message_normalize import format_agent_chat_display_text
+
+        display = format_agent_chat_display_text(self._final_text)
         self._session.last_turn_raw_reply = raw
         return display, raw
 
@@ -1452,15 +1473,17 @@ def set_trace_render_markdown(session: TraceSession, enabled: bool | None = None
 
 
 def _extract_text_from_message_chunk(chunk: Any) -> str:
+    from llgraph.adapters.inbound.xml_tool_call import strip_inbound_tool_call_markup
+
     content = getattr(chunk, "content", None)
     if isinstance(content, str):
-        return content
+        return strip_inbound_tool_call_markup(content)
     if isinstance(content, list):
         parts: list[str] = []
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
                 parts.append(str(block.get("text", "")))
-        return "".join(parts)
+        return strip_inbound_tool_call_markup("".join(parts))
     return ""
 
 
@@ -1574,18 +1597,39 @@ def _web_progress_milestone(session: TraceSession | None, text: str) -> None:
     emit_trace_milestone(session, text)
 
 
+def _react_stream_config(
+    *,
+    thread_id: str,
+    with_memory: bool,
+    recursion_limit: int | None = None,
+) -> dict[str, Any] | None:
+    """ReAct stream/invoke 用 RunnableConfig。"""
+    cfg: dict[str, Any] = {}
+    if with_memory:
+        cfg["configurable"] = {"thread_id": thread_id}
+    if recursion_limit is not None:
+        cfg["recursion_limit"] = recursion_limit
+    return cfg if cfg else None
+
+
 def _stream_collect_silent(
     agent,
     user_message: str,
     *,
     thread_id: str,
     with_memory: bool,
-    effective_message: str | None = None,
+    effective_message: str | list[dict[str, Any]] | None = None,
     trace_session: TraceSession | None = None,
+    cancel_check: Any | None = None,
+    recursion_limit: int | None = None,
 ) -> TurnRunResult:
     """NONE 模式：不打印过程，只收集最终回复。"""
     turn_start = time.perf_counter()
-    config = {"configurable": {"thread_id": thread_id}} if with_memory else None
+    config = _react_stream_config(
+        thread_id=thread_id,
+        with_memory=with_memory,
+        recursion_limit=recursion_limit,
+    )
     final_parts: list[str] = []
     tool_names: list[str] = []
     payload = effective_message if effective_message is not None else user_message
@@ -1600,6 +1644,8 @@ def _stream_collect_silent(
         config=config,
         stream_mode=["updates", "messages"],
     ):
+        if cancel_check is not None and cancel_check():
+            break
         if not isinstance(item, tuple) or len(item) != 2:
             continue
         mode, chunk = item
@@ -1661,10 +1707,12 @@ def stream_agent_turn(
     thread_id: str = "default",
     with_memory: bool = False,
     trace_session: TraceSession | None = None,
-    effective_message: str | None = None,
+    effective_message: str | list[dict[str, Any]] | None = None,
     write_failure_tracker=None,
     workspace: Path | str | None = None,
     context_session: Any | None = None,
+    cancel_check: Any | None = None,
+    recursion_limit: int | None = None,
 ) -> TurnRunResult:
     """
     流式执行一轮对话并按 TraceMode 展示。
@@ -1697,12 +1745,23 @@ def stream_agent_turn(
             with_memory=with_memory,
             effective_message=payload,
             trace_session=session,
+            cancel_check=cancel_check,
+            recursion_limit=recursion_limit,
         )
 
-    config = {"configurable": {"thread_id": thread_id}} if with_memory else None
+    config = _react_stream_config(
+        thread_id=thread_id,
+        with_memory=with_memory,
+        recursion_limit=recursion_limit,
+    )
+    ws_path = Path(workspace).expanduser().resolve() if workspace is not None else None
+    if with_memory and ws_path is not None:
+        from llgraph.context.chat_history_repair import ensure_agent_chat_history_dispatch_safe
+
+        ensure_agent_chat_history_dispatch_safe(agent, ws_path, thread_id)
+
     printer = TurnTracePrinter(session)
     session.active_printer = printer
-    ws_path = Path(workspace).expanduser().resolve() if workspace is not None else None
     printer.on_turn_start(
         user_message,
         workspace=ws_path,
@@ -1721,6 +1780,8 @@ def stream_agent_turn(
         config=config,
         stream_mode=["updates", "messages"],
     ):
+        if cancel_check is not None and cancel_check():
+            break
         if not isinstance(item, tuple) or len(item) != 2:
             continue
         mode, payload = item
@@ -1737,6 +1798,8 @@ def stream_agent_turn(
                         streaming_reply = False
                         if not session.shows_process():
                             _web_progress_milestone(session, "模型决策中…")
+                    printer.on_agent_update(messages)
+                elif node_name == "turn_fallback":
                     printer.on_agent_update(messages)
                 elif node_name == "tools":
                     saw_tool_round = True

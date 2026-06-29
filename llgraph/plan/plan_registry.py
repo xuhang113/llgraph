@@ -8,10 +8,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from llgraph.plan.plan_store import count_task_progress, load_plan
+from llgraph.plan.plan_phase_resolve import resolve_plan_phase
+from llgraph.plan.plan_store import count_task_progress, load_plan, pick_richer_plan
 from llgraph.plan.config import resolve_plan_settings
 from llgraph.session.session_meta import get_session_title, resolve_session_display_title
 from llgraph.session.user_storage import session_thread_dir, user_sessions_root
+
+
+@dataclass(frozen=True)
+class PlanTaskStub:
+    """Plan 任务摘要（会话树 worker 节点）。"""
+
+    id: str
+    title: str
+    status: str
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,7 @@ class PlanSummary:
     tasks_done: int
     tasks_total: int
     updated_at: str | None
+    task_stubs: tuple[PlanTaskStub, ...] = ()
 
 
 def _mtime_iso(path: Path) -> str | None:
@@ -62,11 +73,13 @@ def discover_plan_sessions(workspace: Path) -> list[PlanSummary]:
         return []
 
     summaries: list[PlanSummary] = []
+    from llgraph.session.session_delete import is_plan_main_thread
+
     for child in sessions_root.iterdir():
         if not child.is_dir():
             continue
         thread_id = child.name
-        if not thread_id.startswith("plan-"):
+        if not is_plan_main_thread(thread_id):
             continue
         meta_path = child / "meta.json"
         meta: dict[str, Any] = {}
@@ -78,10 +91,12 @@ def discover_plan_sessions(workspace: Path) -> list[PlanSummary]:
         plan_id = str(meta.get("plan_id") or "")
         phase = str(meta.get("phase") or "unknown")
         plan_state_path = child / "plan_state.json"
+        plan_state: dict[str, Any] = {}
         if plan_state_path.is_file():
             try:
                 ps = json.loads(plan_state_path.read_text(encoding="utf-8"))
                 if isinstance(ps, dict):
+                    plan_state = ps
                     plan_id = plan_id or str(ps.get("plan_id") or "")
                     phase = str(ps.get("phase") or phase)
             except (OSError, json.JSONDecodeError):
@@ -89,12 +104,29 @@ def discover_plan_sessions(workspace: Path) -> list[PlanSummary]:
 
         title = get_session_title(root, thread_id) or resolve_session_display_title(root, thread_id)
         tasks_done, tasks_total = 0, 0
+        plan: dict[str, Any] | None = None
         if plan_id:
-            plan = load_plan(root, plan_id, plans_dir=settings.plans_dir)
+            plan_file = load_plan(root, plan_id, plans_dir=settings.plans_dir)
+            plan_inline = plan_state.get("plan") if isinstance(plan_state.get("plan"), dict) else None
+            plan = pick_richer_plan(plan_file, plan_inline)
             if plan:
                 title = str(plan.get("title") or title)
-                phase = str(plan.get("phase") or phase)
                 tasks_done, tasks_total = count_task_progress(plan)
+        if plan:
+            phase = resolve_plan_phase(plan_state=plan_state, meta=meta, plan=plan)
+
+        task_stubs: tuple[PlanTaskStub, ...] = ()
+        if plan:
+            raw_tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
+            task_stubs = tuple(
+                PlanTaskStub(
+                    id=str(t.get("id") or ""),
+                    title=str(t.get("title") or t.get("id") or ""),
+                    status=str(t.get("status") or "pending"),
+                )
+                for t in raw_tasks
+                if isinstance(t, dict) and t.get("id")
+            )
 
         updated = _mtime_iso(plan_state_path) or _mtime_iso(meta_path) or _mtime_iso(child / "messages.jsonl")
         summaries.append(
@@ -106,6 +138,7 @@ def discover_plan_sessions(workspace: Path) -> list[PlanSummary]:
                 tasks_done=tasks_done,
                 tasks_total=tasks_total,
                 updated_at=updated,
+                task_stubs=task_stubs,
             )
         )
 

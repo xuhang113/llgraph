@@ -39,8 +39,9 @@ def _undo_payload(results: list[UndoItemResult], tracker: SessionEditTracker) ->
     deleted = sum(1 for r in results if r.action == "deleted")
     skipped = sum(1 for r in results if r.action == "skipped")
     failed = sum(1 for r in results if r.action == "failed")
+    effective = restored + deleted
     return {
-        "ok": failed == 0,
+        "ok": failed == 0 and skipped == 0 and (not results or effective > 0),
         "summary": {
             "restored": restored,
             "deleted": deleted,

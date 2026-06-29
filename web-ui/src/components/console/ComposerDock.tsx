@@ -1,6 +1,7 @@
 import FileChangesPanel, { type FileChangesMode } from './FileChangesPanel';
 import ChatComposer from './ChatComposer';
 import type { SlashCatalogItem } from '../../api/client';
+import type { ComposerImage } from '../../types/chatImage';
 
 interface FileChangesProps {
   slug: string;
@@ -16,6 +17,8 @@ interface Props {
   fileChanges?: FileChangesProps | null;
   value: string;
   onChange: (v: string) => void;
+  images: ComposerImage[];
+  onImagesChange: (images: ComposerImage[]) => void;
   onSend: () => void;
   onStop?: () => void;
   busy?: boolean;
@@ -28,6 +31,8 @@ export default function ComposerDock({
   fileChanges,
   value,
   onChange,
+  images,
+  onImagesChange,
   onSend,
   onStop,
   busy = false,
@@ -56,6 +61,8 @@ export default function ComposerDock({
           embedded
           value={value}
           onChange={onChange}
+          images={images}
+          onImagesChange={onImagesChange}
           onSend={onSend}
           onStop={onStop}
           busy={busy}

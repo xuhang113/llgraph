@@ -26,8 +26,20 @@ def llm_content_text(content: Any, *, fallback_thinking: bool = False) -> str:
                 block_type = block.get("type")
                 if block_type == "text":
                     text_parts.append(str(block.get("text", "")))
-                elif block_type == "thinking" and fallback_thinking:
-                    thinking_parts.append(str(block.get("thinking", "")))
+                elif fallback_thinking and block_type in (
+                    "thinking",
+                    "reasoning",
+                    "reasoning_text",
+                    "redacted_thinking",
+                ):
+                    thinking_parts.append(
+                        str(
+                            block.get("thinking")
+                            or block.get("reasoning")
+                            or block.get("text")
+                            or ""
+                        )
+                    )
             elif isinstance(block, str):
                 text_parts.append(block)
         text = "".join(text_parts).strip()
@@ -41,6 +53,38 @@ def llm_content_text(content: Any, *, fallback_thinking: bool = False) -> str:
     return str(content).strip()
 
 
+def llgraph_meta_thinking(response: Any) -> str:
+    """
+    从 additional_kwargs.llgraph.thinking_text 读取落盘 thinking。
+
+    @param response AIMessage 或兼容对象
+    @return thinking 正文
+    """
+    extra = getattr(response, "additional_kwargs", None) or {}
+    if not isinstance(extra, dict):
+        return ""
+    meta = extra.get("llgraph")
+    if not isinstance(meta, dict):
+        return ""
+    raw = meta.get("thinking_text")
+    return str(raw).strip() if raw else ""
+
+
+def llm_thinking_text(response: Any) -> str:
+    """
+    合并 content 内 thinking/reasoning 块与 llgraph.thinking_text。
+
+    @param response AIMessage 或兼容对象
+    @return thinking 全文
+    """
+    content = getattr(response, "content", response)
+    visible = llm_content_text(content, fallback_thinking=False).strip()
+    from_blocks = llm_content_text(content, fallback_thinking=True).strip()
+    block_thinking = from_blocks if from_blocks and from_blocks != visible else ""
+    meta = llgraph_meta_thinking(response)
+    return meta or block_thinking
+
+
 def llm_response_text(response: Any, *, fallback_thinking: bool = False) -> str:
     """
     从 llm.invoke 返回值提取正文。
@@ -50,7 +94,12 @@ def llm_response_text(response: Any, *, fallback_thinking: bool = False) -> str:
     @return 正文
     """
     content = getattr(response, "content", response)
-    return llm_content_text(content, fallback_thinking=fallback_thinking)
+    text = llm_content_text(content, fallback_thinking=fallback_thinking)
+    if text:
+        return text
+    if fallback_thinking:
+        return llgraph_meta_thinking(response)
+    return ""
 
 
 def normalize_stored_llm_text(raw: Any, *, fallback_thinking: bool = False) -> str:

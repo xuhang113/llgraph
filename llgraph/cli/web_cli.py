@@ -40,7 +40,9 @@ def main(argv: list[str] | None = None) -> None:
         import uvicorn
     except ImportError as exc:
         print(
-            "错误: 未安装 web 可选依赖。请执行: pip install 'llgraph[web]'",
+            "错误: 未安装 web 可选依赖。\n"
+            "  推荐: ./scripts/setup.sh web\n"
+            "  或:   uv sync --extra web  /  pip install -e '.[web]'",
             file=sys.stderr,
         )
         raise SystemExit(1) from exc
@@ -82,4 +84,5 @@ def main(argv: list[str] | None = None) -> None:
         host=args.host,
         port=args.port,
         reload=False,
+        timeout_graceful_shutdown=5,
     )

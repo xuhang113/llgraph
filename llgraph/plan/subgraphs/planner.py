@@ -35,11 +35,12 @@ def planner_system_prompt(ctx: PlanRuntimeContext) -> str:
     )
 
 
-def build_planner_subgraph(ctx: PlanRuntimeContext) -> Any:
+def build_planner_subgraph(ctx: PlanRuntimeContext, *, sub_thread: str) -> Any:
     """
     构建 Planner ReAct 子图。
 
     @param ctx Plan 运行时上下文
+    @param sub_thread 子图 checkpoint thread
     @return 已 compile 的子图
     """
     llm = create_gateway_llm(ctx.workspace)
@@ -55,6 +56,8 @@ def build_planner_subgraph(ctx: PlanRuntimeContext) -> Any:
         tools,
         planner_system_prompt(ctx),
         workspace=ctx.workspace,
+        thread_key=sub_thread,
+        subgraph_kind="planner",
     )
 
 
@@ -63,6 +66,7 @@ def run_planner_subagent(
     *,
     user_prompt: str,
     version: int,
+    plan_state: dict[str, Any] | None = None,
 ) -> str:
     """
     在父图 planner node 内 invoke Planner 子图。
@@ -70,15 +74,36 @@ def run_planner_subagent(
     @param ctx Plan 运行时上下文
     @param user_prompt 本轮任务提示
     @param version 计划版本号（用于子 thread）
-    @return 助手最终文本
+    @param plan_state 父 PlanState（manifest 用）
+    @return 助手最终文本（子图 ReAct turn 结束后的交付正文）
     """
-    subgraph = build_planner_subgraph(ctx)
+    sub_key = f"planner-v{version}"
     sub_thread = f"{ctx.thread_id}{PLANNER_SUBGRAPH_SPEC.thread_suffix.format(version=version)}"
-    return invoke_react_subgraph_turn(
-        ctx,
+    subgraph = build_planner_subgraph(ctx, sub_thread=sub_thread)
+    planner_ctx = ctx.fork_subagent_runtime(
+        sub_thread=sub_thread,
+        subgraph_kind="planner",
+    )
+    text = invoke_react_subgraph_turn(
+        planner_ctx,
         subgraph,
         user_prompt,
         sub_thread=sub_thread,
         role_label="Planner",
         spec=PLANNER_SUBGRAPH_SPEC,
+        allow_write=False,
+        plan_state=plan_state,
     )
+    from llgraph.plan.subgraph_messages import collect_and_persist_subgraph_messages
+    from llgraph.plan.subgraphs.base import collect_subgraph_messages
+
+    messages = collect_subgraph_messages(subgraph, sub_thread)
+    collect_and_persist_subgraph_messages(
+        ctx.workspace,
+        ctx.thread_id,
+        sub_key,
+        subgraph,
+        sub_thread,
+        fallback_messages=messages,
+    )
+    return text

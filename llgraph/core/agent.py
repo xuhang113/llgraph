@@ -7,14 +7,17 @@ LangGraph ReAct Agent（参照官方 StateGraph / prebuilt 用法）。
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+import time
 
-from langgraph.prebuilt import create_react_agent
+from llgraph.core.react_limits import resolve_agent_max_turns
+from llgraph.core.react_graph import build_react_graph
 
 from llgraph.core.checkpointer_factory import create_checkpointer
 
-from llgraph.context.context_builder import (
-    build_workspace_context_block,
-    wrap_user_message_with_context,
+from llgraph.context.context_builder import build_workspace_context_block
+from llgraph.core.user_message_content import (
+    ChatImageInput,
+    build_human_content_blocks,
 )
 from llgraph.context.context_compressor import (
     apply_compress_to_agent_state,
@@ -24,7 +27,6 @@ from llgraph.context.context_session import ContextSession
 from llgraph.core.llm import create_gateway_llm
 from llgraph.core.llm_settings import resolve_effective_model
 from llgraph.core.tools import get_agent_tools
-from llgraph.survey.edit_confirm import EditConfirmGate
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.context.context_spill import ContextSpill
 from llgraph.core.write_failure_tracker import WriteFailureTracker
@@ -51,170 +53,44 @@ def build_system_prompt(
     @param survey_interactive_enabled 是否启用交互式 survey 向导
     @return 系统提示词
     """
-    mode = "可读写" if allow_write else "只读（禁止调用 write_file、append_file、search_replace）"
     from llgraph.code_index.index_ready import code_index_is_ready
+    from llgraph.core.model_thinking import resolve_model_thinking_payload
+    from llgraph.loaders.prompt_loader import compose_agent_system_prompt, compose_search_order_hint
 
+    mode = "可读写" if allow_write else "只读（禁止调用 write_file、append_file、search_replace）"
     index_ready = code_index_is_ready(workspace_root)
-    batch_search_hint = (
-        "同时查找**多个已知文件名/脚本名**时："
-        "用**一次** grep_files（如 pattern=\"collect_alert|gitlab_monitor|dm-daily-task\"，"
-        "path=\"markdowns\" 或 path=\".\"）；**禁止**对每个文件名逐个调用 glob_files。\n"
-        "glob 全未命中或连续多个 glob 为 0："
-        "源文件可能不在工作区、仅在 markdowns/docs 台账/crontab 文档中被引用；"
-        "改用 grep_files（path=\"markdowns\" 或 path=\"docs\"）或 read_file 已知文档，"
-        "勿再逐个 glob。\n"
-    )
-    path_scope_hint = (
-        "**glob_files / grep_files 的 path（必须遵守）**：\n"
-        "- path = 相对工作区根的**搜索根（子树边界）**，无 cwd；只在 path 子树内匹配，**不含兄弟目录**。\n"
-        "- **禁止** path 含 \"../\"（会越界或解析错误）。\n"
-        "- 默认 path=\".\" 或 \"<仓库名>\"（如 auth-api）；"
-        "**禁止**沿用 list_directory 后的深层 path 做跨包 glob"
-        "（如 path=.../activity 却 glob **/basic/**）。\n"
-        "- list_directory 仅用于浏览；glob/grep 搜类/模块时 path 至少到**仓库根**。\n"
-        "- glob/grep 0 命中后**禁止同 path 再试**；须换更宽 path 或 markdowns/docs。\n"
-    )
-    code_search_hint = (
-        "**代码检索（对齐 Cursor：一次给线索，多轮深挖）**：\n"
-        "- 意图不清 → 可选 **search_code_parallel** **一次**；在 **query 里自行扩展**"
-        "类名、仓库名片段、callback/postback 等关键字（空格分隔，可写 ripgrep 正则），"
-        "整句亦作向量语义。\n"
-        "- parallel 后：**read_files** 读线索 → **grep_files** 追上下游/依赖；"
-        "**本轮勿再** search_code_parallel。\n"
-        "- 已知类名/仓库 → 直接 **grep_files**。\n"
-    )
-    batch_read_hint = (
-        "**批量读**：检索给出多个完整路径时，尽量一次 read_files(paths=[...])（最多 8 个）。\n"
-        "path 禁止 ../；须从检索结果原样复制。\n"
-    )
-    if index_ready:
-        tools_read = (
-            "list_directory、glob_files、grep_files、search_code_parallel、"
-            "search_code_semantic、search_workspace、"
-            "read_file、read_files、search_session_history、"
-            "run_shell_command、get_current_utc_time"
-        )
-        search_order_hint = (
-            "本工作区**代码向量索引已就绪**（llgraph index）。\n"
-            "目录浏览用 list_directory；找文件名 glob_files；搜内容 grep_files；读文件 read_file/read_files。\n"
-            "**禁止** run_shell_command 的 ls/find/tree 做文件发现。\n"
-            + path_scope_hint
-            + code_search_hint
-            + batch_read_hint
-            + batch_search_hint
-            + "glob/grep 0 命中：换更宽 path 或 markdowns/docs。\n"
-        )
-    else:
-        tools_read = (
-            "list_directory、glob_files、grep_files、search_code_parallel、"
-            "search_code_semantic、search_workspace、search_files、"
-            "read_file、read_files、search_session_history、"
-            "run_shell_command、get_current_utc_time"
-        )
-        search_order_hint = (
-            "本工作区**尚未建立代码向量索引**（请 llgraph index -C .）。\n"
-            "检索：glob_files → grep_files → read_files；建索引后可用 search_code_parallel。\n"
-            + path_scope_hint
-            + batch_read_hint
-            + batch_search_hint
-        )
+    tools_read, search_order_hint = compose_search_order_hint(index_ready=index_ready)
     if web_search_enabled:
         tools_read += "、web_search"
     tools_write = "、search_replace、append_file、write_file" if allow_write else ""
-    edit_hint = (
-        "修改已有文件优先 search_replace（局部替换）；新建文件先用 write_file 写骨架，"
-        "长 Markdown/文档分节用 append_file 或 search_replace 追加，禁止一次 tool_call 塞入整篇长文；"
-        "每次 write_file/append_file 必须同时提供 path 与 content，禁止只传 path。"
-        "替换前须 read_file 确认 old_string 与磁盘一致（含缩进）。"
-        if allow_write
-        else ""
-    )
+    edit_hint = ""
+    if allow_write:
+        from llgraph.loaders.prompt_loader import prompt_text
+
+        edit_hint = prompt_text("agent", "tools", "edit_hint")
 
     model_id = resolve_effective_model(workspace_root)
-    from llgraph.core.model_thinking import resolve_model_thinking_payload
+    from llgraph.core.model_thinking import is_thinking_enabled, resolve_model_thinking_payload
 
-    thinking_payload = resolve_model_thinking_payload(workspace_root, model_id)
-    thinking_hint = ""
-    if thinking_payload is not None:
-        thinking_hint = (
-            f"网关 thinking 已启用（agent.json）：{thinking_payload}。"
-            "用户询问扩展思考/thinking 模式时，如实说明已开启；勿回答「不支持」或「无法传 thinking 参数」。\n"
-            "**thinking 输出约束（必须遵守）**：\n"
-            "- thinking/reasoning 仅作内部推理，**终端用户看不到**；"
-            "面向用户的结论、梳理、代码说明、步骤总结**必须写在正文 text**，不可只写在 thinking 里。\n"
-            "- 调用工具前可以只有 thinking + tool_call；"
-            "**一旦本轮不再调用工具（结束 turn），必须输出完整可见正文**，"
-            "禁止 thinking-only 就 end_turn。\n"
-            "- 用户要求「仅对话、不落盘」时：结论仍须出现在正文 text，"
-            "只是不要 write_file；**不是**把答案只放在 thinking。\n"
-            "- 工具读完后要给用户汇总时：先停止调工具，再单独一轮用正文输出完整梳理，"
-            "不要 endless read_file 后在 thinking 里草稿即结束。\n"
-        )
-    base = (
-        "你是工作区编程助手，通过 OpenAI 兼容 API 网关（LLGRAPH_API_BASE_URL）调用大模型。\n"
-        f"当前模型: {model_id}\n"
-        + thinking_hint
-        + "若用户问「你是什么模型 / 你是谁」，只回答当前模型 id，不要自称 Claude、GPT 或其它未在配置中的名称。\n"
-        f"当前工作区根目录: {workspace_root}\n"
-        f"文件访问模式: {mode}。\n"
-        f"可用工具: {tools_read}{tools_write}。\n"
-        + (f"{edit_hint}\n" if edit_hint else "")
-        + "**终端展示与落盘（勿混淆）**：\n"
-        "- 用户看到的回复 = 助手**正文 text**（终端流式输出）；thinking、tool 结果预览**不算**用户可见答复。\n"
-        "- 用户说「放到 text / 正文 / 对话里展示 / 不要落盘 / 仅对话」时：**禁止** write_file/append_file；"
-        "完整梳理须直接写在助手正文里，**不是**写 .md 文件，也不是只写 thinking。\n"
-        "- write_file 仅当用户**明确要求**保存到某路径（如「写到 docs/xxx.md」）时使用；"
-        "写文件后仍须在正文给出可读的结论摘要，不能只有「已写入 xxx.md」一句。\n"
-        + "Skill/Rule 全量目录与简介在置顶 <session-manifest>；正文不在上下文中。"
-        "需要某技能/规则时用 read_file 对应路径（见 manifest 目录）。"
-        "/skill <name> 可会话置顶该技能路径；不自动匹配、不注入 SKILL 正文。\n"
-        + "置顶 <session-manifest>、<conversation-anchor>（路径见 manifest.json；通常在 ~/.llgraph/context/<工作区>/sessions/） "
-        "在上下文压缩后仍保留路径指针；远早对话原文不在每轮上下文中。\n"
-        + "会话失忆/指代不清/压缩或换模型后：先读置顶 anchor，仍不足则 **search_session_history(query=关键词)** "
-        "检索归档与 messages.jsonl，勿臆造未检索过的历史细节；需要全文再 read_file 归档路径。\n"
-        + "业务归属、项目对照：先 read_file 技能/规则/ markdowns 索引中的文档，再扫代码；"
-        "禁止未读文档硬猜服务名。\n"
-        + search_order_hint
-        + "run_shell_command **仅**用于需要真实 shell 环境的操作："
-        "pwd、git status/log/diff、mvn/npm 构建、运行**已定位**的脚本/测试、docker 等；"
-        "cwd 相对工作区。\n"
-        "**禁止**用 shell 的 ls/ls -la/find/grep/rg/cat/head/tail 做目录浏览、文件发现或读代码"
-        "（请用 list_directory / glob_files / grep_files / read_file / read_files）。"
-        "不要声称无法执行 shell。\n"
-        "路径一律使用相对工作区的路径（如 services/order-api/README.md）。\n"
-        "工具返回若含「工具结果已落盘」与路径，表示全文在磁盘；用 read_file/grep_files 按需读取，"
-        "勿假设预览即全文。\n"
-        + (
-            "需要互联网最新信息（版本、新闻、公开文档）时使用 web_search；"
-            "本地代码与 .llgraph 文档优先用检索工具。\n"
-            if web_search_enabled
-            else ""
-        )
-        + "回答简洁、准确；需要实时信息时使用工具。"
+    thinking_payload = (
+        resolve_model_thinking_payload(workspace_root, model_id)
+        if is_thinking_enabled(workspace_root, model_id)
+        else None
     )
-    if allow_write and survey_interactive_enabled:
-        base = (
-            base
-            + "\n\n需要用户确认时：禁止要求用户「输入序号/打字」；"
-            "须在回复末尾输出 <<<llgraph-survey>>> JSON <<<end-survey>>>，"
-            "必须含 title 与 questions 数组（每题含 id、prompt、options≥2、step_label；"
-            "多选题为 multi_select:true，终端用 Space 勾选、Enter 确认；"
-            "option_hints 为每题可选说明，禁止放在 JSON 根级）。"
-            "终端会隐藏该 JSON 并弹出确认向导。"
-            "问卷仅由 Agent 在回复末尾输出 <<<llgraph-survey>>> 触发；"
-            "llgraph 不在 Agent 运行前弹出固定问卷。"
-            "遵循 project-organize 等 Skill 时："
-            "单项目（仅 1 仓）无 doc 时直接落盘、有 doc 时 survey 仅 mode+overwrite；"
-            "多项目（≥2 仓或业务域）survey 必须含 scope 确认改动哪些仓库，"
-            "禁止因依赖关系自动扩仓落盘；无 doc 时至少先 scope 再读代码/落盘。"
-        )
-    elif allow_write:
-        base = (
-            base
-            + "\n\n本环境已禁用交互式 survey（--no-survey 或非交互 Agent）。"
-            "需要用户确认时：直接在回复中列出选项与建议，勿输出 <<<llgraph-survey>>>；"
-            "不要等待用户在下拉菜单中确认，按合理默认继续执行并说明假设。"
-        )
+
+    base = compose_agent_system_prompt(
+        workspace_root=workspace_root,
+        model_id=model_id,
+        mode=mode,
+        tools_read=tools_read,
+        tools_write=tools_write,
+        edit_hint=edit_hint,
+        search_order_hint=search_order_hint,
+        thinking_payload=thinking_payload,
+        web_search_enabled=web_search_enabled,
+        allow_write=allow_write,
+        survey_interactive_enabled=survey_interactive_enabled,
+    )
 
     thought_block = build_thought_prompt_block(workspace_root)
     if thought_block:
@@ -233,7 +109,6 @@ def build_agent(
     context_spill: ContextSpill | None = None,
     write_failure_tracker: WriteFailureTracker | None = None,
     web_search_enabled: bool = False,
-    edit_confirm_gate: EditConfirmGate | None = None,
     context_session: ContextSession | None = None,
     sandbox_policy: SandboxPolicy | None = None,
 ):
@@ -249,7 +124,6 @@ def build_agent(
     @param context_spill 工具结果落盘
     @param write_failure_tracker 写工具失败提醒
     @param web_search_enabled 是否注册 web_search
-    @param edit_confirm_gate 写文件前终端确认
     @param sandbox_policy OS 沙箱策略
     @return 已编译的 LangGraph Runnable
     """
@@ -264,12 +138,10 @@ def build_agent(
         context_spill=context_spill,
         write_failure_tracker=write_failure_tracker,
         web_search_enabled=web_search_enabled,
-        edit_confirm_gate=edit_confirm_gate,
         sandbox_policy=sandbox_policy,
     )
     from llgraph.core.llm_settings import resolve_effective_model
     from llgraph.core.prompt_cache import (
-        apply_prompt_cache_to_llm,
         build_cache_control,
         tag_tools_for_prompt_cache,
     )
@@ -284,7 +156,6 @@ def build_agent(
         cache_control = build_cache_control(cache_settings)
         if cache_settings.tag_tools:
             tools = tag_tools_for_prompt_cache(tools, cache_control)
-        llm = apply_prompt_cache_to_llm(llm, root)
     checkpointer = create_checkpointer(root, with_memory=with_memory)
     from llgraph.config.survey_settings import survey_interactive_enabled
 
@@ -305,11 +176,12 @@ def build_agent(
             f"{format_sandbox_config_hint(root)}"
         )
 
-    return create_react_agent(
+    return build_react_graph(
         llm,
         tools,
         prompt=make_prompt_normalizer(system_prompt, root),
         checkpointer=checkpointer,
+        workspace=root,
     )
 
 
@@ -365,7 +237,6 @@ def rebuild_agent_preserving_memory(
         context_spill=agent_session.context_spill,
         write_failure_tracker=agent_session.write_failure_tracker,
         web_search_enabled=web,
-        edit_confirm_gate=getattr(agent_session, "edit_confirm_gate", None),
         context_session=agent_session.context_session,
         sandbox_policy=policy,
     )
@@ -409,10 +280,13 @@ def invoke_agent(
     with_memory: bool = False,
     trace_session: TraceSession | None = None,
     context_session: ContextSession | None = None,
-    effective_message_override: str | None = None,
+    effective_message_override: str | list[dict[str, Any]] | None = None,
     write_failure_tracker: WriteFailureTracker | None = None,
     context_spill: Any | None = None,
     allow_write: bool = False,
+    cancel_check: Any | None = None,
+    run_source: str = "cli",
+    images: list[ChatImageInput] | None = None,
 ) -> str:
     """
     执行一轮对话并返回助手最后一条文本。
@@ -425,8 +299,11 @@ def invoke_agent(
     @param trace_session 过程展示（/trace 切换；默认 steps）
     @param context_session Rule/Skill 会话状态
     @param effective_message_override 覆盖发给模型的消息（自定义命令用）
+    @param images 用户附带的图片（Web 多模态）
     @param write_failure_tracker 写工具失败跟踪
     @param allow_write Web/CLI 当前是否可写（同步 manifest 与 workspace-context）
+    @param cancel_check 可选；返回 True 时在 ReAct 步间中断（Web Stop）
+    @param run_source 运行来源（cli | web），写入 last_run.json
     @return 助手回复文本
     """
     trace = trace_session or TraceSession()
@@ -535,35 +412,165 @@ def invoke_agent(
         recent_messages=recent_messages,
         edited_paths=edited_paths,
     )
+    turn_image_refs: list = []
     if effective_message_override is not None:
         effective = effective_message_override
     else:
-        effective = wrap_user_message_with_context(user_message, context_block)
-    turn_result = stream_agent_turn(
-        agent,
-        user_message,
-        thread_id=thread_id,
-        with_memory=with_memory,
-        trace_session=trace,
-        effective_message=effective,
-        write_failure_tracker=write_failure_tracker,
-        workspace=root,
-        context_session=ctx,
-    )
-    from llgraph.display.execution_log import log_turn_end
+        images_for_llm = images
+        if with_memory and images:
+            from llgraph.session.session_image_store import (
+                load_chat_images_as_input,
+                save_chat_images,
+            )
 
-    log_turn_end(
+            turn_image_refs = save_chat_images(root, thread_id, images)
+            images_for_llm = load_chat_images_as_input(root, thread_id, turn_image_refs)
+        effective = build_human_content_blocks(
+            user_message,
+            images=images_for_llm,
+            context_block=context_block,
+        )
+    if with_memory and (user_message.strip() or images):
+        from llgraph.session.session_file_store import append_pending_user_turn
+
+        append_pending_user_turn(
+            root,
+            thread_id,
+            user_message,
+            image_refs=turn_image_refs or None,
+        )
+
+    from llgraph.display.execution_log import log_turn_end, log_turn_failure, log_turn_start
+    from llgraph.session.session_run_log import (
+        UserCancelledError,
+        trace_run_context,
+        write_session_last_run,
+    )
+
+    log_turn_start(
         root,
         thread_id=thread_id,
-        with_memory=with_memory,
-        agent=agent,
-        tool_names=turn_result.tool_names,
-        duration_sec=turn_result.duration_sec,
-        compress_report=compress_report,
-        spill=context_spill,
-        spill_count_at_start=spill_count_at_start,
+        user_message=user_message,
         trace_mode=trace.mode.value,
     )
+
+    turn_wall_start = time.perf_counter()
+    try:
+        turn_result = stream_agent_turn(
+            agent,
+            user_message,
+            thread_id=thread_id,
+            with_memory=with_memory,
+            trace_session=trace,
+            effective_message=effective,
+            write_failure_tracker=write_failure_tracker,
+            workspace=root,
+            context_session=ctx,
+            recursion_limit=resolve_agent_max_turns(root),
+            cancel_check=cancel_check,
+        )
+    except Exception as exc:
+        partial_tools: list[str] = []
+        printer = trace.active_printer
+        if printer is not None and getattr(printer, "_tool_names", None):
+            partial_tools = list(printer._tool_names)
+        run_ctx = trace_run_context(trace)
+        duration = time.perf_counter() - turn_wall_start
+        outcome = "timeout" if type(exc).__name__ in ("TimeoutError", "ReadTimeout", "APITimeoutError") else "error"
+        log_turn_failure(
+            root,
+            thread_id=thread_id,
+            with_memory=with_memory,
+            agent=agent,
+            duration_sec=duration,
+            error=exc,
+            tool_names=partial_tools,
+            compress_report=compress_report,
+            spill=context_spill,
+            spill_count_at_start=spill_count_at_start,
+            trace_mode=trace.mode.value,
+            outcome=outcome,
+            trace_context=run_ctx,
+            user_message=user_message,
+        )
+        if with_memory:
+            from llgraph.core.llm_settings import resolve_effective_model
+
+            write_session_last_run(
+                root,
+                thread_id,
+                outcome=outcome,
+                duration_sec=duration,
+                model=resolve_effective_model(root),
+                user_message=user_message,
+                error=exc,
+                trace_context=run_ctx,
+                source=run_source,
+            )
+        raise
+
+    duration = turn_result.duration_sec
+    run_ctx = trace_run_context(trace)
+    cancelled = cancel_check is not None and cancel_check()
+    if cancelled:
+        log_turn_failure(
+            root,
+            thread_id=thread_id,
+            with_memory=with_memory,
+            agent=agent,
+            duration_sec=duration,
+            error=UserCancelledError("用户停止当前生成"),
+            tool_names=turn_result.tool_names,
+            compress_report=compress_report,
+            spill=context_spill,
+            spill_count_at_start=spill_count_at_start,
+            trace_mode=trace.mode.value,
+            outcome="cancelled",
+            trace_context=run_ctx,
+            user_message=user_message,
+        )
+        if with_memory:
+            from llgraph.core.llm_settings import resolve_effective_model
+
+            write_session_last_run(
+                root,
+                thread_id,
+                outcome="cancelled",
+                duration_sec=duration,
+                model=resolve_effective_model(root),
+                user_message=user_message,
+                error=UserCancelledError("用户停止当前生成"),
+                trace_context=run_ctx,
+                source=run_source,
+            )
+    else:
+        log_turn_end(
+            root,
+            thread_id=thread_id,
+            with_memory=with_memory,
+            agent=agent,
+            tool_names=turn_result.tool_names,
+            duration_sec=duration,
+            compress_report=compress_report,
+            spill=context_spill,
+            spill_count_at_start=spill_count_at_start,
+            trace_mode=trace.mode.value,
+            trace_context=run_ctx,
+            user_message=user_message,
+        )
+        if with_memory:
+            from llgraph.core.llm_settings import resolve_effective_model
+
+            write_session_last_run(
+                root,
+                thread_id,
+                outcome="ok",
+                duration_sec=duration,
+                model=resolve_effective_model(root),
+                user_message=user_message,
+                trace_context=run_ctx,
+                source=run_source,
+            )
     if with_memory:
         from llgraph.context.incremental_context import (
             apply_incremental_tool_prune_to_agent_state,
@@ -571,7 +578,12 @@ def invoke_agent(
         )
         from llgraph.session.session_file_store import persist_agent_session
 
-        persist_agent_session(agent, root, thread_id)
+        persist_agent_session(
+            agent,
+            root,
+            thread_id,
+            turn_image_refs=turn_image_refs or None,
+        )
         end_prune = apply_incremental_tool_prune_to_agent_state(
             agent,
             thread_id=thread_id,

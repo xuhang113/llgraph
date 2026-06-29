@@ -4,6 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from llgraph.code_index.paths import DEFAULT_SEARCH_TOP_K
 from llgraph.code_index.parallel_search import search_parallel
 from llgraph.code_index.search import search_semantic
 from llgraph.config.config import load_llgraph_env
@@ -21,7 +22,7 @@ def main(argv: list[str] | None = None) -> None:
         default="parallel",
         help="parallel（默认）= 字面量 grep + 向量；hybrid 为 parallel 别名；semantic = 纯向量",
     )
-    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--top-k", type=int, default=DEFAULT_SEARCH_TOP_K)
     parser.add_argument("--path", default=".", metavar="PREFIX")
     parser.add_argument(
         "--log-level",

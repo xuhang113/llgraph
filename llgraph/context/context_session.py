@@ -1,5 +1,7 @@
 """会话级 Rule / Skill 配置（/rule、/skill 命令修改）。"""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 
@@ -48,3 +50,17 @@ class ContextSession:
     def clear_skills(self) -> None:
         """清空已启用技能。"""
         self.active_skills.clear()
+
+    def fork(self) -> ContextSession:
+        """
+        复制会话级 Rule/Skill 状态（并行 Worker 独立 ctx）。
+
+        @return 新 ContextSession 快照
+        """
+        return ContextSession(
+            active_skills=list(self.active_skills),
+            disabled_rules=set(self.disabled_rules),
+            forced_rules=set(self.forced_rules),
+            write_failure_hint=self.write_failure_hint,
+            survey_enabled=self.survey_enabled,
+        )

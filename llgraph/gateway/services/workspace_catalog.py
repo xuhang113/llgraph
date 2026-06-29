@@ -7,8 +7,13 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from llgraph.config.workspace_config import is_packaged_example_workspace
 from llgraph.gateway.types import WorkspaceRecord
-from llgraph.session.user_storage import user_context_root, workspace_context_slug
+from llgraph.session.user_storage import (
+    is_ephemeral_workspace_path,
+    user_context_root,
+    workspace_context_slug,
+)
 
 
 def resolve_context_root() -> Path:
@@ -98,9 +103,38 @@ def _workspace_record(ctx_dir: Path, slug: str, ws_path: str) -> WorkspaceRecord
     )
 
 
+def _hide_duplicate_workspace_markers(workspace: Path, *, keep_slug: str) -> None:
+    """同一路径只保留 canonical slug，其余 context 目录从最近列表隐藏。"""
+    ctx_root = resolve_context_root()
+    if not ctx_root.is_dir():
+        return
+    try:
+        resolved = str(workspace.expanduser().resolve())
+    except OSError:
+        return
+    for child in ctx_root.iterdir():
+        if not child.is_dir() or child.name == keep_slug:
+            continue
+        data = _read_workspace_marker(child / "workspace.json")
+        path = str(data.get("path") or "").strip()
+        if not path:
+            continue
+        try:
+            if str(Path(path).expanduser().resolve()) == resolved:
+                _write_workspace_marker(
+                    child,
+                    Path(path),
+                    hidden_from_recent=True,
+                )
+        except OSError:
+            continue
+
+
 def list_workspaces() -> list[WorkspaceRecord]:
     """
     扫描 context 下所有工作区（跳过已从最近列表移除的项）。
+
+    同一路径只保留 canonical slug；临时目录与无效 path 不展示。
 
     @return WorkspaceRecord 列表，按最近活跃排序
     """
@@ -108,7 +142,8 @@ def list_workspaces() -> list[WorkspaceRecord]:
     if not ctx_root.is_dir():
         return []
 
-    workspaces: list[tuple[str, WorkspaceRecord]] = []
+    merged: dict[str, tuple[str, WorkspaceRecord]] = {}
+
     for child in sorted(ctx_root.iterdir()):
         if not child.is_dir():
             continue
@@ -117,11 +152,50 @@ def list_workspaces() -> list[WorkspaceRecord]:
         data = _read_workspace_marker(marker)
         if data.get("hidden_from_recent"):
             continue
-        ws_path = str(data.get("path") or "")
-        record = _workspace_record(child, slug, ws_path)
-        workspaces.append((_recent_sort_key(data, record.updated_at), record))
-    workspaces.sort(key=lambda item: item[0], reverse=True)
-    return [record for _, record in workspaces]
+        ws_path = str(data.get("path") or "").strip()
+        if not ws_path:
+            continue
+        try:
+            ws = Path(ws_path).expanduser()
+            try:
+                resolved = str(ws.resolve())
+            except OSError:
+                resolved = str(ws)
+            if is_ephemeral_workspace_path(resolved):
+                _write_workspace_marker(child, ws, hidden_from_recent=True)
+                continue
+            if is_packaged_example_workspace(resolved):
+                _write_workspace_marker(child, ws, hidden_from_recent=True)
+                continue
+            if not ws.is_dir():
+                continue
+        except OSError:
+            continue
+
+        canonical_slug = workspace_context_slug(ws)
+        canonical_ctx = ctx_root / canonical_slug
+        if slug != canonical_slug:
+            _write_workspace_marker(
+                canonical_ctx,
+                ws,
+                hidden_from_recent=False,
+                touch_opened=False,
+            )
+            _write_workspace_marker(
+                child,
+                ws,
+                hidden_from_recent=True,
+            )
+
+        marker_data = _read_workspace_marker(canonical_ctx / "workspace.json")
+        record = _workspace_record(canonical_ctx, canonical_slug, resolved)
+        sort_key = _recent_sort_key(marker_data, record.updated_at)
+        prev = merged.get(resolved)
+        if prev is None or sort_key > prev[0]:
+            merged[resolved] = (sort_key, record)
+
+    items = sorted(merged.values(), key=lambda item: item[0], reverse=True)
+    return [record for _, record in items]
 
 
 def resolve_workspace_path(slug: str) -> str:
@@ -141,7 +215,10 @@ def resolve_workspace_path(slug: str) -> str:
     path = str(data.get("path") or "").strip()
     if not path:
         raise FileNotFoundError(f"workspace.json 无 path: {slug}")
-    return str(Path(path).expanduser().resolve())
+    ws = Path(path).expanduser()
+    if not ws.is_dir():
+        raise FileNotFoundError(f"工作区路径不存在: {path}")
+    return str(ws.resolve())
 
 
 def register_workspace(path: str) -> WorkspaceRecord:
@@ -154,6 +231,10 @@ def register_workspace(path: str) -> WorkspaceRecord:
     ws = Path(path).expanduser().resolve()
     if not ws.is_dir():
         raise FileNotFoundError(f"不是有效目录: {path}")
+    if is_ephemeral_workspace_path(str(ws)):
+        raise ValueError("不能用系统临时目录作为工作区，请选择真实项目目录")
+    if is_packaged_example_workspace(str(ws)):
+        raise ValueError("不能使用 llgraph 包内 examples 模板目录作为工作区")
     slug = workspace_context_slug(ws)
     ctx_dir = resolve_context_root() / slug
     _write_workspace_marker(
@@ -162,6 +243,7 @@ def register_workspace(path: str) -> WorkspaceRecord:
         hidden_from_recent=False,
         touch_opened=True,
     )
+    _hide_duplicate_workspace_markers(ws, keep_slug=slug)
     return _workspace_record(ctx_dir, slug, str(ws))
 
 

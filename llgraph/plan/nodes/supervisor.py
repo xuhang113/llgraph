@@ -12,6 +12,7 @@ from llgraph.plan.task_scheduling import (
     deps_satisfied,
     done_task_ids,
     pick_forced_tasks,
+    recover_stale_running_tasks,
 )
 from llgraph.plan.workflow_view import build_workflow_snapshot
 
@@ -129,7 +130,7 @@ def route_after_supervisor(state: dict[str, Any]) -> str:
     phase = str(state.get("phase") or "")
     if phase in (PlanPhase.CANCELLED, PlanPhase.COMPLETED):
         return "end"
-    if state.get("cancel_requested") or is_cancel_requested(str(state.get("thread_id") or "")):
+    if state.get("cancel_requested"):
         return "end"
 
     batch = state.get("parallel_batch")
@@ -140,6 +141,8 @@ def route_after_supervisor(state: dict[str, Any]) -> str:
     if all_tasks_terminal(plan):
         return "synthesize"
     if has_blocking_failures(plan):
+        return "confirm"
+    if isinstance(batch, list) and not batch:
         return "confirm"
     return "end"
 
@@ -172,6 +175,10 @@ def supervisor_node(state: dict[str, Any], ctx: PlanRuntimeContext) -> dict[str,
         disk = load_plan(ctx.workspace, plan_id, plans_dir=ctx.settings.plans_dir)
         if disk:
             plan = disk
+
+    plan, recovered = recover_stale_running_tasks(plan)
+    if recovered and plan_id:
+        save_plan(ctx.workspace, plan, plans_dir=ctx.settings.plans_dir)
 
     if has_blocking_failures(plan) and not all_tasks_terminal(plan):
         plan["phase"] = PlanPhase.AWAITING_CONFIRM

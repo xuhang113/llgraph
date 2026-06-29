@@ -7,42 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from llgraph.core.agent_config import load_agent_config
+from llgraph.loaders.prompt_loader import compose_thought_block_header, compose_thought_builtin_retrieval
 from llgraph.loaders.rules_loader import _parse_bool, _parse_frontmatter
 
 LLGRAPH_DIR_NAME = ".llgraph"
 THOUGHT_DIR_NAME = "thought"
 AGENT_CONFIG_FILE = "agent.json"
-
-# 包内默认 Thought（工作区未配置时使用）
-_BUILTIN_RETRIEVAL_THOUGHT = """\
-## 调工具前的规划（Thought）
-
-每轮**准备调用工具之前**，先用 1～3 句中文说明：当前目标、上一步结果、本步打算做什么。
-若终端为 `/trace all`，这段规划会显示在「模型规划」之前，便于对照。
-
-## 目录浏览与文件发现（禁止 shell 替代）
-
-- **list_directory**：列目录（如 `path="docs"`、`.llgraph/context/tool-results`）；**禁止** `ls` / `ls -la`。
-- **glob_files**：按文件名找（如 `**/collect_alert.sh`）；**禁止** `find`。
-- **grep_files**：按内容搜（含 .md）；**禁止** shell `grep`/`rg`。
-- **read_file**：读已知路径文件；**禁止** shell `cat`/`head`/`tail`。
-
-## 批量文件名检索（禁止逐个 glob）
-
-- **多个已知文件名/脚本名**：**一次** `grep_files`（如 `pattern="collect_alert|gitlab_monitor|dm-daily-task"`，`path="markdowns"` 或 `path="."`）；**禁止**对每个名字单独 `glob_files`。
-- **glob 全未命中或连续多个 glob 为 0**：源文件可能不在工作区，仅在 **markdowns/docs** 台账/crontab 文档中被引用；改 `grep_files`（`path="markdowns"` 或 `path="docs"`）或 `read_file` 已知文档，**勿再逐个 glob**。
-
-## 检索无结果时必须重试（勿立刻断言「不存在」）
-
-1. **glob_files**：文件名是否存在（如 `**/collect_alert.sh`）。
-2. **grep_files**：字面/正则搜内容（含 .md）；多词用 `词A|词B`。
-3. **search_code_parallel**：当轮不明确时可选一次；query 里自行扩展关键字；之后 grep_files 深挖。
-4. **search_workspace**：`keywords` 一次 **5～12** 个词；换 `path`（`markdowns`、`docs`）。
-5. **read_file**：manifest、embedding.json、README 等配置先读后答。
-
-同一用户问题内，至少换 **2 种**工具；**禁止**对同一 find/glob/ls 空结果重复超过 1 次。
-"""
-
 
 @dataclass(frozen=True)
 class ThoughtEntry:
@@ -186,14 +156,10 @@ def build_thought_prompt_block(workspace: Path) -> str:
     if not settings.enabled:
         return ""
 
-    parts: list[str] = ["## Agent 规划与检索规范（Thought，工作区可配置）", ""]
-
-    if settings.emit_plan_line:
-        parts.append(
-            "硬性要求：每次调用工具之前，必须先输出 1～3 句中文规划，"
-            "以「【规划】」开头，说明目标与上一步结果；然后再发起 tool_calls。"
-        )
-        parts.append("")
+    parts: list[str] = []
+    header = compose_thought_block_header(emit_plan_line=settings.emit_plan_line)
+    if header:
+        parts.extend([header, ""])
 
     entries = discover_thoughts(workspace)
     if entries:
@@ -202,7 +168,7 @@ def build_thought_prompt_block(workspace: Path) -> str:
             parts.append(entry.body)
             parts.append("")
     elif settings.use_builtin_fallback:
-        parts.append(_BUILTIN_RETRIEVAL_THOUGHT.strip())
+        parts.append(compose_thought_builtin_retrieval())
         parts.append("")
 
     if len(parts) <= 2:

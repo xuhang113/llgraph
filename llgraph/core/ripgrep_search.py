@@ -155,6 +155,96 @@ def ripgrep_files(
     return rel_paths, ""
 
 
+_RG_CTX_LINE = re.compile(r"^(.+)-(\d+)-(.*)$")
+_RG_MATCH_LINE = re.compile(r"^(.+):(\d+):(.*)$")
+
+
+def _format_rg_context_blocks(
+    stdout: str,
+    workspace: Path,
+    *,
+    limit: int,
+) -> list[str]:
+    """
+    解析 rg -C 输出为可读块（path:line + 上下文字行）。
+
+    @param stdout rg 标准输出
+    @param workspace 工作区根（转相对路径）
+    @param limit 最多匹配块数
+    @return 格式化块列表
+    """
+    root = workspace.expanduser().resolve()
+    blocks: list[str] = []
+    current_lines: list[tuple[int, str, bool]] = []
+    current_rel = ""
+    match_count = 0
+
+    def flush_block() -> None:
+        nonlocal match_count, current_lines, current_rel
+        if not current_lines:
+            return
+        match_line = next((ln for ln, _, is_match in current_lines if is_match), None)
+        if match_line is None:
+            current_lines = []
+            current_rel = ""
+            return
+        header = f"--- {current_rel}:{match_line} ---"
+        body_lines: list[str] = []
+        for line_no, text, is_match in current_lines:
+            prefix = ">>>" if is_match else "   "
+            clipped = text if len(text) <= 200 else text[:200] + "..."
+            body_lines.append(f"{prefix} {line_no}| {clipped}")
+        blocks.append(header + "\n" + "\n".join(body_lines))
+        match_count += 1
+        current_lines = []
+        current_rel = ""
+
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line == "--":
+            flush_block()
+            if match_count >= limit:
+                break
+            continue
+        match_m = _RG_MATCH_LINE.match(line)
+        if match_m:
+            abs_or_rel, line_no_s, snippet = match_m.group(1), match_m.group(2), match_m.group(3)
+            try:
+                rel = Path(abs_or_rel).resolve().relative_to(root).as_posix()
+            except ValueError:
+                rel = abs_or_rel
+            try:
+                line_no = int(line_no_s)
+            except ValueError:
+                continue
+            if current_lines and rel != current_rel:
+                flush_block()
+                if match_count >= limit:
+                    break
+            current_rel = rel
+            current_lines.append((line_no, snippet.strip(), True))
+            continue
+        ctx_m = _RG_CTX_LINE.match(line)
+        if ctx_m:
+            abs_or_rel, line_no_s, snippet = ctx_m.group(1), ctx_m.group(2), ctx_m.group(3)
+            try:
+                rel = Path(abs_or_rel).resolve().relative_to(root).as_posix()
+            except ValueError:
+                rel = abs_or_rel
+            try:
+                line_no = int(line_no_s)
+            except ValueError:
+                continue
+            if not current_lines:
+                current_rel = rel
+            current_lines.append((line_no, snippet.strip(), False))
+
+    flush_block()
+    return blocks[:limit]
+
+
 def ripgrep_content(
     workspace: Path,
     pattern: str,
@@ -162,18 +252,20 @@ def ripgrep_content(
     path_prefix: str = ".",
     file_glob: str = "",
     limit: int = 80,
+    context_lines: int = 0,
     skip_dirs: frozenset[str] | tuple[str, ...] | None = None,
 ) -> tuple[list[str], str]:
     """
-    在工作区文本文件中搜索（rg -n）。
+    在工作区文本文件中搜索（rg -n，可选 -C 上下文）。
 
     @param workspace 工作区根
     @param pattern 正则或字面量
     @param path_prefix 起始相对目录
     @param file_glob 可选文件名 glob，如 *.md
     @param limit 最多匹配行数
+    @param context_lines 每条命中附加上下文行数（0=仅匹配行）
     @param skip_dirs 额外跳过目录
-    @return (path:line: snippet 列表, 错误文案)
+    @return (格式化命中列表, 错误文案)
     """
     root = workspace.expanduser().resolve()
     search_root = (root / path_prefix.strip().lstrip("/")).resolve()
@@ -196,6 +288,8 @@ def ripgrep_content(
         str(max(1, limit)),
         *_rg_skip_glob_args(merged_skip),
     ]
+    if context_lines > 0:
+        cmd.extend(["-C", str(context_lines)])
     if file_glob.strip():
         cmd.extend(["--iglob", file_glob.strip()])
     else:
@@ -228,6 +322,10 @@ def ripgrep_content(
     if proc.returncode not in (0, 1):
         err = (stderr or stdout or "").strip()
         return [], f"ripgrep 失败 (exit {proc.returncode}): {err[:200]}"
+
+    if context_lines > 0:
+        blocks = _format_rg_context_blocks(stdout, root, limit=limit)
+        return blocks, ""
 
     hits: list[str] = []
     for line in stdout.splitlines():

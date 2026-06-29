@@ -5,7 +5,20 @@ from pathlib import Path
 from langchain_core.tools import StructuredTool
 
 from llgraph.code_index.parallel_search import search_parallel
+from llgraph.code_index.paths import DEFAULT_SEARCH_TOP_K
 from llgraph.code_index.search import search_semantic
+from llgraph.core.tool_execution_context import (
+    count_tool_results_since_user,
+    get_tool_execution_messages,
+)
+
+_DUPLICATE_PARALLEL_MSG = (
+    "【llgraph 拦截】本用户问题已调用过 search_code_parallel，禁止再次调用（换 query 仍算同一问题）。\n"
+    "请改用（不要再 parallel）：\n"
+    "1. grep_files(pattern=\"业务词|字段名|类名\", path=\".\") — 不确定仓库时用 path=\".\"；\n"
+    "2. read_files(paths=[...]) 或 read_file(path, start_line, end_line) 宽段精读；\n"
+    "3. path 须来自 list_directory/parallel/glob 结果，禁止猜目录名。"
+)
 
 
 def create_code_index_tools(workspace_root: Path) -> list:
@@ -19,7 +32,7 @@ def create_code_index_tools(workspace_root: Path) -> list:
 
     def search_code_semantic(
         query: str,
-        top_k: int = 15,
+        top_k: int = DEFAULT_SEARCH_TOP_K,
         path_prefix: str = ".",
     ) -> str:
         """
@@ -29,7 +42,7 @@ def create_code_index_tools(workspace_root: Path) -> list:
         不适用：已知精确符号请用 grep_files。
 
         @param query 自然语言或概念描述（可含中英文、服务名、业务词）
-        @param top_k 返回条数，默认 15
+        @param top_k 返回条数，默认 8
         @param path_prefix 限定相对子目录，默认 .
         """
         return search_semantic(
@@ -43,19 +56,22 @@ def create_code_index_tools(workspace_root: Path) -> list:
 
     def search_code_parallel(
         query: str,
-        top_k: int = 15,
+        top_k: int = DEFAULT_SEARCH_TOP_K,
         path_prefix: str = ".",
     ) -> str:
         """
         并行代码检索（字面量 grep + 向量，无内嵌 LLM）。
 
-        意图不清时**可选调用一次**；请在 query 里自行扩展类名/关键字（空格分隔）。
-        同一轮后续用 read_files + grep_files 追上下游，勿再调用本工具。
+        **每个用户问题最多 1 次**；用户问题已含字段名/类名时应先用 grep_files(path=".")，勿调用本工具。
+        之后必须用 grep_files + read_files/read_file；换 query 再调会被拦截。
 
-        @param query 主 Agent 扩展后的检索词（类名 + 业务描述）
-        @param top_k 最终返回条数，默认 15
-        @param path_prefix 限定相对子目录（建议仓库名），默认 .
+        @param query 检索词（类名 + 业务描述，空格分隔，建议 5+ 词）
+        @param top_k 最终返回条数，默认 8
+        @param path_prefix 限定相对子目录，默认 .；不确定时用 .
         """
+        prior = get_tool_execution_messages()
+        if count_tool_results_since_user(prior, "search_code_parallel") >= 1:
+            return _DUPLICATE_PARALLEL_MSG
         return search_parallel(
             root,
             query,

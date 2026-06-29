@@ -401,8 +401,6 @@ class SessionEditTracker:
         """
         if result.action in {"restored", "deleted"}:
             self._drop_path_ledger(rel)
-        elif result.action == "skipped" and not self._is_undo_pending(rel):
-            self._drop_path_ledger(rel)
         return result
 
     def restore_path(self, rel_path: str) -> UndoItemResult:
@@ -444,9 +442,10 @@ class SessionEditTracker:
             except OSError as exc:
                 return UndoItemResult(rel, "failed", str(exc))
 
-        return self._finalize_undo(
+        return UndoItemResult(
             rel,
-            UndoItemResult(rel, "skipped", "无快照且磁盘上不存在该文件"),
+            "failed",
+            "账本有记录但磁盘上找不到该路径的文件（可能路径不一致或通过 shell 写入到其他位置）",
         )
 
     def restore_all(self) -> list[UndoItemResult]:

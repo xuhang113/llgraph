@@ -168,6 +168,25 @@ def is_registered_meta_command(text: str, workspace: Path) -> bool:
     return resolve_command(workspace, token) is not None
 
 
+def resolve_meta_display_mode(text: str, workspace: Path) -> str:
+    """
+    Web UI 元命令结果展示方式。
+
+    @param text 用户输入
+    @param workspace 工作区根
+    @return modal：弹窗展示，不写入对话区；agent：已注入 Agent 会话，应刷新历史
+    """
+    token = _meta_command_token(text)
+    if token is None:
+        return "modal"
+    if token in _BUILTIN_META_COMMAND_NAMES:
+        return "modal"
+    cmd = resolve_command(workspace, token)
+    if cmd is not None and cmd.handler == "prompt":
+        return "agent"
+    return "modal"
+
+
 def _handle_index_meta_command(line: str, workspace: Path) -> bool:
     """
     处理 /index 及子命令（在交互会话内构建索引）。

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from llgraph.code_index.paths import (
+    DEFAULT_SEARCH_TOP_K,
     DEFAULT_VECTOR_DIM,
     META_FILENAME,
     TABLE_NAME,
@@ -220,7 +221,7 @@ def search_vectors(
     workspace: Path,
     query_vector: list[float],
     *,
-    top_k: int = 15,
+    top_k: int = DEFAULT_SEARCH_TOP_K,
     path_prefix: str = "",
 ) -> list[dict[str, Any]]:
     """

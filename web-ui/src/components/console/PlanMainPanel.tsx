@@ -10,6 +10,10 @@ interface Props {
   onTaskSelect: (taskId: string) => void;
   onPlanConfirm: () => void;
   onPlanContinue: () => void;
+  onPlanStop?: () => void;
+  onPlanAbort?: () => void;
+  onTaskStop?: (taskId: string) => void;
+  onTaskRun?: (taskId: string) => void;
 }
 
 function phaseLabel(phase: string): string {
@@ -30,6 +34,10 @@ export default function PlanMainPanel({
   onTaskSelect,
   onPlanConfirm,
   onPlanContinue,
+  onPlanStop,
+  onPlanAbort,
+  onTaskStop,
+  onTaskRun,
 }: Props) {
   const snap = planDetail.workflow_snapshot;
   const wfTasks = snap?.tasks || [];
@@ -53,10 +61,16 @@ export default function PlanMainPanel({
   const showContinue =
     planDetail.phase === 'executing' && incompleteCount > 0 && !planDetail.job?.running;
   const showSynthesizeContinue =
-    planDetail.phase === 'executing' &&
     incompleteCount === 0 &&
     !planDetail.final_report &&
-    !planDetail.job?.running;
+    !planDetail.job?.running &&
+    planDetail.phase === 'executing';
+
+  const showAbort =
+    onPlanAbort &&
+    (planDetail.phase === 'planning' ||
+      planDetail.phase === 'awaiting_confirm' ||
+      planDetail.phase === 'executing');
 
   return (
     <div className="cursor-plan-main">
@@ -96,8 +110,26 @@ export default function PlanMainPanel({
           currentTaskId={currentTaskId}
           variant="main"
           onTaskSelect={onTaskSelect}
+          onTaskStop={onTaskStop}
+          onTaskRun={onTaskRun}
+          planJobRunning={!!planDetail.job?.running}
         />
         <div className="cursor-plan-actions">
+          {planDetail.job?.running && onPlanStop && (
+            <button type="button" className="cursor-btn-danger" onClick={onPlanStop} disabled={busy}>
+              停止执行
+            </button>
+          )}
+          {showAbort && (
+            <button
+              type="button"
+              className="cursor-btn-ghost cursor-btn-danger-outline"
+              onClick={onPlanAbort}
+              disabled={busy && !!planDetail.job?.running}
+            >
+              取消 Plan
+            </button>
+          )}
           {planDetail.phase === 'awaiting_confirm' && (
             <button type="button" className="cursor-btn-primary" onClick={onPlanConfirm}>
               确认计划

@@ -68,10 +68,18 @@ EXTRA_SPECS: tuple[ExtraSpec, ...] = (
         modules=("tavily",),
         pip_hint="pip install -e '.[search]'",
     ),
+    ExtraSpec(
+        extra="web",
+        title="Web Console",
+        features="llgraph web、图片 multipart 上传（fastapi + uvicorn + python-multipart）",
+        modules=("fastapi", "uvicorn", "multipart"),
+        pip_hint="pip install -e '.[web]'  或  uv sync --extra web",
+    ),
 )
 
-BASE_INSTALL = "pip install -e ."
-FULL_DEV_HINT = "pip install -e '.[terminal,index,watch,mcp,search,ast]'"
+BASE_INSTALL = "pip install -e .  或  uv sync"
+FULL_DEV_HINT = "uv sync --extra web --extra terminal --extra index --extra watch --extra mcp --extra search --extra ast --extra dev"
+SETUP_SCRIPT_HINT = "./scripts/setup.sh dev"
 
 
 def _module_available(name: str) -> bool:
@@ -115,7 +123,17 @@ def suggest_pip_install(*, include_terminal: bool = True) -> str:
         missing = [name for name in missing if name != "terminal"]
     if not missing:
         return BASE_INSTALL + "  # 常用 optional 已就绪"
+    if command_has_uv():
+        parts = " ".join(f"--extra {name}" for name in missing)
+        return f"uv sync {parts}  或  {SETUP_SCRIPT_HINT}"
     return f"pip install -e '.[{','.join(missing)}]'"
+
+
+def command_has_uv() -> bool:
+    """PATH 中是否可用 uv。"""
+    import shutil
+
+    return shutil.which("uv") is not None
 
 
 def format_install_extras_report(*, missing_only: bool = False) -> str:
@@ -151,7 +169,8 @@ def format_install_extras_report(*, missing_only: bool = False) -> str:
 
     lines.append("【推荐】")
     if missing_names:
-        lines.append(f"  补装: {suggest_pip_install()}")
+        lines.append(f"  一键安装: {SETUP_SCRIPT_HINT}")
+        lines.append(f"  或补装: {suggest_pip_install()}")
         lines.append("")
         lines.append("  对照当前用法:")
         need: list[str] = []

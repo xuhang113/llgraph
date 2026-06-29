@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from llgraph.context.context_session import ContextSession
-from llgraph.survey.edit_confirm import EditConfirmGate
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.display.trace_display import TraceSession
 from llgraph.sandbox.policy import SandboxPolicy
@@ -34,7 +33,6 @@ class AgentSessionContext:
     on_file_changed: Callable[[str], None] | None = None
     watch_service: Any | None = None
     web_search_enabled: bool = False
-    edit_confirm_gate: EditConfirmGate | None = None
     sandbox_policy: SandboxPolicy | None = None
     sandbox_cli_enabled: bool | None = None
     mode_switch: SessionModeTransition | None = None

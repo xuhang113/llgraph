@@ -71,6 +71,12 @@ def build_workspace_context_block(
 
     sections: list[str] = [format_file_access_workspace_context(allow_write)]
 
+    sections.append(
+        "## 工具批量（ReAct 默认）\n"
+        "同一步若需 ≥2 次 grep/read/list/glob → **一条 assistant 消息多个 tool_call**；"
+        "grep 多词用 `pattern=\"a|b|c\"`；禁止拆成多轮单 grep/read。"
+    )
+
     from llgraph.context.context_continuity import build_continuity_context_hint
 
     continuity = build_continuity_context_hint(
@@ -88,6 +94,12 @@ def build_workspace_context_block(
     hint = session.write_failure_hint.strip()
     if hint:
         sections.append(hint)
+
+    from llgraph.core.search_path_tracker import format_retrieval_batch_hint
+
+    batch_hint = format_retrieval_batch_hint(user_message)
+    if batch_hint:
+        sections.append(batch_hint)
 
     return "\n\n".join(sections)
 

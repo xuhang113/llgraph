@@ -8,6 +8,18 @@ from pathlib import Path
 
 from llgraph.config.edit_settings import load_agent_config
 from llgraph.core.gateway_models import ModelCatalogEntry, load_model_catalog
+from llgraph.core.model_thinking_profile import (
+    apply_thinking_dispatch_overrides,
+    dispatch_preserves_thinking_on_outbound,
+    resolve_model_thinking_spec,
+)
+
+__all__ = [
+    "MessageDispatchProfile",
+    "canonical_persist_profile",
+    "dispatch_preserves_thinking_on_outbound",
+    "resolve_dispatch_profile",
+]
 
 
 @dataclass(frozen=True)
@@ -140,7 +152,7 @@ def _heuristic_dispatch_profile(model_id: str) -> MessageDispatchProfile:
     mid = model_id.strip().lower()
     if re.search(r"kimi-k2", mid, re.I):
         return MessageDispatchProfile(
-            expand_parallel_tool_rounds=True,
+            expand_parallel_tool_rounds=False,
             patch_tool_ai_reasoning=True,
             strip_assistant_thinking_blocks=False,
             label=f"{model_id}(heuristic:kimi-k2)",
@@ -152,16 +164,23 @@ def _heuristic_dispatch_profile(model_id: str) -> MessageDispatchProfile:
             strip_assistant_thinking_blocks=True,
             label=f"{model_id}(heuristic:anthropic-openai)",
         )
-    if re.search(r"^(glm|minimax|deepseek)", mid, re.I):
+    if re.search(r"^deepseek", mid, re.I):
         return MessageDispatchProfile(
-            expand_parallel_tool_rounds=True,
+            expand_parallel_tool_rounds=False,
+            patch_tool_ai_reasoning=False,
+            strip_assistant_thinking_blocks=False,
+            label=f"{model_id}(heuristic:deepseek)",
+        )
+    if re.search(r"^(glm|minimax)", mid, re.I):
+        return MessageDispatchProfile(
+            expand_parallel_tool_rounds=False,
             patch_tool_ai_reasoning=False,
             strip_assistant_thinking_blocks=True,
             label=f"{model_id}(heuristic:strict-tool)",
         )
     if re.search(r"kimi", mid, re.I):
         return MessageDispatchProfile(
-            expand_parallel_tool_rounds=True,
+            expand_parallel_tool_rounds=False,
             patch_tool_ai_reasoning=False,
             strip_assistant_thinking_blocks=False,
             label=f"{model_id}(heuristic:kimi)",
@@ -177,34 +196,61 @@ def _heuristic_dispatch_profile(model_id: str) -> MessageDispatchProfile:
 def resolve_dispatch_profile(
     workspace: Path | None,
     model_id: str | None = None,
+    *,
+    thinking_enabled: bool | None = None,
 ) -> MessageDispatchProfile:
     """
     解析当前模型的出站修链策略。
 
-    优先级：catalog 项 dispatch > llm.message_dispatch_defaults > 模型名启发式。
+    优先级：catalog 项 dispatch > llm.message_dispatch_defaults > 模型名启发式；
+    thinking 开启且模型支持时，再覆盖 strip/patch 策略。
 
     @param workspace 工作区根
     @param model_id 模型 id；None 时用 resolve_effective_model
+    @param thinking_enabled 是否 thinking 模式；None 时读运行时/agent.json
     @return MessageDispatchProfile
     """
     from llgraph.core.llm_settings import resolve_effective_model
+    from llgraph.core.model_thinking import is_thinking_enabled
 
     effective = (model_id or "").strip() or resolve_effective_model(workspace)
+    base: MessageDispatchProfile | None = None
     catalog, _ = load_model_catalog(workspace)
     for entry in catalog:
         if entry.model_id == effective:
             from_catalog = _catalog_entry_profile(entry)
             if from_catalog is not None:
-                return from_catalog
+                base = from_catalog
             break
 
-    defaults = _global_dispatch_defaults(workspace)
-    if defaults is not None:
-        return _dispatch_from_mapping(
-            defaults,
-            label=f"{effective}(agent-defaults)",
-            fallback_expand=False,
-            fallback_reasoning=False,
-        )
+    if base is None:
+        defaults = _global_dispatch_defaults(workspace)
+        if defaults is not None:
+            base = _dispatch_from_mapping(
+                defaults,
+                label=f"{effective}(agent-defaults)",
+                fallback_expand=False,
+                fallback_reasoning=False,
+            )
+        else:
+            base = _heuristic_dispatch_profile(effective)
 
-    return _heuristic_dispatch_profile(effective)
+    enabled = (
+        thinking_enabled
+        if thinking_enabled is not None
+        else is_thinking_enabled(workspace, effective)
+    )
+    if enabled:
+        spec = resolve_model_thinking_spec(effective)
+        if spec.supports_thinking:
+            base = apply_thinking_dispatch_overrides(base, spec)
+    # DeepSeek Anthropic 协议要求多轮 tool 时原样回传 content[].thinking
+    if re.search(r"deepseek", effective, re.I) and base.strip_assistant_thinking_blocks:
+        from dataclasses import replace
+
+        base = replace(
+            base,
+            strip_assistant_thinking_blocks=False,
+            label=f"{base.label}+deepseek-preserve",
+        )
+    return base

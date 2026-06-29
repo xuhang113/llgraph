@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { LlmSettings } from '../../api/client';
+import type { Capabilities, LlmSettings } from '../../api/client';
 import ModelPicker from './ModelPicker';
 
 interface Props {
@@ -7,6 +7,10 @@ interface Props {
   busy: boolean;
   isAgent: boolean;
   webSearchEnabled?: boolean;
+  sandbox?: Capabilities['sandbox'];
+  allowWrite: boolean;
+  onAllowWriteChange: (enabled: boolean) => void;
+  onSandboxChange?: (enabled: boolean) => Promise<void>;
   onModelChange: (modelId: string) => Promise<void>;
   onThinkingChange: (enabled: boolean) => void;
   onWebSearchChange?: (enabled: boolean) => Promise<void>;
@@ -17,6 +21,10 @@ export default function AgentToolbar({
   busy,
   isAgent,
   webSearchEnabled = false,
+  sandbox,
+  allowWrite,
+  onAllowWriteChange,
+  onSandboxChange,
   onModelChange,
   onThinkingChange,
   onWebSearchChange,
@@ -34,7 +42,7 @@ export default function AgentToolbar({
     [],
   );
 
-  if (!isAgent) {
+  if (!isAgent && !sandbox && !onWebSearchChange) {
     return null;
   }
 
@@ -54,7 +62,9 @@ export default function AgentToolbar({
 
   return (
     <div className="cursor-agent-toolbar">
-      {llm && llm.models.length > 0 && (
+      {!llm ? (
+        <span className="cursor-agent-toolbar-hint">加载模型…</span>
+      ) : llm.models.length > 0 ? (
         <div className="cursor-agent-toolbar-field">
           <span className="cursor-agent-toolbar-label">模型</span>
           <ModelPicker
@@ -66,7 +76,39 @@ export default function AgentToolbar({
             onSelect={handleModelPick}
           />
         </div>
+      ) : (
+        <span className="cursor-agent-toolbar-hint">无可用模型</span>
       )}
+
+      {sandbox && onSandboxChange && (
+        <label
+          className="cursor-agent-toolbar-toggle"
+          title={
+            sandbox.enabled
+              ? `OS 沙箱已启用 · ${sandbox.backend || 'unknown'} · ${sandbox.mode}`
+              : sandbox.active
+                ? '沙箱已请求但未就绪（后端不可用）'
+                : '启用 OS 沙箱（macOS sandbox-exec / Linux bwrap）'
+          }
+        >
+          <input
+            type="checkbox"
+            checked={sandbox.enabled}
+            disabled={busy}
+            onChange={(e) => void onSandboxChange(e.target.checked)}
+          />
+          沙箱
+        </label>
+      )}
+
+      <label className="cursor-agent-toolbar-toggle" title="允许 Agent 写入工作区文件">
+        <input
+          type="checkbox"
+          checked={allowWrite}
+          onChange={(e) => onAllowWriteChange(e.target.checked)}
+        />
+        允许写
+      </label>
 
       {llm?.thinking.supported && (
         <label className="cursor-agent-toolbar-toggle" title="扩展思考（thinking）">

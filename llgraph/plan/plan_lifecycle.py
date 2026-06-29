@@ -18,6 +18,17 @@ def is_plan_terminal(state: dict[str, Any]) -> bool:
     return str(state.get("phase") or "") == PlanPhase.COMPLETED
 
 
+def is_plan_closed(state: dict[str, Any]) -> bool:
+    """
+    Plan 是否已关闭（completed 或 cancelled），不可再 start 新 goal。
+
+    @param state PlanState
+    @return 是否 closed
+    """
+    phase = str(state.get("phase") or "")
+    return phase in (PlanPhase.COMPLETED, PlanPhase.CANCELLED)
+
+
 def can_schedule_workers(state: dict[str, Any]) -> bool:
     """
     是否允许调度/重跑 Work task。
@@ -46,11 +57,12 @@ def needs_synthesize(state: dict[str, Any]) -> bool:
     """
     if is_plan_terminal(state):
         return False
-    phase = str(state.get("phase") or "")
-    if phase != PlanPhase.EXECUTING:
+    if str(state.get("phase") or "") == PlanPhase.CANCELLED:
+        return False
+    if str(state.get("final_report") or "").strip():
         return False
     plan = state.get("plan") if isinstance(state.get("plan"), dict) else {}
-    return all_tasks_terminal(plan) and not str(state.get("final_report") or "").strip()
+    return all_tasks_terminal(plan)
 
 
 def can_discuss(state: dict[str, Any]) -> bool:

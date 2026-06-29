@@ -1,19 +1,30 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, type Capabilities, type ContextUsage, type IndexStatus, type PlanDetail } from '../../api/client';
 import type { TraceStep } from '../../types/trace';
-import { partitionTraceMiscLines } from '../../types/trace';
+import { partitionTraceMiscLines, filterTraceMiscWhenSteps, traceStepsFingerprint } from '../../types/trace';
+import { useStickToBottomScroll } from '../../utils/useStickToBottomScroll';
 import WorkflowGraph from '../WorkflowGraph';
 import TraceStepList from './TraceStepList';
+import TraceTurnList from './TraceTurnList';
+import type { TraceTurn } from '../../types/trace';
+import { useAppDialog } from '../AppDialog';
+import {
+  CONTEXT_BREAKDOWN_LABELS,
+  formatContextTokens,
+} from '../../utils/contextDisplay';
 
 interface TraceLine {
   id: string;
   text: string;
 }
 
+export type RightPanelTab = 'trace' | 'tools' | 'context' | 'log' | 'plan';
+
 interface Props {
   caps: Capabilities | null;
   traceLines: TraceLine[];
   traceSteps: TraceStep[];
+  traceTurns?: TraceTurn[];
   liveThinking?: string;
   planDetail: PlanDetail | null;
   slug: string;
@@ -21,12 +32,17 @@ interface Props {
   isPlan: boolean;
   isAgent?: boolean;
   allowWrite?: boolean;
-  onMetaOutput?: (text: string) => void;
+  requestedTab?: RightPanelTab | null;
+  onRequestedTabHandled?: () => void;
   onTraceMode: (mode: string) => void;
   onPlanConfirm: () => void;
   onPlanContinue: () => void;
   busy: boolean;
+  contextRefreshSignal?: number;
   onTaskSelect?: (taskId: string) => void;
+  onCapsLoaded?: (caps: Capabilities) => void;
+  /** 当前轮已执行秒数（SSE 心跳 + 本地计时） */
+  traceActivitySec?: number;
 }
 
 function miscLineClass(line: string): string {
@@ -63,31 +79,11 @@ function traceModeHint(mode: string): string {
   }
 }
 
-function formatTokens(n: number): string {
-  if (n >= 10_000) {
-    return `~${(n / 1000).toFixed(1)}K`;
-  }
-  if (n >= 1000) {
-    return `~${(n / 1000).toFixed(1)}K`;
-  }
-  return `~${n}`;
-}
-
-const BREAKDOWN_LABELS: Record<string, string> = {
-  system_prompt: 'System prompt',
-  tool_definitions: 'Tool definitions',
-  rules: 'Rules',
-  skills: 'Skills',
-  mcp: 'MCP',
-  markdowns_index: 'Markdowns index',
-  summarized_conversation: 'Summarized conversation',
-  conversation: 'Conversation',
-};
-
 export default function CursorRightPanel({
   caps,
   traceLines,
   traceSteps,
+  traceTurns = [],
   liveThinking = '',
   planDetail,
   slug,
@@ -95,16 +91,22 @@ export default function CursorRightPanel({
   isPlan,
   isAgent = false,
   allowWrite = false,
-  onMetaOutput,
+  requestedTab = null,
+  onRequestedTabHandled,
   onTraceMode,
   onPlanConfirm,
   onPlanContinue,
   busy,
+  contextRefreshSignal = 0,
   onTaskSelect,
+  onCapsLoaded,
+  traceActivitySec = 0,
 }: Props) {
-  const [tab, setTab] = useState<'trace' | 'tools' | 'context' | 'log' | 'quick' | 'plan'>(
-    isPlan ? 'plan' : 'trace',
-  );
+  const { confirm } = useAppDialog();
+  const [tab, setTab] = useState<RightPanelTab>(isPlan ? 'plan' : 'trace');
+  const [toolsCaps, setToolsCaps] = useState<Capabilities | null>(caps);
+  const [toolsLoading, setToolsLoading] = useState(false);
+  const [toolsError, setToolsError] = useState('');
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [contextBusy, setContextBusy] = useState(false);
@@ -112,8 +114,40 @@ export default function CursorRightPanel({
   const [contextMsg, setContextMsg] = useState('');
   const [logLines, setLogLines] = useState<string[]>([]);
   const [logBusy, setLogBusy] = useState(false);
-  const [metaBusy, setMetaBusy] = useState(false);
-  const [metaMsg, setMetaMsg] = useState('');
+
+  useEffect(() => {
+    if (caps) {
+      setToolsCaps(caps);
+    }
+  }, [caps]);
+
+  useEffect(() => {
+    setTab(isPlan ? 'plan' : 'trace');
+  }, [isPlan, threadId]);
+
+  const loadToolsCaps = useCallback(async () => {
+    if (!slug) {
+      return;
+    }
+    setToolsLoading(true);
+    setToolsError('');
+    try {
+      const data = await api.capabilities(slug, allowWrite);
+      setToolsCaps(data);
+      onCapsLoaded?.(data);
+    } catch (err) {
+      setToolsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setToolsLoading(false);
+    }
+  }, [slug, allowWrite, onCapsLoaded]);
+
+  useEffect(() => {
+    if (tab !== 'tools' || !slug) {
+      return;
+    }
+    void loadToolsCaps();
+  }, [tab, slug, allowWrite, loadToolsCaps]);
 
   const refreshContextPanel = useCallback(async () => {
     if (!slug) {
@@ -158,38 +192,55 @@ export default function CursorRightPanel({
     }
   }, [tab, refreshContextPanel, refreshLogPanel]);
 
-  const runMeta = async (command: string) => {
-    if (!slug) {
-      return;
+  useEffect(() => {
+    if (tab === 'context') {
+      void refreshContextPanel();
     }
-    setMetaBusy(true);
-    setMetaMsg('');
-    try {
-      const res = await api.metaCommand(slug, command, allowWrite, isAgent ? threadId : '');
-      const out = res.output?.trim() || '（无输出）';
-      setMetaMsg(out);
-      onMetaOutput?.(out);
-    } catch (err) {
-      setMetaMsg(err instanceof Error ? err.message : String(err));
-    } finally {
-      setMetaBusy(false);
+  }, [contextRefreshSignal, tab, refreshContextPanel]);
+
+  useEffect(() => {
+    if (!busy && tab === 'context') {
+      void refreshContextPanel();
     }
-  };
+  }, [busy, tab, refreshContextPanel]);
+
+  useEffect(() => {
+    if (requestedTab) {
+      setTab(requestedTab);
+      onRequestedTabHandled?.();
+    }
+  }, [requestedTab, onRequestedTabHandled]);
 
   const traceMode = caps?.trace_mode ?? 'steps';
-  const sandbox = caps?.sandbox;
   const showProcess = traceMode === 'steps' || traceMode === 'all';
   const fullLog = traceLines.map((l) => l.text).join('\n');
   const miscLines = partitionTraceMiscLines(fullLog.split('\n'));
-  const hasStructuredSteps = traceSteps.length > 0;
+  const displayMiscLines = filterTraceMiscWhenSteps(miscLines, traceSteps.length);
+  const hasStructuredSteps = traceSteps.length > 0 || traceTurns.some((turn) => turn.steps.length > 0);
   const hasLogLines = fullLog.trim().length > 0;
   const thinkingChars = liveThinking.trim().length;
   /** all：完整日志；steps：里程碑/用户消息 + 结构化步骤（与终端一致） */
   const showFullLog = traceMode === 'all' && hasLogLines;
-  const showMiscLines = showProcess && traceMode === 'steps' && miscLines.length > 0;
+  const showMiscLines = showProcess && traceMode === 'steps' && displayMiscLines.length > 0;
   const hasTrace =
     (showProcess && (hasLogLines || hasStructuredSteps)) || thinkingChars > 0;
   const modeHint = traceModeHint(traceMode);
+
+  const traceScroll = useStickToBottomScroll<HTMLDivElement>(
+    [
+      traceStepsFingerprint(traceSteps),
+      traceTurns.map((t) => `${t.id}:${t.steps.length}`).join('|'),
+      traceLines.length,
+      traceLines.map((l) => l.text).join('\n').length,
+      liveThinking.length,
+      busy,
+      traceMode,
+      showFullLog,
+      displayMiscLines.length,
+      traceActivitySec,
+    ],
+    { enabled: tab === 'trace', resetKey: threadId },
+  );
 
   return (
     <aside className="cursor-right">
@@ -210,9 +261,6 @@ export default function CursorRightPanel({
         </button>
         <button type="button" className={tab === 'log' ? 'active' : ''} onClick={() => setTab('log')}>
           Log
-        </button>
-        <button type="button" className={tab === 'quick' ? 'active' : ''} onClick={() => setTab('quick')}>
-          快捷
         </button>
       </div>
 
@@ -243,7 +291,12 @@ export default function CursorRightPanel({
               </p>
             )}
             {modeHint && <p className="cursor-trace-mode-hint">{modeHint}</p>}
-            <div className="cursor-trace-log">
+            {busy && traceActivitySec >= 5 && showProcess && (
+              <p className="cursor-trace-mode-hint cursor-trace-mode-hint--active">
+                ⏳ 仍在执行… {traceActivitySec}s（工具或 LLM 阻塞时可能数十秒无新步骤，属正常）
+              </p>
+            )}
+            <div ref={traceScroll.ref} className="cursor-trace-log">
               {!showProcess && !thinkingChars && (
                 <div className="muted small">
                   当前模式不展示过程 trace。切换为 steps 或 all 可查看步骤记录。
@@ -273,33 +326,56 @@ export default function CursorRightPanel({
               )}
               {showMiscLines && (
                 <div className="cursor-trace-misc-block">
-                  {miscLines.map((line, index) => (
+                  {displayMiscLines.map((line, index) => (
                     <div key={index} className={miscLineClass(line)}>
                       {line}
                     </div>
                   ))}
                 </div>
               )}
-              {showProcess && hasStructuredSteps && (
+              {showProcess && (traceTurns.length > 0 || hasStructuredSteps) && (
                 <div className="cursor-trace-steps">
-                  <div className="cursor-trace-steps-label">步骤（可展开详情）</div>
-                  <TraceStepList
-                    steps={traceSteps}
-                    defaultOpenLast={busy}
-                    expandBodies={traceMode === 'all'}
-                  />
+                  {traceTurns.length > 0 ? (
+                    <TraceTurnList
+                      turns={traceTurns}
+                      defaultOpenLast={busy}
+                      expandBodies={traceMode === 'all'}
+                    />
+                  ) : (
+                    <>
+                      <div className="cursor-trace-steps-label">步骤（可展开详情）</div>
+                      <TraceStepList
+                        steps={traceSteps}
+                        defaultOpenLast={busy}
+                        expandBodies={traceMode === 'all'}
+                      />
+                    </>
+                  )}
                 </div>
               )}
             </div>
           </div>
         )}
 
-        {tab === 'tools' && caps && (
+        {tab === 'tools' && (
           <div className="cursor-tools-panel">
+            {toolsLoading && !toolsCaps && (
+              <p className="muted small">加载工具列表…</p>
+            )}
+            {toolsError && !toolsCaps && (
+              <div className="cursor-tools-error">
+                <p className="small">{toolsError}</p>
+                <button type="button" className="cursor-link-btn" onClick={() => void loadToolsCaps()}>
+                  重试
+                </button>
+              </div>
+            )}
+            {toolsCaps && (
+              <>
             <section>
-              <h4>内置 ({caps.builtin_tools.length})</h4>
+              <h4>内置 ({toolsCaps.builtin_tools.length})</h4>
               <ul className="cursor-catalog-list">
-                {caps.builtin_tools.map((t) => (
+                {toolsCaps.builtin_tools.map((t) => (
                   <li key={t.name} className="cursor-catalog-item">
                     <div className="cursor-catalog-item-name">{t.name}</div>
                     {t.description?.trim() && (
@@ -315,10 +391,10 @@ export default function CursorRightPanel({
               </ul>
             </section>
             <section>
-              <h4>MCP ({caps.mcp_tools.length})</h4>
-              <p className="small muted">{caps.mcp_summary}</p>
+              <h4>MCP ({toolsCaps.mcp_tools.length})</h4>
+              <p className="small muted">{toolsCaps.mcp_summary}</p>
               <ul className="cursor-catalog-list">
-                {caps.mcp_tools.map((t) => (
+                {toolsCaps.mcp_tools.map((t) => (
                   <li key={t.name} className="cursor-catalog-item">
                     <div className="cursor-catalog-item-name">{t.name}</div>
                     {t.description?.trim() && (
@@ -334,9 +410,9 @@ export default function CursorRightPanel({
               </ul>
             </section>
             <section>
-              <h4>Skills ({caps.skills.length})</h4>
+              <h4>Skills ({toolsCaps.skills.length})</h4>
               <ul className="cursor-catalog-list">
-                {caps.skills.map((s) => (
+                {toolsCaps.skills.map((s) => (
                   <li key={s.name} className="cursor-catalog-item">
                     <div className="cursor-catalog-item-name">
                       {s.name}
@@ -354,6 +430,11 @@ export default function CursorRightPanel({
                 ))}
               </ul>
             </section>
+              </>
+            )}
+            {!toolsLoading && toolsCaps && toolsCaps.builtin_tools.length === 0 && toolsCaps.mcp_tools.length === 0 && toolsCaps.skills.length === 0 && (
+              <p className="muted small">当前工作区暂无可用工具</p>
+            )}
           </div>
         )}
 
@@ -380,7 +461,7 @@ export default function CursorRightPanel({
                         {contextUsage.pct}% Full
                       </span>
                       <span>
-                        {formatTokens(contextUsage.total)} / {formatTokens(contextUsage.limit)} Tokens
+                        {formatContextTokens(contextUsage.total)} / {formatContextTokens(contextUsage.limit)} Tokens
                       </span>
                     </div>
                     <div className="cursor-context-bar">
@@ -395,8 +476,8 @@ export default function CursorRightPanel({
                       .filter(([, v]) => v > 0)
                       .map(([key, value]) => (
                         <li key={key}>
-                          <span>{BREAKDOWN_LABELS[key] || key}</span>
-                          <span>{formatTokens(value)}</span>
+                          <span>{CONTEXT_BREAKDOWN_LABELS[key] || key}</span>
+                          <span>{formatContextTokens(value)}</span>
                         </li>
                       ))}
                   </ul>
@@ -548,7 +629,7 @@ export default function CursorRightPanel({
               className="cursor-btn-ghost"
               disabled={logBusy}
               onClick={async () => {
-                if (!slug || !window.confirm('清理过期日志？')) {
+                if (!slug || !(await confirm({ message: '清理过期日志？', confirmLabel: '清理' }))) {
                   return;
                 }
                 setLogBusy(true);
@@ -567,74 +648,6 @@ export default function CursorRightPanel({
           </div>
         )}
 
-        {tab === 'quick' && (
-          <div className="cursor-quick-panel">
-            {sandbox && (
-              <section className="cursor-quick-sandbox">
-                <h4>沙箱</h4>
-                <p className="small">
-                  {sandbox.enabled
-                    ? `已启用 · ${sandbox.backend || 'unknown'} · mode=${sandbox.mode} · net=${sandbox.network}`
-                    : sandbox.active
-                      ? `已配置但未就绪（backend=${sandbox.backend || '无'}）`
-                      : '未启用'}
-                </p>
-              </section>
-            )}
-            <section>
-              <h4>元命令</h4>
-              <div className="cursor-quick-actions">
-                <button type="button" className="cursor-btn-ghost" disabled={metaBusy} onClick={() => void runMeta('/help')}>
-                  帮助
-                </button>
-                <button type="button" className="cursor-btn-ghost" disabled={metaBusy} onClick={() => void runMeta('/sessions')}>
-                  会话列表
-                </button>
-                <button type="button" className="cursor-btn-ghost" disabled={metaBusy} onClick={() => void runMeta('/context')}>
-                  上下文文本
-                </button>
-                <button type="button" className="cursor-btn-ghost" disabled={metaBusy} onClick={() => void runMeta('/index status')}>
-                  索引状态
-                </button>
-                <button
-                  type="button"
-                  className="cursor-btn-ghost"
-                  disabled={metaBusy}
-                  onClick={() => {
-                    setTab('log');
-                  }}
-                >
-                  执行日志
-                </button>
-                {isAgent && (
-                  <button
-                    type="button"
-                    className="cursor-btn-ghost"
-                    disabled={metaBusy || contextBusy}
-                    onClick={async () => {
-                      if (!slug || !threadId) {
-                        return;
-                      }
-                      setMetaBusy(true);
-                      try {
-                        const res = await api.compressContext(slug, threadId, allowWrite);
-                        setMetaMsg(res.message);
-                        onMetaOutput?.(res.message);
-                      } catch (err) {
-                        setMetaMsg(err instanceof Error ? err.message : String(err));
-                      } finally {
-                        setMetaBusy(false);
-                      }
-                    }}
-                  >
-                    压缩历史
-                  </button>
-                )}
-              </div>
-            </section>
-            {metaMsg && <pre className="cursor-context-msg">{metaMsg}</pre>}
-          </div>
-        )}
 
         {tab === 'plan' && planDetail && (
           <div className="cursor-plan-panel">
@@ -664,13 +677,33 @@ export default function CursorRightPanel({
               )}
               {(() => {
                 const wfTasks = planDetail.workflow_snapshot?.tasks || [];
-                const incomplete = wfTasks.some(
-                  (t) => t.status === 'pending' || t.status === 'running' || t.status === 'failed',
-                );
+                const planTasks = planDetail.tasks || [];
+                const taskIds =
+                  planTasks.length > 0
+                    ? planTasks.map((t) => String(t.id || ''))
+                    : wfTasks.map((t) => t.id);
+                const statusOf = (taskId: string): string => {
+                  const wf = wfTasks.find((t) => t.id === taskId);
+                  const row = planTasks.find((t) => String(t.id) === taskId);
+                  return String(wf?.worker_node_status || wf?.status || row?.status || 'pending');
+                };
+                const incompleteCount = taskIds.filter((id) => {
+                  const s = statusOf(id);
+                  return s === 'pending' || s === 'running' || s === 'failed';
+                }).length;
+                const showContinue =
+                  planDetail.phase === 'executing' &&
+                  incompleteCount > 0 &&
+                  !planDetail.job?.running;
+                const showSynthesizeContinue =
+                  incompleteCount === 0 &&
+                  !planDetail.final_report &&
+                  !planDetail.job?.running &&
+                  planDetail.phase === 'executing';
                 if (planDetail.phase !== 'executing') {
                   return null;
                 }
-                if (incomplete && !planDetail.job?.running) {
+                if (showContinue) {
                   return (
                     <button
                       type="button"
@@ -682,7 +715,7 @@ export default function CursorRightPanel({
                     </button>
                   );
                 }
-                if (!incomplete) {
+                if (showSynthesizeContinue) {
                   return (
                     <button
                       type="button"

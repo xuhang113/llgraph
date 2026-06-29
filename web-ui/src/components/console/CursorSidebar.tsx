@@ -1,11 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import type { TreeNode, Workspace } from '../../api/client';
+import type { StoredWorkspaceMeta } from '../../utils/workspaceStorage';
+import { resolveSessionFullTitle } from '../../utils/sessionTitleEdit';
 
 interface Props {
   slug: string;
   workspaces: Workspace[];
+  /** 同步展示用：API 未返回前用缓存 path/label，避免刷新空白 */
+  workspaceDisplay?: StoredWorkspaceMeta | null;
+  workspacesLoading?: boolean;
   agents: TreeNode[];
   plans: TreeNode[];
+  treeLoading?: boolean;
   selectedId: string | null;
   catalogOpen: 'skills' | 'rules' | 'tools' | null;
   multiSelectMode: boolean;
@@ -66,6 +72,8 @@ function SessionRow({
   depth?: number;
 }) {
   const label = displayLabel(node);
+  const fullLabel = resolveSessionFullTitle(label, node.title_full, node.thread_id);
+  const editBase = fullLabel;
   const selected =
     selectedId === node.thread_id ||
     (node.kind === 'plan' &&
@@ -75,15 +83,15 @@ function SessionRow({
   const deletable = depth === 0 && (node.kind === 'agent' || node.kind === 'plan');
   const renamable = deletable && !multiSelectMode;
   const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(label);
+  const [draft, setDraft] = useState(editBase);
   const [saving, setSaving] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!editing) {
-      setDraft(label);
+      setDraft(editBase);
     }
-  }, [label, editing]);
+  }, [editBase, editing]);
 
   useEffect(() => {
     if (editing) {
@@ -97,18 +105,18 @@ function SessionRow({
     if (!renamable || saving) {
       return;
     }
-    setDraft(label);
+    setDraft(editBase);
     setEditing(true);
   };
 
   const cancelEdit = () => {
-    setDraft(label);
+    setDraft(editBase);
     setEditing(false);
   };
 
   const commitEdit = async () => {
     const next = draft.trim();
-    if (!next || next === label) {
+    if (!next || next === editBase) {
       cancelEdit();
       return;
     }
@@ -145,6 +153,7 @@ function SessionRow({
               className="cursor-session-rename-input"
               value={draft}
               disabled={saving}
+              title={fullLabel}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
                 e.stopPropagation();
@@ -169,7 +178,7 @@ function SessionRow({
             style={{ paddingLeft: `${12 + depth * 12}px` }}
             onClick={handleRowClick}
             onDoubleClick={renamable ? startEdit : undefined}
-            title={renamable ? `${node.thread_id}（双击重命名）` : node.thread_id}
+            title={renamable ? `${fullLabel}\n${node.thread_id}\n双击重命名` : `${fullLabel}\n${node.thread_id}`}
           >
             {multiSelectMode && deletable && (
               <input
@@ -236,6 +245,7 @@ function SessionGroup({
   selectedId,
   multiSelectMode,
   selectedSessionIds,
+  loading = false,
   onSelect,
   onDelete,
   onRename,
@@ -249,6 +259,7 @@ function SessionGroup({
   selectedId: string | null;
   multiSelectMode: boolean;
   selectedSessionIds: ReadonlySet<string>;
+  loading?: boolean;
   onSelect: (node: TreeNode) => void;
   onDelete: (node: TreeNode) => void;
   onRename: (node: TreeNode, title: string) => Promise<void>;
@@ -289,7 +300,9 @@ function SessionGroup({
         )}
       </summary>
       {nodes.length === 0 ? (
-        <div className="cursor-session-empty">暂无 {title} 会话</div>
+        <div className="cursor-session-empty">
+          {loading ? `正在加载 ${title} 会话…` : `暂无 ${title} 会话`}
+        </div>
       ) : (
         nodes.map((n) => (
           <SessionRow
@@ -312,8 +325,11 @@ function SessionGroup({
 export default function CursorSidebar({
   slug,
   workspaces,
+  workspaceDisplay = null,
+  workspacesLoading = false,
   agents,
   plans,
+  treeLoading = false,
   selectedId,
   catalogOpen,
   multiSelectMode,
@@ -337,13 +353,22 @@ export default function CursorSidebar({
   onDeleteEmpty,
 }: Props) {
   const current = workspaces.find((w) => w.slug === slug);
+  const displayMeta =
+    current != null
+      ? {
+          slug: current.slug,
+          path: current.path,
+          label:
+            current.path.split('/').filter(Boolean).pop() || current.slug,
+        }
+      : workspaceDisplay && workspaceDisplay.slug === slug
+        ? workspaceDisplay
+        : null;
   const selectedCount = selectedSessionIds.size;
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [wsPickerOpen, setWsPickerOpen] = useState(false);
 
-  const currentLabel = current
-    ? current.path.split('/').filter(Boolean).pop() || current.slug
-    : '选择工作区';
+  const currentLabel = displayMeta?.label || (workspacesLoading && slug ? '加载工作区…' : '选择工作区');
 
   useEffect(() => {
     if (!contextMenu) {
@@ -418,16 +443,19 @@ export default function CursorSidebar({
           type="button"
           className="cursor-ws-current"
           onClick={() => setWsPickerOpen((v) => !v)}
-          title={current?.path || '切换工作区'}
+          title={displayMeta?.path || current?.path || '切换工作区'}
         >
           <span className="cursor-ws-current-main">
             <span className="cursor-ws-current-name">{currentLabel}</span>
             <span className="cursor-ws-current-chevron">{wsPickerOpen ? '▾' : '▸'}</span>
           </span>
-          {current?.path && (
-            <span className="cursor-ws-current-path">{current.path}</span>
+          {(displayMeta?.path || current?.path) && (
+            <span className="cursor-ws-current-path">{displayMeta?.path || current?.path}</span>
           )}
-          {!current && (
+          {!displayMeta?.path && !current?.path && slug && workspacesLoading && (
+            <span className="cursor-ws-current-path">正在同步工作区列表…</span>
+          )}
+          {!displayMeta && !slug && (
             <span className="cursor-ws-current-path">点击展开选择工作空间</span>
           )}
         </button>
@@ -441,25 +469,30 @@ export default function CursorSidebar({
               ) : (
                 workspaces.map((w) => {
                   const label = w.path.split('/').filter(Boolean).pop() || w.slug;
+                  const isActive = w.slug === slug;
                   return (
                     <div
                       key={w.slug}
-                      className={`cursor-ws-item-wrap${w.slug === slug ? ' is-active' : ''}`}
+                      className={`cursor-ws-item-wrap${isActive ? ' is-active' : ''}`}
                     >
                       <button
                         type="button"
-                        className={`cursor-ws-item${w.slug === slug ? ' is-active' : ''}`}
+                        className={`cursor-ws-item${isActive ? ' is-active' : ''}`}
                         onClick={() => {
                           onSlugChange(w.slug);
                           setWsPickerOpen(false);
                         }}
-                        title={w.path}
+                        title={w.path || w.slug}
                       >
                         <span className="cursor-ws-item-slug">{label}</span>
                         <span className="cursor-ws-item-meta">
-                          {w.session_count} agent · {w.plan_count} plan
+                          {isActive
+                            ? `${agents.length} agent · ${plans.length} plan`
+                            : `${Math.max(0, w.session_count - w.plan_count)} agent · ${w.plan_count} plan`}
                         </span>
-                        {w.path && <span className="cursor-ws-item-path">{w.path}</span>}
+                        {w.path && w.path !== label && (
+                          <span className="cursor-ws-item-path">{w.path}</span>
+                        )}
                       </button>
                       <button
                         type="button"
@@ -523,6 +556,7 @@ export default function CursorSidebar({
             groupKind="agent"
             title="Agent"
             nodes={agents}
+            loading={treeLoading}
             selectedId={selectedId}
             multiSelectMode={multiSelectMode}
             selectedSessionIds={selectedSessionIds}
@@ -537,6 +571,7 @@ export default function CursorSidebar({
             groupKind="plan"
             title="Plan"
             nodes={plans}
+            loading={treeLoading}
             selectedId={selectedId}
             multiSelectMode={multiSelectMode}
             selectedSessionIds={selectedSessionIds}

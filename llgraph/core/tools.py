@@ -7,6 +7,7 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from llgraph.code_index.index_settings import resolve_index_settings
+from llgraph.context.context_settings import resolve_context_settings
 from llgraph.core.code_index_tools import create_code_index_tools
 from llgraph.context.context_spill import ContextSpill, apply_spill_to_tools
 from llgraph.core.filesystem_tools import create_filesystem_tools
@@ -16,7 +17,6 @@ from llgraph.core.web_search_tools import create_web_search_tools
 from llgraph.plan.plan_tools import create_plan_tools
 from llgraph.config.mcp_config import resolve_mcp_settings
 from llgraph.core.mcp_tools import McpToolRegistry, create_mcp_tools
-from llgraph.survey.edit_confirm import EditConfirmGate
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.core.write_failure_tracker import WriteFailureTracker
 from llgraph.core.workspace import WorkspaceContext
@@ -39,7 +39,6 @@ def get_agent_tools(
     context_spill: ContextSpill | None = None,
     write_failure_tracker: WriteFailureTracker | None = None,
     web_search_enabled: bool = False,
-    edit_confirm_gate: EditConfirmGate | None = None,
     sandbox_policy: SandboxPolicy | None = None,
 ) -> list:
     """
@@ -58,18 +57,20 @@ def get_agent_tools(
     """
     root = Path(workspace_root or ".").expanduser().resolve()
     skip_dirs = frozenset(resolve_index_settings(root).skip_dirs)
+    ctx_settings = resolve_context_settings(root)
     ctx = WorkspaceContext(
         root,
         allow_write=allow_write,
         extra_skip_dirs=skip_dirs,
         sandbox_policy=sandbox_policy,
+        max_read_bytes=ctx_settings.read_file_max_bytes,
+        max_read_lines=ctx_settings.read_file_max_lines,
     )
     fs_tools = create_filesystem_tools(
         ctx,
         edit_tracker=edit_tracker,
         on_file_changed=on_file_changed,
         write_failure_tracker=write_failure_tracker,
-        edit_confirm_gate=edit_confirm_gate,
     )
     index_tools = create_code_index_tools(root)
     history_tools = create_session_history_tools(root)

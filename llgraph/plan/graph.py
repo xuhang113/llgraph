@@ -79,7 +79,7 @@ def build_plan_graph(ctx: PlanRuntimeContext):
     graph.add_edge("worker", "supervisor")
     graph.add_edge("synthesize", END)
 
-    checkpointer = create_checkpointer(ctx.workspace, with_memory=True)
+    checkpointer = create_checkpointer(ctx.workspace, with_memory=True, thread_key=ctx.thread_id)
     compiled = graph.compile(checkpointer=checkpointer)
     compiled.plan_subgraph_registry = PLAN_SUBGRAPH_REGISTRY  # type: ignore[attr-defined]
     return compiled

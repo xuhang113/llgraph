@@ -35,6 +35,27 @@ def package_user_config_dir() -> Path:
     return _package_examples_root() / "user-llgraph"
 
 
+def is_packaged_example_workspace(resolved: str | Path) -> bool:
+    """
+    是否为 llgraph 包内 examples 模板目录（不应出现在 Web 最近工作区）。
+
+    @param resolved 工作区绝对路径
+    @return 是模板目录返回 True
+    """
+    try:
+        path = Path(resolved).expanduser().resolve()
+    except OSError:
+        return False
+    examples_root = _package_examples_root().resolve()
+    for name in ("user-llgraph", "default-workspace"):
+        try:
+            if path == (examples_root / name).resolve():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def init_user_llgraph(*, force: bool = False) -> list[str]:
     """
     将默认用户配置复制到 ~/.llgraph/（不覆盖已有文件，除非 force）。

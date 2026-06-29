@@ -13,24 +13,16 @@ _SURVEY_BLOCK_RE = re.compile(
     re.escape(_SURVEY_START) + r"[\s\S]*?"
     + r"(?:" + re.escape(_SURVEY_END) + r"|$)",
 )
-_CONFIRMATION_HEADER_RE = re.compile(
-    r"(请确认|确认你的需求|确认以下|请选择以下|请在下方确认)",
-    re.IGNORECASE,
-)
-_NUMBERED_OPTION_RE = re.compile(
-    r"^\s*(\d+)[\.\)、]\s*(?:\*\*)?(.+?)(?:\*\*)?\s*$",
-)
 
 
 class SurveyStreamFilter:
-    """流式输出时隐藏 survey JSON 块与重复确认列表，避免与向导双显。"""
+    """流式输出时隐藏 survey JSON 块，避免与向导双显。"""
 
     _HOLD_BACK = len(_SURVEY_START) - 1
 
     def __init__(self) -> None:
         self._buffer = ""
         self._in_survey = False
-        self._suppress_confirmation = False
 
     def _hold_back_suffix(self, text: str) -> tuple[str, str]:
         """
@@ -61,31 +53,13 @@ class SurveyStreamFilter:
         visible_parts: list[str] = []
 
         while self._buffer:
-            if self._suppress_confirmation and not self._in_survey:
-                survey_idx = self._buffer.find(_SURVEY_START)
-                if survey_idx >= 0:
-                    self._buffer = self._buffer[survey_idx + len(_SURVEY_START) :]
-                    self._in_survey = True
-                    continue
-                self._buffer = ""
-                break
-
             if not self._in_survey:
                 survey_idx = self._buffer.find(_SURVEY_START)
-                header_match = _CONFIRMATION_HEADER_RE.search(self._buffer)
-                if survey_idx >= 0 and (
-                    header_match is None or survey_idx < header_match.start()
-                ):
+                if survey_idx >= 0:
                     if survey_idx > 0:
                         visible_parts.append(self._buffer[:survey_idx])
                     self._buffer = self._buffer[survey_idx + len(_SURVEY_START) :]
                     self._in_survey = True
-                    continue
-                if header_match is not None:
-                    if header_match.start() > 0:
-                        visible_parts.append(self._buffer[: header_match.start()])
-                    self._buffer = self._buffer[header_match.start() :]
-                    self._suppress_confirmation = True
                     continue
                 safe, hold = self._hold_back_suffix(self._buffer)
                 if hold:
@@ -113,12 +87,12 @@ class SurveyStreamFilter:
         """
         if not self._buffer:
             return ""
-        if self._in_survey or self._suppress_confirmation:
+        if self._in_survey:
             self._buffer = ""
             return ""
         tail = self._buffer
         self._buffer = ""
-        if _SURVEY_START in tail or _CONFIRMATION_HEADER_RE.search(tail):
+        if _SURVEY_START in tail:
             return strip_survey_for_display(tail)
         return tail
 
@@ -126,42 +100,6 @@ class SurveyStreamFilter:
         """新一轮对话前重置。"""
         self._buffer = ""
         self._in_survey = False
-        self._suppress_confirmation = False
-
-
-def _strip_confirmation_markdown(text: str) -> str:
-    """
-    去掉「请确认 + 编号选项」类 Markdown（向导会接管交互）。
-
-    @param text 助手正文
-    @return 去掉确认列表后的文本
-    """
-    if not _CONFIRMATION_HEADER_RE.search(text):
-        return text
-    lines = text.splitlines()
-    out: list[str] = []
-    skipping = False
-    for line in lines:
-        if not skipping and _CONFIRMATION_HEADER_RE.search(line):
-            match = _CONFIRMATION_HEADER_RE.search(line)
-            if match and match.start() > 0:
-                prefix = line[: match.start()].strip()
-                if prefix:
-                    out.append(prefix)
-            skipping = True
-            continue
-        if skipping:
-            if _NUMBERED_OPTION_RE.match(line.strip()):
-                continue
-            if line.strip() == "":
-                continue
-            if line.strip().startswith("---"):
-                skipping = False
-                out.append(line)
-                continue
-            skipping = False
-        out.append(line)
-    return "\n".join(out).strip()
 
 
 def strip_survey_for_display(text: str) -> str:
@@ -171,10 +109,9 @@ def strip_survey_for_display(text: str) -> str:
     @param text 助手全文
     @return 去掉 survey 后的文本
     """
-    if _SURVEY_START not in text and not _CONFIRMATION_HEADER_RE.search(text):
+    if _SURVEY_START not in text:
         return text
     cleaned = _SURVEY_BLOCK_RE.sub("", text)
-    cleaned = _strip_confirmation_markdown(cleaned)
     return cleaned.strip()
 
 
@@ -412,125 +349,16 @@ def format_survey_answers_for_agent(
     return "\n".join(lines)
 
 
-def infer_survey_from_markdown(text: str) -> SurveySpec | None:
-    """
-    从「请确认 + 编号列表」推断单题问卷（Agent 未输出 survey 块时的兜底）。
-
-    @param text 助手回复
-    @return 问卷规格
-    """
-    if not re.search(r"请确认|确认你的需求|确认以下|请选择", text):
-        return None
-    options: list[str] = []
-    for line in text.splitlines():
-        matched = re.match(
-            r"^\s*(\d+)[\.\)、]\s*(?:\*\*)?(.+?)(?:\*\*)?\s*$",
-            line.strip(),
-        )
-        if not matched:
-            continue
-        body = matched.group(2).strip()
-        if len(body) < 4:
-            continue
-        if body.startswith("---"):
-            break
-        options.append(body[:240])
-    if len(options) < 2 or len(options) > 8:
-        return None
-    opts = tuple(options) + ("其他（手动输入）",)
-    return SurveySpec(
-        title="请确认你的需求",
-        questions=(
-            SurveyQuestion(
-                question_id="choice",
-                prompt="请选择一项（↑↓ · Enter，无需输入序号）",
-                options=opts,
-                default_index=0,
-                allow_free_text=True,
-                step_label="需求",
-            ),
-        ),
-    )
-
-
-def infer_project_organize_survey(text: str) -> SurveySpec | None:
-    """
-    project-organize 等 Skill 未输出 survey JSON 时的兜底（Agent 纯文本确认）。
-
-    @param text 助手回复
-    @return 问卷规格
-    """
-    if not re.search(r"请先确认|须确认|须用户确认|判定", text):
-        return None
-    questions: list[SurveyQuestion] = []
-    if re.search(r"改动范围|scope", text, re.IGNORECASE):
-        questions.append(
-            SurveyQuestion(
-                question_id="scope",
-                prompt="本次将改动哪些项目？（未选中的仓库禁止 write_file）",
-                options=(
-                    "仅 docs/ 工作区总览",
-                    "工作区总览 + 各核心仓库 docs",
-                    "其他（手动输入）",
-                ),
-                default_index=0,
-                allow_free_text=True,
-                step_label="改动范围",
-                multi_select=True,
-            )
-        )
-    if re.search(r"梳理方式|仅按文档|结合代码", text):
-        questions.append(
-            SurveyQuestion(
-                question_id="mode",
-                prompt="范围内已有业务文档，梳理方式？",
-                options=(
-                    "仅按文档为主（只读已有 doc）",
-                    "结合代码梳理并落盘 tmp",
-                    "其他（手动输入）",
-                ),
-                default_index=1,
-                allow_free_text=True,
-                step_label="梳理方式",
-            )
-        )
-    if re.search(r"覆盖|overwrite|正式\s*\.md", text, re.IGNORECASE):
-        questions.append(
-            SurveyQuestion(
-                question_id="overwrite",
-                prompt="是否覆盖正式业务文档（.md）？",
-                options=(
-                    "否，仅产出 .tmp.md",
-                    "是，核对后覆盖正式 .md",
-                    "其他（手动输入）",
-                ),
-                default_index=0,
-                allow_free_text=True,
-                step_label="覆盖策略",
-            )
-        )
-    if not questions:
-        return None
-    return SurveySpec(
-        title="业务梳理 — 请确认",
-        questions=tuple(questions),
-    )
-
-
 def resolve_survey_from_assistant(text: str) -> SurveySpec | None:
     """
-    解析助手回复中的问卷（JSON 块优先，其次 Markdown 编号列表）。
+    解析助手回复中的 <<<llgraph-survey>>> JSON 块。
+
+    问卷是否弹出、题目内容均由 Agent 显式输出 survey 块决定；不做正文关键词推断。
 
     @param text 助手全文
     @return 问卷规格
     """
-    spec = extract_survey_block(text)
-    if spec is not None:
-        return spec
-    spec = infer_survey_from_markdown(text)
-    if spec is not None:
-        return spec
-    return infer_project_organize_survey(text)
+    return extract_survey_block(text)
 
 
 def try_run_survey_followup(
@@ -551,6 +379,8 @@ def try_run_survey_followup(
     from llgraph.config.survey_settings import survey_followup_enabled
 
     if not survey_followup_enabled(workspace, context_session):
+        return None
+    if not allow_write:
         return None
     has_block = _SURVEY_START in assistant_text
     spec = resolve_survey_from_assistant(assistant_text)

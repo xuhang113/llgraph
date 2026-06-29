@@ -7,7 +7,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from llgraph.code_index.literal_grep import literal_grep_hits
-from llgraph.code_index.search_params import ParallelSearchParams, build_parallel_search_params_with_timing
+from llgraph.code_index.paths import DEFAULT_SEARCH_TOP_K
+from llgraph.code_index.search_format import format_search_hit
+from llgraph.code_index.search_params import build_parallel_search_params_with_timing
 from llgraph.code_index.search import collect_vector_hits
 from llgraph.code_index.search_path_filter import is_junk_search_path
 from llgraph.config.logging_settings import get_search_logger
@@ -15,12 +17,11 @@ from llgraph.core.workspace import WorkspaceContext
 
 RRF_K = 60
 LITERAL_RRF_BOOST = 2.4
-LITERAL_TOP = 60
-VECTOR_TOP = 50
-_MAX_HITS_PER_REPO = 6
+LITERAL_TOP = 40
+VECTOR_TOP = 30
+_MAX_HITS_PER_REPO = 3
 _PARALLEL_WORKERS = 2
-_SUGGEST_READ_FILES = 8
-_DEFAULT_TOP_K = 15
+_SUGGEST_READ_FILES = 5
 
 
 def _rrf_score(rank: int, k: int = RRF_K) -> float:
@@ -86,21 +87,11 @@ def _apply_repo_cap(
     return out
 
 
-def _format_literal_summary(params: ParallelSearchParams) -> str:
-    pats = params.literal_grep_patterns
-    if not pats:
-        return "(无，仅向量)"
-    preview = ", ".join(pats[:6])
-    if len(pats) > 6:
-        preview += f", …(+{len(pats) - 6})"
-    return preview
-
-
 def search_parallel(
     workspace: Path,
     query: str,
     *,
-    top_k: int = _DEFAULT_TOP_K,
+    top_k: int = DEFAULT_SEARCH_TOP_K,
     path_prefix: str = ".",
     source: str = "cli",
     tool: str = "search_code_parallel",
@@ -248,17 +239,10 @@ def _search_parallel_impl(
             msg += f" 向量路: {vector_err}"
         return msg
 
-    lines = [
-        f"并行检索 Top{len(filtered)}（字面量 grep + 向量）:",
-        f"  字面量 grep [{len(literal_list)} 命中]: {_format_literal_summary(params)}",
-        f"  向量语义 [{len(vector_list)} 命中] query={params.semantic_query[:80]!r}",
-        "",
-    ]
-    for i, (doc_id, score) in enumerate(filtered, start=1):
+    lines = [f"并行检索 Top{len(filtered)}:", ""]
+    for i, (doc_id, _score) in enumerate(filtered, start=1):
         prev = previews.get(doc_id, "")
-        lines.append(f"{i}. [{score:.4f}] {doc_id}")
-        if prev:
-            lines.append(f"   {prev}")
+        lines.append(format_search_hit(i, doc_id, prev))
     if vector_err:
         lines.append(f"\n（向量路告警: {vector_err}）")
 
@@ -266,14 +250,16 @@ def _search_parallel_impl(
     if len(suggest_paths) >= 2:
         paths_json = json.dumps(suggest_paths, ensure_ascii=False)
         lines.append(
-            f"\n【批量读建议】read_files(paths={paths_json})，"
+            f"\n精读: read_files(paths={paths_json})，"
             f"再 grep_files 追上下游（最多 {_SUGGEST_READ_FILES} 个/次）。"
         )
     elif len(suggest_paths) == 1:
-        lines.append(f"\n精读建议: read_file(path={suggest_paths[0]!r})")
+        lines.append(f"\n精读: read_file(path={suggest_paths[0]!r})")
     else:
-        lines.append("\n请对命中位置使用 read_files / read_file 精读。")
+        lines.append("\n精读: read_files / read_file。")
     lines.append(
-        "上下游/依赖：用 grep_files(path=<仓库>, pattern=...) 深挖，勿再调 search_code_parallel。"
+        "勿重复 search_code_parallel（再次调用将被拦截）。"
+        "下一步：grep_files(pattern=\"词A|词B\", path=\".\") 定行号，再 read_files/read_file(宽段)；"
+        "path 须从本结果原样复制，禁止猜目录名。"
     )
     return "\n".join(lines)

@@ -6,9 +6,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import BaseMessage, messages_from_dict, messages_to_dict
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, messages_from_dict, messages_to_dict
 
-from llgraph.session.user_storage import session_messages_path, session_thread_dir
+from llgraph.core.user_message_content import strip_inline_images_from_messages
+from llgraph.session.jsonl_read import open_jsonl_for_read
+from llgraph.session.user_storage import session_messages_path, session_thread_dir, user_sessions_root
 
 
 def save_session_messages(
@@ -51,13 +53,13 @@ def load_session_messages(workspace: Path, thread_id: str) -> list[BaseMessage]:
         return []
     rows: list[dict[str, Any]] = []
     try:
-        with path.open(encoding="utf-8") as handle:
+        with open_jsonl_for_read(path) as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
                     continue
                 rows.append(json.loads(line))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return []
     if not rows:
         return []
@@ -68,6 +70,9 @@ def load_session_messages(workspace: Path, thread_id: str) -> list[BaseMessage]:
     from llgraph.context.message_canonical import to_canonical_v2_messages
 
     cleaned, _report = to_canonical_v2_messages(loaded)
+    cleaned, stripped = strip_inline_images_from_messages(cleaned)
+    if stripped:
+        save_session_messages(workspace, thread_id, cleaned)
     return cleaned
 
 
@@ -102,12 +107,12 @@ def restore_session_to_agent(
         return 0
     rows: list[dict] = []
     try:
-        with path.open(encoding="utf-8") as handle:
+        with open_jsonl_for_read(path) as handle:
             for line in handle:
                 line = line.strip()
                 if line:
                     rows.append(json.loads(line))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return 0
     if not rows:
         return 0
@@ -117,7 +122,8 @@ def restore_session_to_agent(
         return 0
 
     messages, report = to_canonical_v2_messages(raw_messages)
-    if report.changed:
+    messages, stripped = strip_inline_images_from_messages(messages)
+    if report.changed or stripped:
         save_session_messages(workspace, thread_id, messages)
 
     config = {"configurable": {"thread_id": thread_id}}
@@ -159,10 +165,63 @@ def prepare_resumable_agent_session(
     return restore_session_to_agent(agent, workspace, thread_id)
 
 
+def append_pending_user_turn(
+    workspace: Path,
+    thread_id: str,
+    user_message: str,
+    *,
+    image_refs: list | None = None,
+) -> str | None:
+    """
+    轮次开始即将用户原文追加到 messages.jsonl，刷新页面时可恢复最新提问。
+
+    整轮结束后 persist_agent_session 会用 Agent 状态全量覆盖。
+
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @param user_message 用户输入原文（不含 workspace-context）
+    @param image_refs 可选图片附件引用（Web 多模态）
+    @return 落盘路径；无内容或失败返回 None
+    """
+    from llgraph.context.context_continuity import strip_workspace_context_wrapper
+    from llgraph.core.user_message_content import (
+        StoredImageRef,
+        build_stored_user_content,
+        extract_text_from_human_content,
+    )
+
+    text = user_message.strip()
+    refs: list[StoredImageRef] = list(image_refs or [])
+    if not thread_id.strip() or (not text and not refs):
+        return None
+
+    stored_content = build_stored_user_content(text, image_refs=refs)
+
+    existing = load_session_messages(workspace, thread_id)
+    if existing:
+        last = existing[-1]
+        if isinstance(last, HumanMessage):
+            last_text = strip_workspace_context_wrapper(
+                extract_text_from_human_content(last.content)
+            ).strip()
+            if last_text == text and not refs:
+                return str(session_messages_path(workspace, thread_id))
+        elif not isinstance(last, AIMessage):
+            pass
+
+    new_messages = [*existing, HumanMessage(content=stored_content)]
+    from llgraph.context.message_canonical import to_canonical_v2_messages
+
+    cleaned, _report = to_canonical_v2_messages(new_messages)
+    return save_session_messages(workspace, thread_id, cleaned)
+
+
 def persist_agent_session(
     agent: Any,
     workspace: Path,
     thread_id: str,
+    *,
+    turn_image_refs: list | None = None,
 ) -> str | None:
     """
     从 Agent 状态读取并落盘 messages.jsonl。
@@ -170,6 +229,7 @@ def persist_agent_session(
     @param agent LangGraph agent
     @param workspace 工作区根
     @param thread_id 会话 ID
+    @param turn_image_refs 本轮新上传附件；落盘前将内联图替换为 image_ref
     @return 落盘路径；无消息或失败返回 None
     """
     config = {"configurable": {"thread_id": thread_id}}
@@ -181,9 +241,53 @@ def persist_agent_session(
     if not messages:
         return None
     from llgraph.context.message_canonical import to_canonical_v2_messages
+    from llgraph.session.session_image_store import canonicalize_messages_image_refs
+
+    if turn_image_refs:
+        messages = canonicalize_messages_image_refs(
+            messages,
+            turn_image_refs=turn_image_refs,
+        )
+        try:
+            agent.update_state(config, {"messages": messages})
+        except Exception:
+            pass
 
     cleaned, _report = to_canonical_v2_messages(messages)
+    cleaned, stripped = strip_inline_images_from_messages(cleaned)
+    if stripped or turn_image_refs:
+        try:
+            agent.update_state(config, {"messages": cleaned})
+        except Exception:
+            pass
+
     return save_session_messages(workspace, thread_id, cleaned)
+
+
+def purge_legacy_inline_images_in_workspace(workspace: Path) -> int:
+    """
+    扫描工作区全部会话，清除 messages.jsonl 中废弃的内联 base64 image 块。
+
+    @param workspace 工作区根
+    @return 清理的会话数
+    """
+    root = user_sessions_root(workspace)
+    if not root.is_dir():
+        return 0
+    cleaned_sessions = 0
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        thread_id = child.name
+        msg_path = session_messages_path(workspace, thread_id)
+        if not msg_path.is_file():
+            continue
+        before = msg_path.read_text(encoding="utf-8")
+        load_session_messages(workspace, thread_id)
+        after = msg_path.read_text(encoding="utf-8") if msg_path.is_file() else ""
+        if before != after:
+            cleaned_sessions += 1
+    return cleaned_sessions
 
 
 def _write_session_meta(workspace: Path, thread_id: str, message_count: int) -> None:

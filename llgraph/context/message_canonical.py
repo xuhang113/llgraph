@@ -90,6 +90,18 @@ def _extract_thinking_for_meta(msg: AIMessage) -> str:
     return "\n".join(parts).strip()
 
 
+def persist_ai_thinking_in_message(msg: AIMessage) -> tuple[AIMessage, bool]:
+    """
+    将 content 内 thinking/reasoning 块落盘到 llgraph.thinking_text（出站前调用）。
+
+    避免 ensure_nonempty 用占位符覆盖 content 时丢失 thinking。
+
+    @param msg assistant 消息
+    @return (消息, 是否改写)
+    """
+    return _flatten_ai_for_storage(msg)
+
+
 def _flatten_ai_for_storage(msg: AIMessage) -> tuple[AIMessage, bool]:
     """
     将 AI 多段 content 收成纯文本；thinking 写入 additional_kwargs.llgraph。
