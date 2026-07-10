@@ -9,6 +9,8 @@ from llgraph.config.config import ENV_MODEL, get_llgraph_settings
 from llgraph.config.edit_settings import load_agent_config
 
 DEFAULT_MAX_TOKENS = 16_384
+DEFAULT_REQUEST_TIMEOUT_SEC = 600.0
+DEFAULT_THINKING_STREAM_TIMEOUT_SEC = 180.0
 
 _runtime_model: str | None = None
 
@@ -19,6 +21,8 @@ class LlmSettings:
 
     model: str
     max_tokens: int
+    request_timeout_sec: float
+    thinking_stream_timeout_sec: float
 
 
 def set_runtime_model(model_id: str | None) -> str | None:
@@ -72,6 +76,8 @@ def resolve_llm_settings(workspace: Path | None = None) -> LlmSettings:
     @return LlmSettings
     """
     max_tokens = DEFAULT_MAX_TOKENS
+    request_timeout_sec = DEFAULT_REQUEST_TIMEOUT_SEC
+    thinking_stream_timeout_sec = DEFAULT_THINKING_STREAM_TIMEOUT_SEC
     if workspace is not None:
         cfg = load_agent_config(workspace)
         llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
@@ -80,10 +86,25 @@ def resolve_llm_settings(workspace: Path | None = None) -> LlmSettings:
             max_tokens = max(1024, int(raw))
         except (TypeError, ValueError):
             max_tokens = DEFAULT_MAX_TOKENS
+        raw_timeout = llm_cfg.get("request_timeout_sec", DEFAULT_REQUEST_TIMEOUT_SEC)
+        try:
+            request_timeout_sec = max(30.0, min(3600.0, float(raw_timeout)))
+        except (TypeError, ValueError):
+            request_timeout_sec = DEFAULT_REQUEST_TIMEOUT_SEC
+        raw_thinking_timeout = llm_cfg.get(
+            "thinking_stream_timeout_sec",
+            DEFAULT_THINKING_STREAM_TIMEOUT_SEC,
+        )
+        try:
+            thinking_stream_timeout_sec = max(30.0, min(900.0, float(raw_thinking_timeout)))
+        except (TypeError, ValueError):
+            thinking_stream_timeout_sec = DEFAULT_THINKING_STREAM_TIMEOUT_SEC
 
     return LlmSettings(
         model=resolve_effective_model(workspace),
         max_tokens=max_tokens,
+        request_timeout_sec=request_timeout_sec,
+        thinking_stream_timeout_sec=thinking_stream_timeout_sec,
     )
 
 

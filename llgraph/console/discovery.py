@@ -219,6 +219,7 @@ def simplify_message(
         attachment_url_for=_attachment_url if slug and thread_id else None,
     )
     kind: str | None = None
+    has_tool_calls = bool(tool_calls)
     if "human" in msg_type.lower():
         display_text = _strip_user_injected_context(display_text)
         from llgraph.core.agent_turn import THINK_CONTINUE_NUDGE
@@ -226,10 +227,18 @@ def simplify_message(
         if display_text.strip() == THINK_CONTINUE_NUDGE.strip():
             kind = "think_nudge"
     elif "ai" in msg_type.lower() or "assistant" in msg_type.lower():
+        from llgraph.context.chat_history_repair import is_dispatch_placeholder_text
         from llgraph.context.message_normalize import format_agent_chat_display_text
 
         display_text = format_agent_chat_display_text(display_text)
-    has_tool_calls = bool(tool_calls)
+        if is_dispatch_placeholder_text(display_text) and not has_tool_calls:
+            extra = data.get("additional_kwargs") if isinstance(data, dict) else {}
+            if isinstance(extra, dict):
+                llgraph = extra.get("llgraph")
+                if isinstance(llgraph, dict):
+                    turn_reply = llgraph.get("turn_reply_text")
+                    if isinstance(turn_reply, str) and turn_reply.strip():
+                        display_text = format_agent_chat_display_text(turn_reply.strip())
     if not display_text and not has_tool_calls and isinstance(data, dict):
         extra = data.get("additional_kwargs") if isinstance(data.get("additional_kwargs"), dict) else {}
         llgraph_meta = extra.get("llgraph") if isinstance(extra.get("llgraph"), dict) else {}

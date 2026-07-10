@@ -17,6 +17,10 @@ class UserCancelledError(RuntimeError):
     """Web Stop / 用户主动停止当前 ReAct 轮次。"""
 
 
+class ThinkingStreamTimeoutError(RuntimeError):
+    """单轮 LLM 仅 thinking 流式超过上限（避免空转）。"""
+
+
 def last_run_path(workspace: Path, thread_id: str) -> Path:
     """
     @param workspace 工作区根
@@ -168,3 +172,49 @@ def write_session_last_run(
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     _append_run_log(run_log_path(workspace, thread_id), payload)
     return payload
+
+
+def log_react_phase(
+    workspace: Path,
+    thread_id: str,
+    *,
+    phase: str,
+    detail: dict[str, Any] | None = None,
+    duration_sec: float | None = None,
+    error: BaseException | None = None,
+) -> None:
+    """
+    记录 ReAct 步间阶段（run_log.jsonl，便于排查「整理工具结果后无响应」）。
+
+    @param workspace 工作区根
+    @param thread_id 会话 thread
+    @param phase 阶段名（如 post_tools_start / compress_llm_done）
+    @param detail 附加字段
+    @param duration_sec 本阶段耗时
+    @param error 异常
+    """
+    if not thread_id.strip() or not phase.strip():
+        return
+    record: dict[str, Any] = {
+        "ts": _utc_now_iso(),
+        "event": "react_phase",
+        "thread_id": thread_id,
+        "phase": phase.strip(),
+    }
+    if duration_sec is not None:
+        record["duration_sec"] = round(duration_sec, 3)
+    if detail:
+        record.update(detail)
+    if error is not None:
+        record["error_type"] = type(error).__name__
+        record["error_message"] = (str(error).strip() or type(error).__name__)[:2000]
+    try:
+        _append_run_log(run_log_path(workspace, thread_id), record)
+    except OSError:
+        pass
+    try:
+        from llgraph.display.execution_log import log_react_phase_event
+
+        log_react_phase_event(workspace, record)
+    except Exception:
+        pass

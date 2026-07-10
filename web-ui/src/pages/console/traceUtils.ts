@@ -1,19 +1,30 @@
 import type { TraceStep, TraceTurn } from '../../types/trace';
-import { mergeTraceStepsUnique, stepsToPanelLogLines, parseTraceTurnsFromRemote, buildDisplayTraceTurns } from '../../types/trace';
+import { mergeTraceStepsUnique, stepsToPanelLogLines, parseTraceTurnsFromRemote, buildDisplayTraceTurns, resolveElapsedKind } from '../../types/trace';
 import { loadTracePanelCache } from '../../utils/tracePanelStore';
 import type { ChatMessage } from '../../components/console/ChatThread';
 import type { TraceLine } from './types';
 
 export function parseTraceStep(raw: Record<string, unknown>): TraceStep {
+  const kind = String(raw.kind ?? '');
   return {
     step_id: Number(raw.step_id ?? 0),
-    kind: String(raw.kind ?? ''),
+    kind,
     title: String(raw.title ?? ''),
     elapsed: Number(raw.elapsed ?? 0),
+    elapsed_kind: String(raw.elapsed_kind ?? resolveElapsedKind(kind)),
     summary: String(raw.summary ?? ''),
     body_lines: Array.isArray(raw.body_lines) ? raw.body_lines.map(String) : [],
     usage: (raw.usage as TraceStep['usage']) ?? null,
+    invoke_timing: (raw.invoke_timing as TraceStep['invoke_timing']) ?? null,
   };
+}
+
+/** 从 trace 助手回复步骤提取可见正文。 */
+export function extractReplyTextFromTraceStep(step: TraceStep): string {
+  if (step.kind !== 'reply') {
+    return '';
+  }
+  return (step.body_lines ?? []).join('\n').trim();
 }
 
 export function parseTraceSteps(raw: unknown): TraceStep[] {

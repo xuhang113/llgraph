@@ -6,8 +6,10 @@ import { findPlanNode } from '../pages/console/workerUtils';
 import {
   applyPendingConfirmHead,
   ingestPlanConfirmFromDetail,
+  ingestTaskStepConfirm,
 } from '../utils/pendingConfirmUi';
-import { clearConfirmQueue } from '../utils/pendingConfirmQueue';
+import { clearConfirmQueue, peekConfirmHead } from '../utils/pendingConfirmQueue';
+import { releaseStreamState } from '../pages/console/streamHelpers';
 
 export type PlanSessionDeps = {
   slug: string;
@@ -24,10 +26,10 @@ export type PlanSessionDeps = {
   setPlanConfirm: React.Dispatch<React.SetStateAction<Record<string, unknown> | null>>;
   setTaskStepConfirm: React.Dispatch<React.SetStateAction<string | null>>;
   taskStepDismissedRef: React.MutableRefObject<string | null>;
-  confirmAutoShownRef: React.MutableRefObject<string | null>;
   planStopInFlightRef: React.MutableRefObject<boolean>;
   runningThreadsRef: React.MutableRefObject<Set<string>>;
   streamAbortRef: React.MutableRefObject<Map<string, AbortController>>;
+  streamLastEventAtRef: React.MutableRefObject<Map<string, number>>;
   beginStream: (threadId: string) => AbortController;
   bindSSE: (threadId: string) => (ev: Record<string, unknown>) => void;
   finalizeLiveTrace: (threadId?: string) => void;
@@ -51,16 +53,26 @@ export function usePlanSession(deps: PlanSessionDeps) {
     setPlanConfirm,
     setTaskStepConfirm,
     taskStepDismissedRef,
-    confirmAutoShownRef,
     planStopInFlightRef,
     runningThreadsRef,
     streamAbortRef,
+    streamLastEventAtRef,
     beginStream,
     bindSSE,
     finalizeLiveTrace,
     handleSelect,
     refreshTree,
   } = deps;
+
+  const streamRefs = {
+    runningThreads: runningThreadsRef,
+    streamAbort: streamAbortRef,
+    streamLastEventAt: streamLastEventAtRef,
+  };
+
+  const releasePlanStream = (threadId: string, clearBusy = true) => {
+    releaseStreamState(threadId, streamRefs, clearBusy ? setBusy : undefined);
+  };
 
   const maybePromptPlanConfirm = useCallback((detail: PlanDetail, threadId: string) => {
     if (!planNeedsConfirm(detail) || !slug) {
@@ -81,11 +93,10 @@ export function usePlanSession(deps: PlanSessionDeps) {
     if (planNeedsConfirm(planDetail)) {
       ingestPlanConfirmFromDetail(slug, selected.thread_id, planDetail);
     } else {
-      confirmAutoShownRef.current = null;
       clearConfirmQueue(slug, selected.thread_id, 'plan_confirm');
       setPlanConfirm(null);
     }
-  }, [selected, planDetail, slug, setPlanConfirm, confirmAutoShownRef]);
+  }, [selected, planDetail, slug, setPlanConfirm]);
   const handleWorkerSelect = (taskId: string) => {
     if (!selected || selected.kind !== 'plan') {
       return;
@@ -132,19 +143,26 @@ export function usePlanSession(deps: PlanSessionDeps) {
         if (check.ok) {
           setBusy(true);
           const ac = beginStream(selected.thread_id);
-          await api.planRunTask(
-            slug,
-            selected.thread_id,
-            taskId,
-            allowWrite,
-            bindSSE(selected.thread_id),
-            ac.signal,
-          );
-          return;
+          try {
+            await api.planRunTask(
+              slug,
+              selected.thread_id,
+              taskId,
+              allowWrite,
+              bindSSE(selected.thread_id),
+              ac.signal,
+            );
+            return;
+          } catch (err) {
+            releasePlanStream(selected.thread_id);
+            await alert(err instanceof Error ? err.message : String(err));
+            return;
+          }
         }
         await alert(check.message || '当前 Work 不可执行');
         return;
       } catch (err) {
+        releasePlanStream(selected.thread_id);
         await alert(err instanceof Error ? err.message : String(err));
         return;
       } finally {
@@ -161,15 +179,20 @@ export function usePlanSession(deps: PlanSessionDeps) {
           if (check.ok) {
             setBusy(true);
             const ac = beginStream(selected.thread_id);
-            await api.planRunTask(
-              slug,
-              selected.thread_id,
-              taskId,
-              allowWrite,
-              bindSSE(selected.thread_id),
-              ac.signal,
-            );
-            return;
+            try {
+              await api.planRunTask(
+                slug,
+                selected.thread_id,
+                taskId,
+                allowWrite,
+                bindSSE(selected.thread_id),
+                ac.signal,
+              );
+              return;
+            } catch (err) {
+              releasePlanStream(selected.thread_id);
+              /* 不可重跑则查看详情 */
+            }
           }
         } catch {
           /* 不可重跑则查看详情 */
@@ -210,6 +233,7 @@ export function usePlanSession(deps: PlanSessionDeps) {
         ac.signal,
       );
     } catch (err) {
+      releasePlanStream(selected.thread_id);
       await alert(err instanceof Error ? err.message : String(err));
     } finally {
       if (!runningThreadsRef.current.has(selected.thread_id)) {
@@ -242,10 +266,12 @@ export function usePlanSession(deps: PlanSessionDeps) {
     planStopInFlightRef.current = true;
     const tid = selected.thread_id;
     streamAbortRef.current.get(tid)?.abort();
-    streamAbortRef.current.delete(tid);
-    runningThreadsRef.current.delete(tid);
-    setBusy(false);
+    releasePlanStream(tid);
     finalizeLiveTrace(tid);
+    clearConfirmQueue(slug, tid, 'plan_confirm');
+    clearConfirmQueue(slug, tid, 'task_step_confirm');
+    setPlanConfirm(null);
+    setTaskStepConfirm(null);
     try {
       const res = await api.planCancel(slug, tid);
       if (!res.ok) {
@@ -271,8 +297,15 @@ export function usePlanSession(deps: PlanSessionDeps) {
     if (!ok) {
       return;
     }
+    const tid = selected.thread_id;
+    streamAbortRef.current.get(tid)?.abort();
+    releasePlanStream(tid);
+    clearConfirmQueue(slug, tid, 'plan_confirm');
+    clearConfirmQueue(slug, tid, 'task_step_confirm');
+    setPlanConfirm(null);
+    setTaskStepConfirm(null);
     try {
-      const res = await api.planAbort(slug, selected.thread_id);
+      const res = await api.planAbort(slug, tid);
       if (!res.ok) {
         await alert(res.message);
       } else {
@@ -281,7 +314,7 @@ export function usePlanSession(deps: PlanSessionDeps) {
           { id: `abort-${Date.now()}`, role: 'system', text: res.message },
         ]);
       }
-      const detail = await api.plan(slug, selected.thread_id);
+      const detail = await api.plan(slug, tid);
       setPlanDetail(detail);
       refreshTree();
     } catch (err) {
@@ -332,6 +365,7 @@ export function usePlanSession(deps: PlanSessionDeps) {
     try {
       const check = await api.planTaskRunnable(slug, planThread, taskId);
       if (!check.ok) {
+        releasePlanStream(planThread);
         await alert(check.message || '当前 Work 不可执行');
         return;
       }
@@ -347,6 +381,7 @@ export function usePlanSession(deps: PlanSessionDeps) {
       setPlanDetail(detail);
       refreshTree();
     } catch (err) {
+      releasePlanStream(planThread);
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         await alert(err instanceof Error ? err.message : String(err));
       }
@@ -360,8 +395,7 @@ export function usePlanSession(deps: PlanSessionDeps) {
     if (!slug || !selected || selected.kind !== 'plan') {
       return;
     }
-    clearConfirmQueue(slug, selected.thread_id, 'plan_confirm');
-    setPlanConfirm(null);
+    const threadId = selected.thread_id;
     if (allowW) {
       setAllowWrite(true);
     }
@@ -372,27 +406,44 @@ export function usePlanSession(deps: PlanSessionDeps) {
       ]);
     }
     setBusy(true);
-    const ac = beginStream(selected.thread_id);
+    const ac = beginStream(threadId);
     try {
       await api.planConfirm(
         slug,
-        selected.thread_id,
+        threadId,
         { action, allow_worker_write: allowW, revise_note: reviseNote },
-        bindSSE(selected.thread_id),
+        bindSSE(threadId),
         ac.signal,
       );
-      const detail = await api.plan(slug, selected.thread_id);
+      clearConfirmQueue(slug, threadId, 'plan_confirm');
+      setPlanConfirm(null);
+      const detail = await api.plan(slug, threadId);
       setPlanDetail(detail);
       if (planExecutionAllowWrite(detail)) {
         setAllowWrite(true);
       }
-      applyPendingConfirmHead(slug, selected.thread_id, {
+      applyPendingConfirmHead(slug, threadId, {
         setSurvey: () => undefined,
         setPlanConfirm,
         setTaskStepConfirm,
       });
       refreshTree();
     } catch (err) {
+      releasePlanStream(threadId);
+      try {
+        const detail = await api.plan(slug, threadId);
+        setPlanDetail(detail);
+        if (planNeedsConfirm(detail)) {
+          ingestPlanConfirmFromDetail(slug, threadId, detail);
+          applyPendingConfirmHead(slug, threadId, {
+            setSurvey: () => undefined,
+            setPlanConfirm,
+            setTaskStepConfirm,
+          });
+        }
+      } catch {
+        /* ignore refresh failure */
+      }
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         setMessages((prev) => [
           ...prev,
@@ -404,7 +455,7 @@ export function usePlanSession(deps: PlanSessionDeps) {
         ]);
       }
     } finally {
-      if (!runningThreadsRef.current.has(selected.thread_id)) {
+      if (!runningThreadsRef.current.has(threadId)) {
         setBusy(false);
       }
     }
@@ -414,14 +465,45 @@ export function usePlanSession(deps: PlanSessionDeps) {
     if (!slug || !selected || selected.kind !== 'plan') {
       return;
     }
+    const threadId = selected.thread_id;
+    const head = peekConfirmHead(slug, threadId);
+    const previousTaskStep =
+      head?.kind === 'task_step_confirm'
+        ? String((head.payload as { task_id?: string })?.task_id || '')
+        : '';
     taskStepDismissedRef.current = null;
-    clearConfirmQueue(slug, selected.thread_id, 'task_step_confirm');
-    setTaskStepConfirm(null);
     setBusy(true);
-    const ac = beginStream(selected.thread_id);
+    const ac = beginStream(threadId);
     try {
-      await api.planContinue(slug, selected.thread_id, allowWrite, bindSSE(selected.thread_id), ac.signal);
+      await api.planContinue(slug, threadId, allowWrite, bindSSE(threadId), ac.signal);
+      clearConfirmQueue(slug, threadId, 'task_step_confirm');
+      setTaskStepConfirm(null);
     } catch (err) {
+      releasePlanStream(threadId);
+      try {
+        const detail = await api.plan(slug, threadId);
+        setPlanDetail(detail);
+        const pending = detail.plan_state?.pending_interrupt;
+        if (pending && typeof pending === 'object' && pending.type === 'task_step_confirm') {
+          const taskId = String(pending.task_id || previousTaskStep || '');
+          if (taskId) {
+            ingestTaskStepConfirm(slug, threadId, taskId);
+            applyPendingConfirmHead(slug, threadId, {
+              setSurvey: () => undefined,
+              setPlanConfirm,
+              setTaskStepConfirm,
+            });
+          }
+        } else if (previousTaskStep) {
+          ingestTaskStepConfirm(slug, threadId, previousTaskStep);
+          setTaskStepConfirm(previousTaskStep);
+        }
+      } catch {
+        if (previousTaskStep) {
+          ingestTaskStepConfirm(slug, threadId, previousTaskStep);
+          setTaskStepConfirm(previousTaskStep);
+        }
+      }
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         setMessages((prev) => [
           ...prev,
@@ -433,7 +515,7 @@ export function usePlanSession(deps: PlanSessionDeps) {
         ]);
       }
     } finally {
-      if (!runningThreadsRef.current.has(selected.thread_id)) {
+      if (!runningThreadsRef.current.has(threadId)) {
         setBusy(false);
       }
     }

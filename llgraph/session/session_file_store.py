@@ -40,6 +40,33 @@ def save_session_messages(
         return None
 
 
+def save_agent_session_messages(
+    workspace: Path,
+    thread_id: str,
+    messages: list[BaseMessage],
+    *,
+    sync_pool: bool = False,
+) -> str | None:
+    """
+    落盘 messages.jsonl；Agent 内存已同步更新时可通知保活池 mtime。
+
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @param messages LangChain 消息列表
+    @param sync_pool 是否更新 LRU 池内 mtime（仅 agent.update_state 后使用）
+    @return 落盘路径；失败返回 None
+    """
+    path = save_session_messages(workspace, thread_id, messages)
+    if path and sync_pool:
+        try:
+            from llgraph.core.agent_session_pool import notify_agent_session_persisted
+
+            notify_agent_session_persisted(workspace, thread_id)
+        except Exception:
+            pass
+    return path
+
+
 def load_session_messages(workspace: Path, thread_id: str) -> list[BaseMessage]:
     """
     从 messages.jsonl 加载对话。
@@ -71,9 +98,12 @@ def load_session_messages(workspace: Path, thread_id: str) -> list[BaseMessage]:
 
     cleaned, _report = to_canonical_v2_messages(loaded)
     cleaned, stripped = strip_inline_images_from_messages(cleaned)
-    if stripped:
-        save_session_messages(workspace, thread_id, cleaned)
-    return cleaned
+    from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
+
+    with_anchor = ensure_messages_include_conversation_anchor(workspace, thread_id, cleaned)
+    if stripped or with_anchor != cleaned:
+        save_session_messages(workspace, thread_id, with_anchor)
+    return with_anchor
 
 
 def session_has_messages_file(workspace: Path, thread_id: str) -> bool:
@@ -123,6 +153,9 @@ def restore_session_to_agent(
 
     messages, report = to_canonical_v2_messages(raw_messages)
     messages, stripped = strip_inline_images_from_messages(messages)
+    from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
+
+    messages = ensure_messages_include_conversation_anchor(workspace, thread_id, messages)
     if report.changed or stripped:
         save_session_messages(workspace, thread_id, messages)
 
@@ -255,13 +288,16 @@ def persist_agent_session(
 
     cleaned, _report = to_canonical_v2_messages(messages)
     cleaned, stripped = strip_inline_images_from_messages(cleaned)
+    from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
+
+    cleaned = ensure_messages_include_conversation_anchor(workspace, thread_id, cleaned)
     if stripped or turn_image_refs:
         try:
             agent.update_state(config, {"messages": cleaned})
         except Exception:
             pass
 
-    return save_session_messages(workspace, thread_id, cleaned)
+    return save_agent_session_messages(workspace, thread_id, cleaned, sync_pool=True)
 
 
 def purge_legacy_inline_images_in_workspace(workspace: Path) -> int:

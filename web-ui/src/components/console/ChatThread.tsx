@@ -2,6 +2,7 @@ import type { TraceStep, TraceTurn } from '../../types/trace';
 import { isHelpReport } from '../../utils/helpReport';
 import HelpReportView from './HelpReportView';
 import MarkdownView from './MarkdownView';
+import CopyButton from './CopyButton';
 import type { ChatImageAttachment } from '../../types/chatImage';
 import ChatImageStrip from './ChatImageStrip';
 import TraceFold from './TraceFold';
@@ -176,11 +177,27 @@ export default function ChatThread({
               <>
                 <div className="cursor-msg-label">你</div>
                 {(m.images?.length ?? 0) > 0 && <ChatImageStrip images={m.images ?? []} />}
-                {m.text.trim() && <div className="cursor-user-query">{m.text}</div>}
+                {m.text.trim() && (
+                  <div className="cursor-user-query">
+                    <CopyButton
+                      text={m.text}
+                      title="复制问题"
+                      className="cursor-user-query-copy"
+                      iconOnly
+                    />
+                    {m.text}
+                  </div>
+                )}
               </>
             )}
             {m.role === 'assistant' && formatAgentChatDisplayText(m.text).trim() && (
               <>
+                <CopyButton
+                  text={formatAgentChatDisplayText(m.text)}
+                  title="复制回复"
+                  className="cursor-msg-copy cursor-msg-copy--assistant"
+                  iconOnly
+                />
                 <div className="cursor-msg-label">助手</div>
                 <div className="cursor-agent-reply">
                   <MarkdownView content={formatAgentChatDisplayText(m.text)} />
@@ -200,6 +217,12 @@ export default function ChatThread({
       )}
       {streamText && formatAgentChatDisplayText(streamText).trim() && (
         <article className="cursor-msg cursor-msg--assistant cursor-msg--streaming">
+          <CopyButton
+            text={formatAgentChatDisplayText(streamText)}
+            title="复制回复"
+            className="cursor-msg-copy cursor-msg-copy--assistant"
+            iconOnly
+          />
           <div className="cursor-msg-label">助手</div>
           <div className="cursor-agent-reply">
             <MarkdownView content={formatAgentChatDisplayText(streamText)} />

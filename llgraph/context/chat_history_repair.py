@@ -21,7 +21,121 @@ from llgraph.context.tool_call_id import (
 
 _REPAIR_TOOL_RESULT = "（上一轮工具调用未完成，已跳过；请继续当前问题。）"
 _REASONING_PLACEHOLDER = "（历史思考过程未落盘，占位以满足 Kimi 等网关校验。）"
-_EMPTY_ASSISTANT_PLACEHOLDER = " "
+THINKING_ONLY_DISPATCH_TEXT = "（无用户可见正文，思考见 thinking 块。）"
+TOOL_ASSISTANT_DISPATCH_TEXT = "（调用工具中，无可见正文。）"
+_EMPTY_ASSISTANT_PLACEHOLDER = TOOL_ASSISTANT_DISPATCH_TEXT
+
+
+def is_dispatch_placeholder_text(text: str) -> bool:
+    """@param text assistant 可见正文 @return 是否为出站/落盘占位符（非用户可见答复）"""
+    t = (text or "").strip()
+    return t in (
+        TOOL_ASSISTANT_DISPATCH_TEXT,
+        THINKING_ONLY_DISPATCH_TEXT,
+        _REASONING_PLACEHOLDER,
+    )
+
+
+def _is_real_user_turn_boundary(msg: BaseMessage) -> bool:
+    """@param msg 消息 @return 是否为真实用户轮次起点（非 manifest/anchor/nudge）"""
+    from langchain_core.messages import HumanMessage
+
+    from llgraph.context.conversation_anchor import is_conversation_anchor_message
+    from llgraph.core.agent_turn import THINK_CONTINUE_NUDGE
+    from llgraph.session.session_manifest import is_session_manifest_message
+
+    if not isinstance(msg, HumanMessage):
+        return False
+    if is_session_manifest_message(msg) or is_conversation_anchor_message(msg):
+        return False
+    text = _message_text(getattr(msg, "content", "")).strip()
+    if not text or text == THINK_CONTINUE_NUDGE.strip():
+        return False
+    if text.startswith("<session-manifest>") or text.startswith("<workspace-context>"):
+        return False
+    return True
+
+
+def stamp_turn_reply_on_messages(
+    messages: list[BaseMessage],
+    reply_text: str,
+) -> tuple[list[BaseMessage], bool]:
+    """
+    将本轮最终可见答复写回末条无 tool_calls 的 AI，避免 messages.jsonl 仅占位符。
+
+    @param messages LangGraph 消息列表
+    @param reply_text 本轮助手可见正文
+    @return (新列表, 是否更新)
+    """
+    from llgraph.context.message_normalize import format_agent_chat_display_text
+
+    reply = format_agent_chat_display_text((reply_text or "").strip())
+    if not reply:
+        return messages, False
+
+    turn_starts = [i for i, m in enumerate(messages) if _is_real_user_turn_boundary(m)]
+    if not turn_starts:
+        turn_starts = [0]
+    last_turn_start = turn_starts[-1]
+
+    last_ai_idx = -1
+    for i in range(last_turn_start, len(messages)):
+        if isinstance(messages[i], AIMessage):
+            last_ai_idx = i
+    if last_ai_idx < 0:
+        return messages, False
+
+    msg = messages[last_ai_idx]
+    if ai_message_has_tool_calls(msg):
+        return messages, False
+
+    current = _message_text(getattr(msg, "content", "")).strip()
+    if current == reply:
+        return messages, False
+    if current and not is_dispatch_placeholder_text(current):
+        return messages, False
+
+    extra = dict(getattr(msg, "additional_kwargs", None) or {})
+    meta = dict(extra.get("llgraph") or {})
+    meta["turn_reply_text"] = reply
+    extra["llgraph"] = meta
+    updated = msg.model_copy(update={"content": reply, "additional_kwargs": extra})
+    out = list(messages)
+    out[last_ai_idx] = updated
+    return out, True
+
+
+def stamp_turn_reply_on_agent_state(
+    agent: Any,
+    thread_id: str,
+    reply_text: str,
+) -> bool:
+    """
+    将 turn 最终答复写回 agent checkpoint（persist 前调用）。
+
+    @param agent LangGraph agent
+    @param thread_id 会话 ID
+    @param reply_text 可见助手正文
+    @return 是否更新 state
+    """
+    if not (reply_text or "").strip():
+        return False
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = agent.get_state(config)
+        messages = list((state.values or {}).get("messages") or [])
+    except Exception:
+        return False
+    if not messages:
+        return False
+    stamped, changed = stamp_turn_reply_on_messages(messages, reply_text)
+    if not changed:
+        return False
+    try:
+        agent.update_state(config, {"messages": stamped})
+    except Exception:
+        return False
+    return True
 
 
 @dataclass
@@ -597,8 +711,10 @@ def rehydrate_native_thinking_block(msg: AIMessage) -> tuple[AIMessage, bool]:
         {"type": "thinking", "thinking": thinking.strip()},
     ]
     merged_text = "\n\n".join(text_parts).strip()
-    if merged_text:
+    if merged_text and merged_text != _EMPTY_ASSISTANT_PLACEHOLDER.strip():
         blocks.append({"type": "text", "text": merged_text})
+    else:
+        blocks.append({"type": "text", "text": THINKING_ONLY_DISPATCH_TEXT})
     return msg.model_copy(update={"content": blocks}), True
 
 
@@ -693,12 +809,17 @@ def ensure_nonempty_assistant_messages(
         if _assistant_has_thinking_blocks(msg):
             out.append(msg)
             continue
+        if _ai_has_persisted_thinking(msg):
+            patched += 1
+            fixed, _ = rehydrate_native_thinking_block(msg)
+            out.append(fixed)
+            continue
         if ai_message_has_tool_calls(msg):
             patched += 1
-            out.append(msg.model_copy(update={"content": _EMPTY_ASSISTANT_PLACEHOLDER}))
+            out.append(msg.model_copy(update={"content": TOOL_ASSISTANT_DISPATCH_TEXT}))
             continue
         patched += 1
-        out.append(msg.model_copy(update={"content": _EMPTY_ASSISTANT_PLACEHOLDER}))
+        out.append(msg.model_copy(update={"content": TOOL_ASSISTANT_DISPATCH_TEXT}))
     return out, patched
 
 
@@ -897,14 +1018,21 @@ def ensure_agent_chat_history_sanitized(
         removed_orphan_tools=canon_report.removed_orphan_tools,
         normalized_ai_messages=canon_report.normalized_ai_messages,
     )
+    from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
+
+    new_messages = ensure_messages_include_conversation_anchor(
+        Path(workspace),
+        thread_id,
+        new_messages,
+    )
     if not _messages_changed(messages, new_messages):
         return report
 
     try:
         agent.update_state(config, {"messages": new_messages})
-        from llgraph.session.session_file_store import save_session_messages
+        from llgraph.session.session_file_store import save_agent_session_messages
 
-        save_session_messages(Path(workspace), thread_id, new_messages)
+        save_agent_session_messages(Path(workspace), thread_id, new_messages, sync_pool=True)
     except Exception:
         return empty
 
@@ -923,8 +1051,8 @@ def ensure_agent_chat_history_sanitized(
         parts.append(f"剥离 {report.stripped_thinking_blocks} 条 AI thinking 块")
     if canon_report.flattened_ai_messages > 0:
         parts.append(f"扁平化 {canon_report.flattened_ai_messages} 条 AI 内容")
-    if canon_report.archived_system_messages > 0:
-        parts.append(f"归档 {canon_report.archived_system_messages} 条中段 system")
+    if canon_report.dropped_system_messages > 0:
+        parts.append(f"移除 {canon_report.dropped_system_messages} 条中段 system")
     if parts:
         from llgraph.terminal.ops_notice import ops_notice
 
@@ -968,9 +1096,9 @@ def ensure_agent_chat_history_dispatch_safe(
     try:
         agent.update_state(config, {"messages": safe})
         if ws is not None:
-            from llgraph.session.session_file_store import save_session_messages
+            from llgraph.session.session_file_store import save_agent_session_messages
 
-            save_session_messages(ws, thread_id, safe)
+            save_agent_session_messages(ws, thread_id, safe, sync_pool=True)
     except Exception:
         return empty
     return report

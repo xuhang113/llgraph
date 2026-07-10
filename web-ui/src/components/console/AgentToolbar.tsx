@@ -63,7 +63,7 @@ export default function AgentToolbar({
   return (
     <div className="cursor-agent-toolbar">
       {!llm ? (
-        <span className="cursor-agent-toolbar-hint">加载模型…</span>
+        <span className="cursor-agent-toolbar-hint">加载模型列表…</span>
       ) : llm.models.length > 0 ? (
         <div className="cursor-agent-toolbar-field">
           <span className="cursor-agent-toolbar-label">模型</span>

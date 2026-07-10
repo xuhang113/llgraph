@@ -15,7 +15,7 @@ usage() {
 用法: $(basename "$0") [profile] [options]
 
 profile（默认 web）:
-  web       Web Console：core + [web] + web-ui npm（推荐）
+  web       Web Console：core + [web,index,mcp,watch,search,terminal,ast] + web-ui npm
   dev       开发全量：web + terminal + index + watch + mcp + search + ast + dev
   minimal   仅核心 editable 安装
   check     检查 optional 依赖是否就绪（不安装）
@@ -44,7 +44,7 @@ log() {
 
 extras_for_profile() {
   case "$1" in
-    web) echo "web" ;;
+    web) echo "web,index,mcp,watch,search,terminal,ast" ;;
     minimal) echo "" ;;
     dev) echo "web,terminal,index,watch,mcp,search,ast,dev" ;;
     check) echo "" ;;
@@ -104,14 +104,13 @@ install_npm() {
   if $SKIP_NPM; then
     return
   fi
-  if [[ ! -f web-ui/package.json ]]; then
-    return
-  fi
-  if [[ ! -d web-ui/node_modules ]]; then
-    log "安装 web-ui npm 依赖 …"
+  # shellcheck source=lib/web-ui-npm.sh
+  source "$ROOT/scripts/lib/web-ui-npm.sh"
+  if web_ui_needs_npm_install "$ROOT"; then
+    log "安装/同步 web-ui npm 依赖 …"
     (cd web-ui && npm install)
-  else
-    log "web-ui node_modules 已存在，跳过 npm install（删目录可强制重装）"
+  elif ! $QUIET; then
+    log "web-ui npm 依赖已是最新"
   fi
 }
 

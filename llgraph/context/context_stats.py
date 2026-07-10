@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.utils.function_calling import convert_to_openai_tool
@@ -144,12 +145,49 @@ def _measure_markdowns_tokens(workspace: Path, session: ContextSession) -> int:
 
 
 def _message_content_chars(msg: BaseMessage) -> int:
+    from langchain_core.messages import HumanMessage
+
+    from llgraph.core.user_message_content import (
+        human_content_has_image_refs,
+        human_content_has_inline_images,
+        human_content_text_for_llm,
+    )
+
     content = getattr(msg, "content", "") or ""
-    if not isinstance(content, str):
-        content = str(content)
+    if isinstance(msg, HumanMessage) and isinstance(content, list):
+        chars = len(human_content_text_for_llm(content))
+        if human_content_has_inline_images(content):
+            n = sum(
+                1
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "image"
+            )
+            chars += n * 1500
+        extra = getattr(msg, "tool_calls", None)
+        if extra:
+            chars += len(str(extra))
+        return chars
+    if isinstance(msg, HumanMessage) and human_content_has_image_refs(content):
+        chars = len(human_content_text_for_llm(content))
+        extra = getattr(msg, "tool_calls", None)
+        if extra:
+            chars += len(str(extra))
+        return chars
+    if isinstance(content, str):
+        text_len = len(content)
+    elif isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        text_len = len("".join(parts)) if parts else len(str(content))
+    else:
+        text_len = len(str(content))
     extra = getattr(msg, "tool_calls", None)
     extra_len = len(str(extra)) if extra else 0
-    return len(content) + extra_len
+    return text_len + extra_len
 
 
 def _split_message_tokens(messages: list[BaseMessage]) -> tuple[int, int]:
@@ -182,6 +220,9 @@ def collect_context_usage(
     allow_write: bool = False,
     web_search_enabled: bool = False,
     agent_session: AgentSessionContext | None = None,
+    thread_id: str = "",
+    mcp_tools: list | None = None,
+    context_spill: Any | None = None,
 ) -> ContextUsageBreakdown:
     """
     汇总当前会话上下文各分项占用（启发式 token）。
@@ -191,7 +232,10 @@ def collect_context_usage(
     @param last_user_message 用于 glob/技能匹配与下轮注入估算
     @param allow_write 是否包含写工具
     @param web_search_enabled 是否包含 web_search
-    @param agent_session Agent 会话（读取消息历史）
+    @param agent_session Agent 会话（读取内存消息；只读统计可传 thread_id + mcp_tools）
+    @param thread_id 无 agent 时从磁盘加载 messages.jsonl
+    @param mcp_tools 无 agent 时的 MCP 工具列表
+    @param context_spill 无 agent 时的 spill 句柄
     @return 分项报告
     """
     system_prompt = estimate_text_tokens(
@@ -202,16 +246,19 @@ def collect_context_usage(
         )
     )
 
-    mcp_tools = agent_session.mcp_tools if agent_session else None
-    spill = agent_session.context_spill if agent_session else None
+    mcp_tools_resolved = mcp_tools
+    spill_resolved = context_spill
+    if agent_session is not None:
+        mcp_tools_resolved = agent_session.mcp_tools
+        spill_resolved = agent_session.context_spill
     tools = get_agent_tools(
         workspace_root=workspace,
         allow_write=allow_write,
-        mcp_tools=mcp_tools,
-        context_spill=spill,
+        mcp_tools=mcp_tools_resolved,
+        context_spill=spill_resolved,
         web_search_enabled=web_search_enabled,
     )
-    mcp_names = _mcp_tool_names(mcp_tools)
+    mcp_names = _mcp_tool_names(mcp_tools_resolved)
     tool_definitions, mcp_tokens, mcp_tool_count = _estimate_tool_schema_tokens(
         tools, mcp_names
     )
@@ -220,11 +267,26 @@ def collect_context_usage(
     markdowns_index = _measure_markdowns_tokens(workspace, context_session)
 
     messages: list[BaseMessage] = []
+    tid = thread_id.strip()
     if agent_session is not None and agent_session.with_memory:
         config = {"configurable": {"thread_id": agent_session.thread_id}}
         try:
             state = agent_session.agent.get_state(config)
             messages = list((state.values or {}).get("messages") or [])
+        except Exception:
+            messages = []
+        if not messages and workspace is not None:
+            from llgraph.session.session_file_store import load_session_messages
+
+            try:
+                messages = load_session_messages(workspace, agent_session.thread_id)
+            except Exception:
+                messages = []
+    elif tid and workspace is not None:
+        from llgraph.session.session_file_store import load_session_messages
+
+        try:
+            messages = load_session_messages(workspace, tid)
         except Exception:
             messages = []
 

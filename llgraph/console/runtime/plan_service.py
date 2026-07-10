@@ -776,6 +776,7 @@ def _force_stop_running_plan(workspace: Path, thread_id: str) -> dict[str, Any]:
             "workflow_snapshot": snapshot,
         }
     )
+    state.pop("pending_interrupt", None)
     save_plan_state(workspace, thread_id, state)
     if plan_id:
         init_plan_session_meta(
@@ -886,6 +887,7 @@ def abort_plan(workspace: Path, thread_id: str) -> dict[str, Any]:
             "workflow_snapshot": snapshot,
         }
     )
+    state.pop("pending_interrupt", None)
     save_plan_state(workspace, thread_id, state)
     clear_cancelled_tasks(thread_id)
 

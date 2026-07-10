@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react';
-import { api, type Capabilities, type ContextUsage, type IndexStatus } from '../../api/client';
+import { api, type Capabilities, type ContextDetail, type ContextUsage, type IndexStatus } from '../../api/client';
+import ContextDetailSections from './ContextDetailSections';
 import {
-  CONTEXT_BREAKDOWN_LABELS,
   formatContextTokens,
   resolveSlashMetaModalRoute,
 } from '../../utils/contextDisplay';
@@ -121,6 +121,7 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
   const menuRef = useRef<HTMLDivElement>(null);
 
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
+  const [contextDetail, setContextDetail] = useState<ContextDetail | null>(null);
   const [contextLoading, setContextLoading] = useState(false);
   const [compressing, setCompressing] = useState(false);
   const [contextNote, setContextNote] = useState('');
@@ -185,13 +186,15 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
     setContextLoading(true);
     setContextNote('');
     try {
-      const usage = await api.contextUsage(slug, allowWrite, isAgent ? threadId : '');
-      setContextUsage(usage);
+      const detail = await api.contextDetail(slug, allowWrite, isAgent ? threadId : '');
+      setContextDetail(detail);
+      setContextUsage(detail.usage);
       if (isAgent) {
-        setContextPct(usage.pct);
+        setContextPct(detail.usage.pct);
       }
     } catch (err) {
       setContextUsage(null);
+      setContextDetail(null);
       setContextNote(err instanceof Error ? err.message : String(err));
     } finally {
       setContextLoading(false);
@@ -449,16 +452,7 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
                   />
                 </div>
               </div>
-              <ul className="cursor-context-breakdown">
-                {Object.entries(contextUsage.breakdown)
-                  .filter(([, v]) => v > 0)
-                  .map(([key, value]) => (
-                    <li key={key}>
-                      <span>{CONTEXT_BREAKDOWN_LABELS[key] || key}</span>
-                      <span>{formatContextTokens(value)}</span>
-                    </li>
-                  ))}
-              </ul>
+              <ContextDetailSections detail={contextDetail} loading={contextLoading} />
               <p className="cursor-ops-meta-line">
                 消息 {contextUsage.message_count} · 工具 {contextUsage.tool_count}
                 {contextUsage.mcp_tool_count > 0 ? ` · MCP ${contextUsage.mcp_tool_count}` : ''}
@@ -489,6 +483,7 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
               {isAgent && !contextUsage.has_session && (
                 <p className="cursor-ops-meta-line muted">当前会话尚无多轮历史可压缩</p>
               )}
+              <ContextDetailSections detail={contextDetail} loading={contextLoading} />
             </>
           )}
           {contextNote && <pre className="cursor-ops-note">{contextNote}</pre>}

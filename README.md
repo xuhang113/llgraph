@@ -122,8 +122,8 @@ from llgraph.console import Console
 c = Console()
 c.list_workspaces()
 c.register_workspace("/path/to/workspace")
-c.session_tree("WorkspaceV2-xxxxxxxx")
-c.delete_session("WorkspaceV2-xxxxxxxx", "plan-xxxxxxxx")  # Plan 含 Worker 级联
+c.session_tree("my-workspace-xxxxxxxx")
+c.delete_session("my-workspace-xxxxxxxx", "plan-xxxxxxxx")  # Plan 含 Worker 级联
 ```
 
 控制面边界见 `llgraph.gateway`（`ControlGateway`）；远程部署预留 `LLGRAPH_CONTROL_GATEWAY=remote`。
@@ -213,7 +213,6 @@ llgraph -C <工作区> --purge-sessions --including-current   # 全量删除
 - **`compress_strategy`**：`auto`（默认，滚动 anchor + auto 出站）或 `legacy`（`keep_recent_*` + 固定出站轮数）
 - **`dispatch_keep_user_turns`**：`0` = 按 `dispatch_window_token_ratio` 自动扩展 user 轮；`>0` = 固定 N 轮
 - **`auto_compress_ratio`**、**`compress_trigger_max_tokens`**：自动压缩阈值
-- **`compress_retrieval_enabled`**：Tier3 压缩前代码检索
 
 模板与字段注释见 `examples/default-workspace/.llgraph/agent.json` → `context._docs`；会话内 `/context` 可查看生效值。
 
@@ -227,7 +226,7 @@ llgraph -C <工作区> --purge-sessions --including-current   # 全量删除
 | **代码索引** | `llgraph index` + `search_code_hybrid`（RRF） |
 | **Rules / Skills** | `.llgraph` + `~/.llgraph` 双源，个人优先；`/rule`、`/skill` |
 | **局部改代码** | `-w`：`search_replace`、`write_file`；`/changes`、`/undo` |
-| **上下文压缩** | `/compress` + 自动压缩（`compress_strategy: auto`）；auto 出站按 token 扩展 user 轮；Tier2 锚点 / Tier3 检索 |
+| **上下文压缩** | `/compress` + 自动压缩（`compress_strategy: auto`）；auto 出站按 token 扩展 user 轮；Tier2 结构化锚点 |
 | **动态落盘 (P6)** | 大工具结果 → `.llgraph/context/tool-results/` |
 | **MCP** | `.llgraph/mcp.json`，工具名 `mcp__<server>__<tool>` |
 | **监听索引** | 保存后 debounce 增量索引（可 `--no-watch-index`） |

@@ -1,27 +1,28 @@
-"""出站上下文窗口：置顶 system + 最近 user 轮（固定 N 或按 token 自动扩展）。"""
+"""出站上下文窗口：稳定 system + 最近 user 轮（固定 N 或按 token 自动扩展）。"""
 
 from __future__ import annotations
 
 from typing import Callable
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
 from llgraph.context.chat_history_repair import ai_message_has_tool_calls
 from llgraph.context.context_message_split import _segment_messages
 from llgraph.context.context_settings import ContextSettings
-from llgraph.context.conversation_anchor import is_conversation_anchor_message
-from llgraph.context.message_canonical import is_session_archive_message
+from llgraph.context.conversation_anchor import (
+    is_conversation_anchor_message,
+    is_pinned_session_context_message,
+)
+from llgraph.context.message_normalize import reorder_pinned_session_messages
 from llgraph.session.session_manifest import is_session_manifest_message
 
 
 def _is_pinned_dispatch_message(msg: BaseMessage) -> bool:
-    if not isinstance(msg, SystemMessage):
-        return False
-    return (
-        is_session_manifest_message(msg)
-        or is_conversation_anchor_message(msg)
-        or is_session_archive_message(msg)
-    )
+    return is_session_manifest_message(msg) or is_conversation_anchor_message(msg)
+
+
+def _is_business_user_message(msg: BaseMessage) -> bool:
+    return isinstance(msg, HumanMessage) and not is_pinned_session_context_message(msg)
 
 
 def _split_pinned_business(
@@ -58,7 +59,7 @@ def trim_messages_for_dispatch_window(
     user_turns = 0
     for seg in reversed(segments):
         kept_segments.insert(0, seg)
-        user_turns += sum(1 for m in seg if isinstance(m, HumanMessage))
+        user_turns += sum(1 for m in seg if _is_business_user_message(m))
         if user_turns >= keep_user_turns:
             break
 
@@ -70,7 +71,7 @@ def trim_messages_for_dispatch_window(
         return messages
 
     trimmed_business = business[-keep_count:]
-    return [*pinned, *trimmed_business]
+    return reorder_pinned_session_messages([*trimmed_business, *pinned])
 
 
 def trim_messages_for_dispatch_window_auto(
@@ -106,7 +107,7 @@ def trim_messages_for_dispatch_window_auto(
 
     for seg in reversed(segments):
         seg_tokens = estimate_tokens(seg)
-        has_user = any(isinstance(m, HumanMessage) for m in seg)
+        has_user = any(_is_business_user_message(m) for m in seg)
         is_tool_round = any(
             isinstance(m, AIMessage) and ai_message_has_tool_calls(m) for m in seg
         )
@@ -122,7 +123,7 @@ def trim_messages_for_dispatch_window_auto(
         kept_segments.insert(0, seg)
         tokens_used += seg_tokens
         if has_user:
-            user_turns += sum(1 for m in seg if isinstance(m, HumanMessage))
+            user_turns += sum(1 for m in seg if _is_business_user_message(m))
         if is_tool_round:
             tool_rounds_kept += 1
 
@@ -133,7 +134,7 @@ def trim_messages_for_dispatch_window_auto(
     if keep_count >= len(business):
         return messages
 
-    return [*pinned, *business[-keep_count:]]
+    return reorder_pinned_session_messages([*business[-keep_count:], *pinned])
 
 
 def apply_dispatch_window_trim(

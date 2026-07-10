@@ -380,8 +380,6 @@ def try_run_survey_followup(
 
     if not survey_followup_enabled(workspace, context_session):
         return None
-    if not allow_write:
-        return None
     has_block = _SURVEY_START in assistant_text
     spec = resolve_survey_from_assistant(assistant_text)
     if spec is None:

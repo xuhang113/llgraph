@@ -19,10 +19,7 @@ from llgraph.core.user_message_content import (
     ChatImageInput,
     build_human_content_blocks,
 )
-from llgraph.context.context_compressor import (
-    apply_compress_to_agent_state,
-    format_compress_report,
-)
+from llgraph.context.context_compressor import apply_compress_to_agent_state
 from llgraph.context.context_session import ContextSession
 from llgraph.core.llm import create_gateway_llm
 from llgraph.core.llm_settings import resolve_effective_model
@@ -111,6 +108,7 @@ def build_agent(
     web_search_enabled: bool = False,
     context_session: ContextSession | None = None,
     sandbox_policy: SandboxPolicy | None = None,
+    thread_id: str | None = None,
 ):
     """
     构建 ReAct Agent：LLM（Gateway）+ 工具循环。
@@ -125,6 +123,7 @@ def build_agent(
     @param write_failure_tracker 写工具失败提醒
     @param web_search_enabled 是否注册 web_search
     @param sandbox_policy OS 沙箱策略
+    @param thread_id 会话 thread（启用 memory 时用于 checkpoint 隔离）
     @return 已编译的 LangGraph Runnable
     """
     root = Path(workspace_root or ".").expanduser().resolve()
@@ -156,7 +155,10 @@ def build_agent(
         cache_control = build_cache_control(cache_settings)
         if cache_settings.tag_tools:
             tools = tag_tools_for_prompt_cache(tools, cache_control)
-    checkpointer = create_checkpointer(root, with_memory=with_memory)
+    from llgraph.core.checkpointer_factory import resolve_thread_checkpointer_key
+
+    cp_key = resolve_thread_checkpointer_key(root, thread_id) if thread_id else None
+    checkpointer = create_checkpointer(root, with_memory=with_memory, thread_key=cp_key)
     from llgraph.config.survey_settings import survey_interactive_enabled
 
     system_prompt = build_system_prompt(
@@ -241,9 +243,9 @@ def rebuild_agent_preserving_memory(
         sandbox_policy=policy,
     )
     if messages and agent_session.with_memory:
-        from llgraph.context.message_normalize import reorder_pinned_system_messages
+        from llgraph.context.message_normalize import reorder_pinned_session_messages
 
-        messages = reorder_pinned_system_messages(messages)
+        messages = reorder_pinned_session_messages(messages)
         try:
             new_agent.update_state(config, {"messages": messages})
         except Exception:
@@ -302,17 +304,30 @@ def invoke_agent(
     @param images 用户附带的图片（Web 多模态）
     @param write_failure_tracker 写工具失败跟踪
     @param allow_write Web/CLI 当前是否可写（同步 manifest 与 workspace-context）
-    @param cancel_check 可选；返回 True 时在 ReAct 步间中断（Web Stop）
+    @param cancel_check 可选；返回 True 时中断 ReAct（含进行中的 LLM stream）
     @param run_source 运行来源（cli | web），写入 last_run.json
     @return 助手回复文本
     """
     trace = trace_session or TraceSession()
     ctx = context_session or ContextSession()
     root = Path(workspace_root or ".").expanduser().resolve()
-    from llgraph.context.runtime_context import set_active_thread_id
-    from llgraph.display.trace_display import print_invoke_prelude
+    import time
 
+    from llgraph.context.runtime_context import set_active_thread_id
+    from llgraph.display import trace_display
+    from llgraph.display.trace_display import print_invoke_prelude
+    from llgraph.display.trace_emit import (
+        emit_compress_trace_step,
+        emit_invoke_prelude_step,
+        emit_tool_prune_trace_step,
+        format_compress_skip_summary,
+        format_sanitize_summary,
+    )
+
+    trace_display.LAST_TRACE_SESSION = trace
+    trace.pending_invoke_steps = []
     print_invoke_prelude(trace)
+    prelude_start = time.perf_counter()
 
     set_active_thread_id(thread_id if with_memory else None)
     if with_memory and user_message.strip():
@@ -331,15 +346,32 @@ def invoke_agent(
             format_tool_prune_report,
         )
 
+        t0 = time.perf_counter()
         prune_report = apply_incremental_tool_prune_to_agent_state(
             agent,
             thread_id=thread_id,
             workspace=root,
         )
+        prune_elapsed = time.perf_counter() - t0
         if prune_report is not None:
             from llgraph.terminal.ops_notice import ops_notice
 
             ops_notice(format_tool_prune_report(prune_report))
+            emit_tool_prune_trace_step(
+                prune_report,
+                thread_id=thread_id,
+                workspace=root,
+                session=trace,
+                elapsed_sec=prune_elapsed,
+            )
+        else:
+            emit_invoke_prelude_step(
+                trace,
+                title="工具结果裁剪",
+                summary="无变更",
+                elapsed=prune_elapsed,
+                kind="tool_prune",
+            )
 
         from llgraph.context.context_settings import is_auto_compress_strategy, resolve_context_settings
 
@@ -347,27 +379,39 @@ def invoke_agent(
         invoke_preserve = (
             False if is_auto_compress_strategy(ctx_settings.compress_strategy) else None
         )
+        t0 = time.perf_counter()
         compress_report = apply_compress_to_agent_state(
             agent,
             thread_id=thread_id,
             workspace=root,
             force=False,
             preserve_current_turn=invoke_preserve,
+            trigger="invoke",
         )
+        compress_elapsed = time.perf_counter() - t0
         if compress_report is not None:
-            from llgraph.terminal.ops_notice import ops_notice
-
-            ops_notice(format_compress_report(compress_report))
-            archive_path = compress_report.archive_path
-            from llgraph.display.execution_log import log_compress_event
-
-            log_compress_event(
-                root,
+            emit_compress_trace_step(
+                compress_report,
                 thread_id=thread_id,
-                report=compress_report,
-                trigger="auto",
+                workspace=root,
+                session=trace,
+                elapsed_sec=compress_elapsed,
+            )
+            archive_path = compress_report.archive_path
+        else:
+            emit_invoke_prelude_step(
+                trace,
+                title="上下文检查",
+                summary=format_compress_skip_summary(
+                    agent,
+                    thread_id=thread_id,
+                    workspace=root,
+                ),
+                elapsed=compress_elapsed,
+                kind="compress",
             )
 
+    t0 = time.perf_counter()
     sync_session_manifest_to_agent_state(
         agent,
         thread_id=thread_id,
@@ -378,11 +422,23 @@ def invoke_agent(
         archive_path=archive_path,
         allow_write=allow_write,
     )
+    emit_invoke_prelude_step(
+        trace,
+        title="Manifest 同步",
+        summary="session manifest 注入（历史尾段）",
+        elapsed=time.perf_counter() - t0,
+    )
     if with_memory:
         from llgraph.context.chat_history_repair import ensure_agent_chat_history_sanitized
 
-        # 仅 canonical 落盘清理（不按当前模型展开），出站修链在 prompt normalizer
-        ensure_agent_chat_history_sanitized(agent, root, thread_id)
+        t0 = time.perf_counter()
+        sanitize_report = ensure_agent_chat_history_sanitized(agent, root, thread_id)
+        emit_invoke_prelude_step(
+            trace,
+            title="历史 sanitize",
+            summary=format_sanitize_summary(sanitize_report),
+            elapsed=time.perf_counter() - t0,
+        )
 
     recent_messages: list[BaseMessage] | None = None
     edited_paths: list[str] | None = None
@@ -413,6 +469,7 @@ def invoke_agent(
         edited_paths=edited_paths,
     )
     turn_image_refs: list = []
+    outbound_t0 = time.perf_counter()
     if effective_message_override is not None:
         effective = effective_message_override
     else:
@@ -439,6 +496,21 @@ def invoke_agent(
             user_message,
             image_refs=turn_image_refs or None,
         )
+    if with_memory:
+        emit_invoke_prelude_step(
+            trace,
+            title="出站上下文",
+            summary="workspace-context + 待处理 user 轮",
+            elapsed=time.perf_counter() - outbound_t0,
+        )
+
+    prelude_step_count = len(trace.pending_invoke_steps)
+    emit_invoke_prelude_step(
+        trace,
+        title="invoke 准备合计",
+        summary=f"共 {prelude_step_count} 步",
+        elapsed=time.perf_counter() - prelude_start,
+    )
 
     from llgraph.display.execution_log import log_turn_end, log_turn_failure, log_turn_start
     from llgraph.session.session_run_log import (
@@ -469,6 +541,44 @@ def invoke_agent(
             recursion_limit=resolve_agent_max_turns(root),
             cancel_check=cancel_check,
         )
+    except UserCancelledError as exc:
+        partial_tools: list[str] = []
+        printer = trace.active_printer
+        if printer is not None and getattr(printer, "_tool_names", None):
+            partial_tools = list(printer._tool_names)
+        run_ctx = trace_run_context(trace)
+        duration = time.perf_counter() - turn_wall_start
+        log_turn_failure(
+            root,
+            thread_id=thread_id,
+            with_memory=with_memory,
+            agent=agent,
+            duration_sec=duration,
+            error=exc,
+            tool_names=partial_tools,
+            compress_report=compress_report,
+            spill=context_spill,
+            spill_count_at_start=spill_count_at_start,
+            trace_mode=trace.mode.value,
+            outcome="cancelled",
+            trace_context=run_ctx,
+            user_message=user_message,
+        )
+        if with_memory:
+            from llgraph.core.llm_settings import resolve_effective_model
+
+            write_session_last_run(
+                root,
+                thread_id,
+                outcome="cancelled",
+                duration_sec=duration,
+                model=resolve_effective_model(root),
+                user_message=user_message,
+                error=exc,
+                trace_context=run_ctx,
+                source=run_source,
+            )
+        return ""
     except Exception as exc:
         partial_tools: list[str] = []
         printer = trace.active_printer
@@ -476,7 +586,12 @@ def invoke_agent(
             partial_tools = list(printer._tool_names)
         run_ctx = trace_run_context(trace)
         duration = time.perf_counter() - turn_wall_start
-        outcome = "timeout" if type(exc).__name__ in ("TimeoutError", "ReadTimeout", "APITimeoutError") else "error"
+        outcome = "timeout" if type(exc).__name__ in (
+            "TimeoutError",
+            "ReadTimeout",
+            "APITimeoutError",
+            "ThinkingStreamTimeoutError",
+        ) else "error"
         log_turn_failure(
             root,
             thread_id=thread_id,
@@ -507,6 +622,12 @@ def invoke_agent(
                 trace_context=run_ctx,
                 source=run_source,
             )
+            try:
+                from llgraph.session.session_file_store import persist_agent_session
+
+                persist_agent_session(agent, root, thread_id)
+            except Exception:
+                pass
         raise
 
     duration = turn_result.duration_sec
@@ -576,8 +697,10 @@ def invoke_agent(
             apply_incremental_tool_prune_to_agent_state,
             format_tool_prune_report,
         )
+        from llgraph.context.chat_history_repair import stamp_turn_reply_on_agent_state
         from llgraph.session.session_file_store import persist_agent_session
 
+        stamp_turn_reply_on_agent_state(agent, thread_id, turn_result.text or "")
         persist_agent_session(
             agent,
             root,

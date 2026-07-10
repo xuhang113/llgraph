@@ -119,6 +119,57 @@ export interface ContextUsage {
   has_session: boolean;
 }
 
+export interface ContextSettingsSnapshot {
+  compress_strategy: string;
+  auto_compress_ratio: number;
+  compress_during_react: boolean;
+  dispatch_keep_user_turns: number;
+  dispatch_window_token_ratio: number;
+  incremental_tool_prune: boolean;
+  keep_recent_tool_messages: number;
+  tool_result_max_chars: number;
+}
+
+export interface ContextFixedSection {
+  key: string;
+  title: string;
+  tokens: number;
+  preview: string;
+  truncated: boolean;
+}
+
+export interface ContextBreakdownSection {
+  key: string;
+  title: string;
+  tokens: number;
+  preview: string;
+  truncated: boolean;
+  messages?: ContextMessageInspect[];
+}
+
+export interface ContextMessageInspect {
+  index: number;
+  role: string;
+  kind: string;
+  tokens: number;
+  chars: number;
+  preview: string;
+  truncated: boolean;
+  tool_name?: string;
+}
+
+export interface ContextDetail {
+  usage: ContextUsage;
+  settings: ContextSettingsSnapshot;
+  compress_threshold: number;
+  config_help: string;
+  breakdown_sections: ContextBreakdownSection[];
+  fixed_sections: ContextFixedSection[];
+  stored_messages: ContextMessageInspect[];
+  dispatch_messages: ContextMessageInspect[];
+  dispatch_note: string;
+}
+
 export interface IndexStatus {
   exists: boolean;
   chunk_count: number;
@@ -282,6 +333,7 @@ export interface PlanDetail {
     user_messages?: string[];
     revision_note?: string | null;
     allow_worker_write?: boolean;
+    cancel_requested?: boolean;
     discuss_messages?: Array<{ role: string; content: string }>;
     pending_interrupt?: Record<string, unknown>;
     confirm_history?: PlanConfirmHistoryEntry[];
@@ -522,6 +574,16 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind, goal }),
     }),
+  prewarmSession: (slug: string, threadId: string, allowWrite = true) =>
+    fetchJson<{ ok: boolean; thread_id: string; duration_sec?: number }>(
+      `/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/warm?allow_write=${allowWrite ? '1' : '0'}`,
+      { method: 'POST' },
+    ),
+  warmRecentSessions: (slug: string, allowWrite = true) =>
+    fetchJson<{ ok: boolean; queued: number; limit: number; background?: boolean }>(
+      `/workspaces/${slug}/sessions/warm-recent?allow_write=${allowWrite ? '1' : '0'}`,
+      { method: 'POST' },
+    ),
   deleteSession: (slug: string, threadId: string) =>
     fetchJson<{
       thread_id: string;
@@ -692,6 +754,15 @@ export const api = {
   contextUsage: (slug: string, allowWrite = false, threadId = '') =>
     fetchJson<ContextUsage>(
       `/workspaces/${slug}/context?allow_write=${allowWrite}&thread_id=${encodeURIComponent(threadId)}`,
+    ),
+  contextDetail: (
+    slug: string,
+    allowWrite = false,
+    threadId = '',
+    maxPreviewChars = 6000,
+  ) =>
+    fetchJson<ContextDetail>(
+      `/workspaces/${slug}/context/detail?allow_write=${allowWrite}&thread_id=${encodeURIComponent(threadId)}&max_preview_chars=${maxPreviewChars}`,
     ),
   compressContext: (slug: string, threadId: string, allowWrite = false) =>
     fetchJson<{ ok: boolean; compressed: boolean; message: string; archive_path?: string }>(

@@ -22,9 +22,8 @@ def _settings(**overrides: object) -> ContextSettings:
         keep_recent_token_ratio=0.25,
         compress_model=None,
         session_archive_on_compress=True,
-        compress_retrieval_enabled=True,
-        compress_retrieval_top_k=5,
         compress_tool_mask_max_chars=2000,
+        read_tool_mask_max_chars=12000,
         tool_result_max_chars=12000,
         read_tool_result_max_chars=36000,
         read_file_max_bytes=600_000,
@@ -54,7 +53,9 @@ def _settings(**overrides: object) -> ContextSettings:
         dispatch_dedupe_read_paths=True,
         dispatch_min_tool_rounds=12,
         grep_context_lines=5,
+        grep_max_inline_chars=48000,
         spill_hit_context_lines=100,
+        tool_prune_token_ratio=0.0,
     )
     base.update(overrides)
     return ContextSettings(**base)
@@ -84,15 +85,52 @@ def test_prune_dispatch_keeps_last_two_tool_messages_full() -> None:
 
 
 def test_mask_read_tool_to_dispatch_pointer() -> None:
+    body = "\n".join(f"{i}| line-{i}" for i in range(1, 51))
     msg = ToolMessage(
-        content="--- pkg/Bar.java (行 10-20 / 共 300 行) ---\n10| x",
+        content=f"--- pkg/Bar.java (行 10-60 / 共 300 行) ---\n{body}",
         tool_call_id="t1",
         name="read_file",
     )
     out = mask_tool_message_to_dispatch_pointer(msg)
     assert "Bar.java" in out.content
     assert "read_file" in out.content
-    assert "10|" not in out.content
+    assert "--- 开头预览 ---" in out.content
+    assert "10| line-10" in out.content
+    assert "--- 末尾预览 ---" in out.content
+    assert "50| line-50" in out.content
+
+
+def test_read_under_mask_threshold_not_pruned(tmp_path: Path) -> None:
+    from llgraph.context.context_spill import mask_tool_message_content
+    from llgraph.context.incremental_context import prune_stale_tool_messages
+
+    ws = tmp_path
+    body = "1| " + ("x" * 6400)
+    content = f"--- src/PolestarExternalApiInterceptor.java (行 1-100 / 共 200 行) ---\n{body}"
+    msg = ToolMessage(content=content, tool_call_id="r1", name="read_file")
+    settings = _settings(read_tool_mask_max_chars=12000, keep_recent_tool_messages=0)
+    pruned, count = prune_stale_tool_messages([msg], ws, settings)
+    assert count == 0
+    assert pruned[0].content == content
+
+    masked = mask_tool_message_content(msg, ws, max_chars=12000)
+    assert masked.content == content
+
+
+def test_read_archive_includes_head_tail_preview(tmp_path: Path) -> None:
+    from llgraph.context.context_spill import mask_tool_message_content
+
+    ws = tmp_path
+    body = "\n".join(f"{i}| code-line-{i}" for i in range(1, 201))
+    content = f"--- src/Foo.java (行 1-200 / 共 500 行) ---\n{body}"
+    msg = ToolMessage(content=content, tool_call_id="r1", name="read_file")
+    masked = mask_tool_message_content(msg, ws, max_chars=1000)
+    assert "[历史 read 已归档]" in masked.content
+    assert "Foo.java" in masked.content
+    assert "--- 开头预览 ---" in masked.content
+    assert "1| code-line-1" in masked.content
+    assert "--- 末尾预览 ---" in masked.content
+    assert "200| code-line-200" in masked.content
 
 
 def test_read_file_spills_when_over_threshold(tmp_path: Path) -> None:
@@ -108,8 +146,9 @@ def test_read_file_spills_when_over_threshold(tmp_path: Path) -> None:
             tool_result_preview_lines=5,
             tool_result_preview_head_lines=3,
             spill_dir=".llgraph/context/tool-results",
-            spill_exempt_tools=(),
-            spill_hit_context_lines=100,
+        spill_exempt_tools=(),
+        grep_max_inline_chars=48000,
+        spill_hit_context_lines=100,
         ),
     )
     big = "--- a.java (行 1-10 / 共 10 行) ---\n" + ("line\n" * 200)
@@ -131,13 +170,16 @@ def test_read_file_uses_higher_spill_threshold(tmp_path: Path) -> None:
             tool_result_preview_lines=5,
             tool_result_preview_head_lines=3,
             spill_dir=".llgraph/context/tool-results",
-            spill_exempt_tools=(),
-            spill_hit_context_lines=100,
+        spill_exempt_tools=(),
+        grep_max_inline_chars=48000,
+        spill_hit_context_lines=100,
         ),
     )
     medium = "--- Foo.java (行 1-50 / 共 50 行) ---\n" + ("1| line\n" * 80)
     assert spill.maybe_spill("read_file", medium) == medium
-    assert spill.maybe_spill("grep_files", medium) != medium
+    grep_out = spill.maybe_spill("grep_files", medium)
+    assert "[工具结果已落盘" not in grep_out
+    assert "Foo.java" in grep_out
 
 
 def test_read_spill_includes_head_and_tail_preview(tmp_path: Path) -> None:
@@ -153,8 +195,9 @@ def test_read_spill_includes_head_and_tail_preview(tmp_path: Path) -> None:
             tool_result_preview_lines=3,
             tool_result_preview_head_lines=2,
             spill_dir=".llgraph/context/tool-results",
-            spill_exempt_tools=(),
-            spill_hit_context_lines=100,
+        spill_exempt_tools=(),
+        grep_max_inline_chars=48000,
+        spill_hit_context_lines=100,
         ),
     )
     lines = [f"{i}| line-{i}" for i in range(1, 41)]
@@ -241,6 +284,7 @@ def test_read_spill_includes_hit_anchor_preview(tmp_path: Path) -> None:
             tool_result_preview_head_lines=2,
             spill_dir=".llgraph/context/tool-results",
             spill_exempt_tools=(),
+            grep_max_inline_chars=48000,
             spill_hit_context_lines=5,
         ),
     )
@@ -287,3 +331,80 @@ def test_ripgrep_content_with_context(tmp_path: Path) -> None:
     assert ">>>" in hits[0]
     assert "line2" in hits[0]
     assert "line4" in hits[0]
+
+
+def test_grep_search_tools_never_spill_to_disk(tmp_path: Path) -> None:
+    from llgraph.context.context_settings import SpillSettings
+
+    spill = ContextSpill(
+        workspace=tmp_path,
+        session_id="cli-test",
+        settings=SpillSettings(
+            enabled=True,
+            tool_result_max_chars=500,
+            read_tool_result_max_chars=500,
+            tool_result_preview_lines=5,
+            tool_result_preview_head_lines=3,
+            spill_dir=".llgraph/context/tool-results",
+            spill_exempt_tools=(),
+            grep_max_inline_chars=48000,
+            spill_hit_context_lines=100,
+        ),
+    )
+    big = "匹配结果（ripgrep）:\n\n" + (
+        "--- src/Foo.java:134 ---\n>>> 134| tableDataList.subList(fromIndex, toIndex)\n"
+    ) * 200
+    out = spill.maybe_spill("grep_files", big)
+    assert "[工具结果已落盘" not in out
+    assert spill.spill_count() == 0
+    assert "subList" in out
+
+
+def test_grep_archive_pointer_keeps_hit_blocks() -> None:
+    from llgraph.context.context_spill import build_search_tool_archive_pointer
+
+    body = (
+        "匹配结果（ripgrep）:\n\n"
+        "--- src/A.java:10 ---\n>>> 10| alpha\n"
+        "--- src/B.java:134 ---\n>>> 134| tableDataList.subList(fromIndex, toIndex)\n"
+    )
+    archived = build_search_tool_archive_pointer(body, "grep_files")
+    assert archived is not None
+    assert "--- 命中预览 ---" in archived
+    assert "subList" in archived
+    assert "A.java:10" in archived
+
+
+def test_prune_skipped_when_context_pressure_low() -> None:
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    from llgraph.context.incremental_context import prune_stale_tool_messages
+
+    settings = _settings(tool_prune_token_ratio=0.7)
+    long_body = "x" * 5000
+    messages = [
+        HumanMessage(content="short question"),
+        ToolMessage(content=long_body, tool_call_id="1", name="grep_files"),
+        ToolMessage(content=long_body, tool_call_id="2", name="grep_files"),
+        ToolMessage(content=long_body, tool_call_id="3", name="grep_files"),
+    ]
+    pruned, count = prune_stale_tool_messages(messages, Path("/tmp/ws"), settings)
+    assert count == 0
+    assert pruned[1].content == long_body
+
+
+def test_dispatch_prune_skipped_when_context_pressure_low() -> None:
+    messages = [
+        HumanMessage(content="q"),
+        ToolMessage(content="grep-old-" + "x" * 5000, tool_call_id="1", name="grep_files"),
+        ToolMessage(content="grep-new", tool_call_id="2", name="grep_files"),
+    ]
+    out = prune_tool_messages_for_dispatch(
+        messages,
+        Path("/tmp/ws"),
+        _settings(tool_prune_token_ratio=0.7),
+    )
+    tools = [m for m in out if isinstance(m, ToolMessage)]
+    assert tools[0].content.startswith("grep-old")
+    assert tools[1].content == "grep-new"
+

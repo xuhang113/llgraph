@@ -16,6 +16,12 @@ from llgraph.display.trace_display import TraceSession
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.session.session_file_store import restore_session_to_agent
 
+__all__ = [
+    "AgentRuntimeBundle",
+    "build_agent_session_for_thread",
+    "get_or_build_agent_session_for_thread",
+]
+
 
 @dataclass
 class AgentRuntimeBundle:
@@ -84,6 +90,7 @@ def build_agent_session_for_thread(
         web_search_enabled=bundle.web_search_enabled,
         context_session=bundle.context_session,
         sandbox_policy=bundle.sandbox_policy,
+        thread_id=thread_id,
     )
     restore_session_to_agent(agent, workspace, thread_id)
     return AgentSessionContext(
@@ -105,3 +112,19 @@ def build_agent_session_for_thread(
         sandbox_policy=bundle.sandbox_policy,
         sandbox_cli_enabled=bundle.sandbox_cli_enabled,
     )
+
+
+def get_or_build_agent_session_for_thread(
+    bundle: AgentRuntimeBundle,
+    thread_id: str,
+) -> AgentSessionContext:
+    """
+    Web 热路径：LRU 保活池获取或冷构建 AgentSessionContext。
+
+    @param bundle 运行时依赖
+    @param thread_id cli-* thread
+    @return AgentSessionContext
+    """
+    from llgraph.core.agent_session_pool import get_or_build_agent_session_for_thread as _pool_get
+
+    return _pool_get(bundle, thread_id)

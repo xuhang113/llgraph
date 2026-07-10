@@ -13,7 +13,7 @@ from typing import Any, Callable
 from llgraph.config.edit_settings import resolve_edit_settings
 from llgraph.context.context_spill import ContextSpill
 from llgraph.core.agent import invoke_agent
-from llgraph.core.session_bootstrap import AgentRuntimeBundle, build_agent_session_for_thread
+from llgraph.core.session_bootstrap import AgentRuntimeBundle, get_or_build_agent_session_for_thread
 from llgraph.core.write_failure_tracker import WriteFailureTracker
 from llgraph.display.trace_display import TraceSession
 from llgraph.session.session_meta import save_session_meta, touch_session_activity
@@ -24,7 +24,9 @@ from llgraph.console.runtime.sse_sink import SseTraceSink
 from llgraph.console.runtime.workspace_runtime import RUNTIME_MANAGER
 
 _ACTIVE_AGENT_CHATS: set[str] = set()
+_ACTIVE_AGENT_CHAT_THREADS: dict[str, threading.Thread] = {}
 _ACTIVE_AGENT_CHATS_LOCK = threading.Lock()
+_STALE_TRACE_IDLE_SEC = 180.0
 _CANCEL_REQUESTS: set[str] = set()
 _CANCEL_LOCK = threading.Lock()
 _TRACE_HEARTBEAT_SEC = 5.0
@@ -119,17 +121,85 @@ def _start_web_trace_heartbeat(
             elapsed = max(0, int(time.monotonic() - turn_start))
             if elapsed < int(_TRACE_HEARTBEAT_SEC):
                 continue
-            emit({"type": "trace_activity", "elapsed_sec": elapsed, "phase": "running"})
+            phase = getattr(trace, "react_phase", "") or "running"
+            emit(
+                {
+                    "type": "trace_activity",
+                    "elapsed_sec": elapsed,
+                    "phase": phase,
+                }
+            )
 
     thread = threading.Thread(target=run, daemon=True, name="web-trace-heartbeat")
     thread.start()
     return thread
 
 
+def _cleanup_agent_chat_registration(thread_id: str) -> None:
+    """@param thread_id 会话 ID"""
+    with _ACTIVE_AGENT_CHATS_LOCK:
+        _ACTIVE_AGENT_CHATS.discard(thread_id)
+        _ACTIVE_AGENT_CHAT_THREADS.pop(thread_id, None)
+
+
+def force_release_agent_chat(thread_id: str, *, owner: str = "web") -> bool:
+    """
+    强制释放僵死 Web Agent 对话占用（锁 + 注册表），便于用户恢复继续提问。
+
+    @param thread_id 会话 ID
+    @param owner 锁持有者
+    @return 是否曾处于 running
+    """
+    with _ACTIVE_AGENT_CHATS_LOCK:
+        was_running = thread_id in _ACTIVE_AGENT_CHATS
+    if was_running:
+        clear_agent_cancel(thread_id)
+        _cleanup_agent_chat_registration(thread_id)
+        LOCKS.release(thread_id, owner=owner)
+    return was_running
+
+
+def reconcile_stale_agent_chat(
+    workspace: Path,
+    thread_id: str,
+    *,
+    max_trace_idle_sec: float = _STALE_TRACE_IDLE_SEC,
+) -> bool:
+    """
+    若 Web trace 长时间无更新但会话仍标记 running，则强制释放占用。
+
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @param max_trace_idle_sec live_web_trace 空闲秒数阈值
+    @return 是否执行了强制释放
+    """
+    if not is_agent_chat_running(thread_id):
+        return False
+    from llgraph.session.web_trace_store import live_web_trace_path
+
+    path = live_web_trace_path(workspace, thread_id)
+    if not path.is_file():
+        return False
+    try:
+        idle = time.time() - path.stat().st_mtime
+    except OSError:
+        return False
+    if idle < max_trace_idle_sec:
+        return False
+    return force_release_agent_chat(thread_id)
+
+
 def is_agent_chat_running(thread_id: str) -> bool:
     """@param thread_id 会话 ID @return Web Agent 后台线程是否在跑"""
     with _ACTIVE_AGENT_CHATS_LOCK:
-        return thread_id in _ACTIVE_AGENT_CHATS
+        if thread_id not in _ACTIVE_AGENT_CHATS:
+            return False
+        worker = _ACTIVE_AGENT_CHAT_THREADS.get(thread_id)
+        if worker is not None and not worker.is_alive():
+            _ACTIVE_AGENT_CHATS.discard(thread_id)
+            _ACTIVE_AGENT_CHAT_THREADS.pop(thread_id, None)
+            return False
+        return True
 
 
 def try_register_agent_chat(thread_id: str) -> bool:
@@ -141,14 +211,19 @@ def try_register_agent_chat(thread_id: str) -> bool:
     """
     with _ACTIVE_AGENT_CHATS_LOCK:
         if thread_id in _ACTIVE_AGENT_CHATS:
-            return False
+            worker = _ACTIVE_AGENT_CHAT_THREADS.get(thread_id)
+            if worker is not None and not worker.is_alive():
+                _ACTIVE_AGENT_CHATS.discard(thread_id)
+                _ACTIVE_AGENT_CHAT_THREADS.pop(thread_id, None)
+            else:
+                return False
         _ACTIVE_AGENT_CHATS.add(thread_id)
         return True
 
 
 def request_agent_cancel(thread_id: str) -> bool:
     """
-    请求停止进行中的 Web Agent 对话（在 ReAct 步间生效）。
+    请求停止进行中的 Web Agent 对话（立即中断当前 LLM invoke / 步间退出 ReAct）。
 
     @param thread_id 会话 ID
     @return 是否已标记（False 表示当前无后台对话）
@@ -176,7 +251,7 @@ def clear_agent_cancel(thread_id: str) -> None:
 
 def abort_agent_chat(thread_id: str) -> dict[str, Any]:
     """
-    Web Stop：标记取消，ReAct stream 在下一步前退出。
+    Web Stop：标记取消并关闭进行中的 LLM stream，不等待 invoke 整包返回。
 
     @param thread_id 会话 ID
     @return ok / message
@@ -202,6 +277,7 @@ def create_agent_session(workspace: Path, *, title: str = "") -> str:
             "session_kind": "agent",
             "workspace": str(workspace.expanduser().resolve()),
             "title": title or "",
+            "allow_write": True,
         },
     )
     return thread_id
@@ -332,10 +408,12 @@ def run_agent_chat(
         watch_active=False,
     )
 
+    turn_end_emitted = False
+
     try:
         emit({"type": "turn_start", "thread_id": req.thread_id})
         touch_session_activity(req.workspace, req.thread_id)
-        agent_ctx = build_agent_session_for_thread(
+        agent_ctx = get_or_build_agent_session_for_thread(
             bundle,
             req.thread_id,
         )
@@ -400,6 +478,7 @@ def run_agent_chat(
                 "type": "turn_done",
                 "text": display_text,
                 "thread_id": req.thread_id,
+                "duration_sec": round(time.monotonic() - turn_start, 3),
             }
             step_payloads: list[dict[str, Any]] = []
             if trace.last_turn_steps:
@@ -430,20 +509,26 @@ def run_agent_chat(
                 payload["type"] = "survey"
             emit(payload)
     except Exception as exc:
-        _persist_web_trace_turn(
-            req,
-            trace,
-            incomplete=True,
-            stop_reason=str(exc).strip() or type(exc).__name__,
-            outcome="error",
-        )
+        force_release_agent_chat(req.thread_id)
         emit({"type": "error", "message": str(exc)})
+        emit({"type": "end"})
+        turn_end_emitted = True
+        try:
+            _persist_web_trace_turn(
+                req,
+                trace,
+                incomplete=True,
+                stop_reason=str(exc).strip() or type(exc).__name__,
+                outcome="error",
+            )
+        except Exception:
+            pass
     finally:
         clear_agent_cancel(req.thread_id)
-        with _ACTIVE_AGENT_CHATS_LOCK:
-            _ACTIVE_AGENT_CHATS.discard(req.thread_id)
+        _cleanup_agent_chat_registration(req.thread_id)
         LOCKS.release(req.thread_id, owner="web")
-        emit({"type": "end"})
+        if not turn_end_emitted:
+            emit({"type": "end"})
 
 
 def start_agent_chat_async(
@@ -462,6 +547,9 @@ def start_agent_chat_async(
         args=(req,),
         kwargs={"loop": loop},
         daemon=True,
+        name=f"web-agent-{req.thread_id[:12]}",
     )
+    with _ACTIVE_AGENT_CHATS_LOCK:
+        _ACTIVE_AGENT_CHAT_THREADS[req.thread_id] = thread
     thread.start()
     return thread

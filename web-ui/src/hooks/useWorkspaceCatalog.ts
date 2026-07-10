@@ -7,7 +7,12 @@ import {
   type TreeNode,
   type Workspace,
 } from '../api/client';
-import { resolveWorkspaceSlug } from '../pages/console/storage';
+import {
+  resolveWorkspaceSlug,
+  readCachedLlmSettings,
+  readStoredSandboxEnabled,
+  writeCachedLlmSettings,
+} from '../pages/console/storage';
 import {
   mergeWorkspaceCatalog,
   readStoredRecentWorkspaces,
@@ -41,6 +46,7 @@ export function useWorkspaceCatalog({
   const [treeReadySlug, setTreeReadySlug] = useState<string | null>(null);
   const treeFetchSeqRef = useRef(0);
   const workspacesFetchSeqRef = useRef(0);
+  const warmedSlugRef = useRef<string | null>(null);
 
   const refreshWorkspaces = useCallback(() => {
     const seq = ++workspacesFetchSeqRef.current;
@@ -104,10 +110,19 @@ export function useWorkspaceCatalog({
         if (seq !== treeFetchSeqRef.current) {
           return;
         }
-        setAgents(t.agents ?? []);
+        setAgents((prev) => {
+          const loaded = t.agents ?? [];
+          const loadedIds = new Set(loaded.map((n) => n.thread_id));
+          const pending = prev.filter((n) => !loadedIds.has(n.thread_id));
+          return [...pending, ...loaded];
+        });
         setPlans(t.plans ?? []);
         setTreeReadySlug(slug);
         setTreeLoading(false);
+        if (warmedSlugRef.current !== slug) {
+          warmedSlugRef.current = slug;
+          void api.warmRecentSessions(slug, allowWrite).catch(() => {});
+        }
       })
       .catch(() => {
         if (seq !== treeFetchSeqRef.current) {
@@ -116,22 +131,72 @@ export function useWorkspaceCatalog({
         setTreeLoading(false);
         setTreeReadySlug(null);
       });
-  }, [slug]);
+  }, [slug, allowWrite]);
 
   const refreshWorkspaceMeta = useCallback(() => {
     if (!slug) {
       return;
     }
-    api.capabilities(slug, allowWrite).then(setCaps).catch(() => setCaps(null));
-    api.llmSettings(slug).then(setLlmSettings).catch(() => setLlmSettings(null));
     api.slashCatalog(slug).then((r) => setSlashCatalog(r.items)).catch(() => setSlashCatalog([]));
-  }, [slug, allowWrite, setCaps, setLlmSettings, setSlashCatalog]);
+    window.setTimeout(() => {
+      void api
+        .capabilities(slug, allowWrite)
+        .then(async (capsData) => {
+          setCaps(capsData);
+          if (
+            readStoredSandboxEnabled() &&
+            capsData.sandbox &&
+            !capsData.sandbox.enabled &&
+            capsData.sandbox.cli_override !== false
+          ) {
+            try {
+              const res = await api.setSandbox(slug, true, '', allowWrite);
+              if (res.sandbox) {
+                setCaps((prev) => (prev ? { ...prev, sandbox: res.sandbox } : prev));
+              }
+            } catch {
+              /* 沙箱后端不可用时保持未勾选 */
+            }
+          }
+        })
+        .catch(() => setCaps(null));
+    }, 0);
+  }, [slug, allowWrite, setCaps, setSlashCatalog]);
+
+  const loadLlmSettings = useCallback(() => {
+    if (!slug) {
+      return;
+    }
+    const cached = readCachedLlmSettings(slug);
+    if (cached) {
+      setLlmSettings(cached);
+    }
+    const attempt = (retriesLeft: number) => {
+      void api
+        .llmSettings(slug)
+        .then((settings) => {
+          setLlmSettings(settings);
+          writeCachedLlmSettings(slug, settings);
+        })
+        .catch(() => {
+          if (retriesLeft > 0) {
+            window.setTimeout(() => attempt(retriesLeft - 1), 600);
+            return;
+          }
+          if (!cached) {
+            setLlmSettings(null);
+          }
+        });
+    };
+    attempt(4);
+  }, [slug, setLlmSettings]);
 
   const refreshTree = useCallback(() => {
     loadSessionTree();
+    loadLlmSettings();
     refreshWorkspaceMeta();
     refreshWorkspaces();
-  }, [loadSessionTree, refreshWorkspaceMeta, refreshWorkspaces]);
+  }, [loadSessionTree, loadLlmSettings, refreshWorkspaceMeta, refreshWorkspaces]);
 
   const refreshCaps = useCallback(() => {
     if (!slug) {
@@ -238,6 +303,10 @@ export function useWorkspaceCatalog({
   useEffect(() => {
     loadSessionTree();
   }, [loadSessionTree]);
+
+  useEffect(() => {
+    loadLlmSettings();
+  }, [loadLlmSettings]);
 
   useEffect(() => {
     refreshWorkspaceMeta();

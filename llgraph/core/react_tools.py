@@ -13,6 +13,11 @@ from langgraph.prebuilt.tool_node import ToolNode
 from llgraph.context.chat_history_repair import ai_message_tool_calls
 from llgraph.core.code_index_tools import _DUPLICATE_PARALLEL_MSG
 from llgraph.core.tool_execution_context import set_tool_execution_messages
+from llgraph.core.tool_invoke_timing import (
+    attach_tool_timings_to_output,
+    reset_tool_timings,
+    wrap_tool_node_with_timing,
+)
 
 _PARALLEL_SEARCH_TOOL = "search_code_parallel"
 
@@ -107,14 +112,9 @@ _AGENT_CANCEL_TOOL_MSG = "[llgraph] 用户已停止当前生成。"
 
 
 def _agent_cancel_requested() -> bool:
-    from llgraph.context.runtime_context import get_active_thread_id
+    from llgraph.core.react_invoke import agent_cancel_requested
 
-    tid = get_active_thread_id()
-    if not tid:
-        return False
-    from llgraph.console.runtime.agent_service import is_agent_cancel_requested
-
-    return is_agent_cancel_requested(tid)
+    return agent_cancel_requested()
 
 
 def _cancel_pending_tool_messages(messages: list[BaseMessage]) -> list[ToolMessage]:
@@ -151,6 +151,7 @@ def build_tool_node(
     """
     _ = workspace
     inner = ToolNode(tools)
+    wrap_tool_node_with_timing(inner)
 
     def invoke(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
         prior = list(state.get("messages") or [])
@@ -161,8 +162,9 @@ def build_tool_node(
                 return {"messages": cancel_msgs}
         set_tool_execution_messages(list(state.get("messages") or prior))
         try:
+            reset_tool_timings()
             _emit_tool_start_milestones(list(state.get("messages") or prior))
-            out = inner.invoke(state, config)
+            out = attach_tool_timings_to_output(inner.invoke(state, config))
             return _merge_tool_outputs(out, blocked)
         finally:
             set_tool_execution_messages(None)
@@ -176,8 +178,9 @@ def build_tool_node(
                 return {"messages": cancel_msgs}
         set_tool_execution_messages(list(state.get("messages") or prior))
         try:
+            reset_tool_timings()
             _emit_tool_start_milestones(list(state.get("messages") or prior))
-            out = await inner.ainvoke(state, config)
+            out = attach_tool_timings_to_output(await inner.ainvoke(state, config))
             return _merge_tool_outputs(out, blocked)
         finally:
             set_tool_execution_messages(None)

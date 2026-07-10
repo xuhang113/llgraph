@@ -65,36 +65,27 @@ def tag_tools_for_prompt_cache(
 def build_cached_system_message(
     *,
     stable_text: str,
-    dynamic_text: str,
     cache_control: dict[str, str],
 ) -> SystemMessage:
     """
-    构建带断点的单条 SystemMessage：稳定前缀可缓存，会话指针不缓存。
+    构建带断点的 SystemMessage：仅稳定 Agent 规范可缓存。
 
     @param stable_text Agent 系统规范（build_system_prompt）
-    @param dynamic_text manifest + anchor 等每轮可变内容
     @param cache_control 断点参数
     @return SystemMessage
     """
-    blocks: list[dict[str, Any]] = []
     stable = stable_text.strip()
-    if stable:
-        blocks.append(
+    if not stable:
+        return SystemMessage(content="")
+    return SystemMessage(
+        content=[
             {
                 "type": "text",
                 "text": stable,
                 "cache_control": dict(cache_control),
             }
-        )
-    dynamic = dynamic_text.strip()
-    if dynamic:
-        blocks.append({"type": "text", "text": dynamic})
-
-    if not blocks:
-        return SystemMessage(content="")
-    if len(blocks) == 1 and "cache_control" not in blocks[0]:
-        return SystemMessage(content=blocks[0]["text"])
-    return SystemMessage(content=blocks)
+        ]
+    )
 
 
 def apply_prompt_cache_to_llm(llm: Any, workspace: Path | None) -> Any:
@@ -126,43 +117,33 @@ def prepare_system_message_for_dispatch(
     model_id: str | None,
 ) -> tuple[SystemMessage | None, list[BaseMessage]]:
     """
-    合并 system：启用 cache 时稳定/可变分块；否则保持字符串拼接。
+    合并 system：仅稳定 Agent 规范；manifest/anchor 留在 messages 中。
 
-    @param messages 已置顶 manifest/anchor 的消息列表
+    @param messages 已整理顺序的消息列表
     @param agent_system_content Agent 系统提示
     @param workspace 工作区根
     @param model_id 当前模型
-    @return (合并后的 SystemMessage 或 None, 非 system 业务消息)
+    @return (合并后的 SystemMessage 或 None, 非 agent-system 消息)
     """
-    session_parts: list[str] = []
     non_system: list[BaseMessage] = []
     for msg in messages:
         if isinstance(msg, SystemMessage):
-            from llgraph.context.message_normalize import _message_text
-
-            text = _message_text(getattr(msg, "content", "")).strip()
-            if text:
-                session_parts.append(text)
-        else:
-            non_system.append(msg)
+            continue
+        non_system.append(msg)
 
     stable = str(agent_system_content or "").strip()
-    dynamic = "\n\n".join(session_parts).strip()
-
-    if not stable and not dynamic:
+    if not stable:
         return None, non_system
 
     settings = resolve_prompt_cache_settings(workspace)
     use_cache = prompt_cache_enabled_for_model(workspace, model_id) and settings.enabled
     if not use_cache:
-        merged = "\n\n".join(part for part in (stable, dynamic) if part)
-        return SystemMessage(content=merged), non_system
+        return SystemMessage(content=stable), non_system
 
     cache_control = build_cache_control(settings)
     return (
         build_cached_system_message(
             stable_text=stable,
-            dynamic_text=dynamic,
             cache_control=cache_control,
         ),
         non_system,

@@ -50,6 +50,7 @@ service-account*.json
 web-ui/node_modules/
 web-ui/dist/
 web-ui/tsconfig.tsbuildinfo
+**/*.tsbuildinfo
 .run/
 
 # --- 评审 / 本地产出 ---

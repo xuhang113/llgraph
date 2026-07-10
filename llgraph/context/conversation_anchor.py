@@ -1,4 +1,4 @@
-"""结构化会话锚点（Tier 2）：增量合并 + 编辑账本 + 压缩检索（Tier 3）。"""
+"""结构化会话锚点（Tier 2）：增量合并 + 编辑账本。"""
 
 from __future__ import annotations
 
@@ -27,8 +27,6 @@ SECTION_SESSION_GOAL = "session_goal"
 SECTION_FILES_MODIFIED = "files_modified"
 SECTION_DECISIONS = "decisions"
 SECTION_ERRORS_RESOLVED = "errors_resolved"
-SECTION_PENDING_TASKS = "pending_tasks"
-SECTION_RELATED_CODE = "related_code"
 SECTION_DETAIL_POINTERS = "detail_pointers"
 
 ANCHOR_SECTION_KEYS = (
@@ -36,8 +34,6 @@ ANCHOR_SECTION_KEYS = (
     SECTION_FILES_MODIFIED,
     SECTION_DECISIONS,
     SECTION_ERRORS_RESOLVED,
-    SECTION_PENDING_TASKS,
-    SECTION_RELATED_CODE,
     SECTION_DETAIL_POINTERS,
 )
 
@@ -46,25 +42,50 @@ _SECTION_LABELS = {
     SECTION_FILES_MODIFIED: "已修改文件",
     SECTION_DECISIONS: "关键决策与结论",
     SECTION_ERRORS_RESOLVED: "错误与处理",
-    SECTION_PENDING_TASKS: "未完成与下一步",
-    SECTION_RELATED_CODE: "相关代码（检索）",
     SECTION_DETAIL_POINTERS: "细节去哪找",
 }
+
+_SEMANTIC_SECTION_KEYS = (
+    SECTION_SESSION_GOAL,
+    SECTION_DECISIONS,
+    SECTION_ERRORS_RESOLVED,
+)
+
+_SESSION_GOAL_MAX_CHARS = 4_000
+
+
+def _system_message_text(msg: BaseMessage) -> str:
+    content = getattr(msg, "content", "") or ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content)
 
 
 def is_conversation_anchor_message(msg: BaseMessage) -> bool:
     """
-    是否为结构化会话锚点 SystemMessage。
+    是否为结构化会话锚点上下文消息（非 system）。
 
     @param msg LangChain 消息
     @return 是否锚点
     """
-    if not isinstance(msg, SystemMessage):
-        return False
-    content = getattr(msg, "content", "") or ""
-    if not isinstance(content, str):
-        content = str(content)
-    return CONVERSATION_ANCHOR_TAG in content
+    return _system_message_text(msg).lstrip().startswith(CONVERSATION_ANCHOR_TAG)
+
+
+def is_pinned_session_context_message(msg: BaseMessage) -> bool:
+    """manifest / anchor / 旧版 summary 等会话上下文 Human 消息（非真实用户发言）。"""
+    return (
+        is_session_manifest_message(msg)
+        or is_conversation_anchor_message(msg)
+        or is_conversation_summary_message(msg)
+    )
 
 
 def is_conversation_summary_message(msg: BaseMessage) -> bool:
@@ -74,21 +95,12 @@ def is_conversation_summary_message(msg: BaseMessage) -> bool:
     @param msg LangChain 消息
     @return 是否旧摘要
     """
-    if not isinstance(msg, SystemMessage):
-        return False
-    content = getattr(msg, "content", "") or ""
-    if not isinstance(content, str):
-        content = str(content)
-    return CONVERSATION_SUMMARY_TAG in content
+    return _system_message_text(msg).lstrip().startswith(CONVERSATION_SUMMARY_TAG)
 
 
 def is_pinned_session_message(msg: BaseMessage) -> bool:
-    """压缩时保留的置顶消息（manifest 或 anchor）。"""
-    return (
-        is_session_manifest_message(msg)
-        or is_conversation_anchor_message(msg)
-        or is_conversation_summary_message(msg)
-    )
+    """压缩时保留的会话上下文消息（manifest 或 anchor）。"""
+    return is_pinned_session_context_message(msg)
 
 
 def empty_anchor_sections() -> dict[str, str]:
@@ -195,23 +207,32 @@ def format_anchor_system_message(sections: dict[str, str], *, anchor_path: str) 
     return "\n".join(lines).strip()
 
 
-def build_conversation_anchor_system_message(
+def build_conversation_anchor_message(
     workspace: Path,
     thread_id: str,
     sections: dict[str, str],
-) -> SystemMessage:
+) -> HumanMessage:
     """
-    构建锚点 SystemMessage。
+    构建锚点上下文消息（HumanMessage，注入历史尾段而非 system）。
 
     @param workspace 工作区根
     @param thread_id 会话 ID
     @param sections 章节
-    @return SystemMessage
+    @return HumanMessage
     """
     path = conversation_anchor_json_path(workspace, thread_id)
     rel = _rel_workspace_path(workspace, path)
     content = format_anchor_system_message(sections, anchor_path=rel)
-    return SystemMessage(content=content)
+    return HumanMessage(content=content)
+
+
+def build_conversation_anchor_system_message(
+    workspace: Path,
+    thread_id: str,
+    sections: dict[str, str],
+) -> HumanMessage:
+    """兼容旧名；返回 HumanMessage。"""
+    return build_conversation_anchor_message(workspace, thread_id, sections)
 
 
 def _merge_file_lines(existing: str, new_part: str) -> str:
@@ -318,95 +339,15 @@ def build_artifact_trail_for_compress(
     messages: list[BaseMessage],
 ) -> str:
     """
-    合并 edits 账本与对话中的路径提示。
+    从 edits 账本提取已修改文件（供 LLM 摘要参考；不扫对话路径避免噪音）。
 
     @param workspace 工作区根
     @param thread_id 会话 ID
-    @param messages 待压缩消息
+    @param messages 待压缩消息（保留参数以兼容调用方）
     @return 供 LLM 参考的硬性事实块
     """
-    parts: list[str] = []
-    edits = build_artifact_trail(workspace, thread_id)
-    if edits:
-        parts.append(edits)
-    path_hints = _extract_path_hints_from_messages(messages)
-    if path_hints:
-        parts.extend(path_hints)
-    return "\n".join(parts)
-
-
-def extract_compress_search_query(
-    messages: list[BaseMessage],
-    *,
-    max_terms: int = 6,
-) -> str | None:
-    """
-    从待压缩段提取 hybrid 检索 query（Tier 3）。
-
-    @param messages 消息列表
-    @param max_terms 最多关键词数
-    @return 查询串；无则 None
-    """
-    terms: list[str] = []
-    seen: set[str] = set()
-    for msg in messages:
-        if not isinstance(msg, HumanMessage):
-            continue
-        content = getattr(msg, "content", "")
-        if not isinstance(content, str):
-            continue
-        for token in re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z][\w.-]{2,}", content):
-            low = token.lower()
-            if low in seen or len(low) < 2:
-                continue
-            if low in {"你好", "谢谢", "帮忙", "一下", "这个", "那个", "怎么", "什么"}:
-                continue
-            seen.add(low)
-            terms.append(token)
-            if len(terms) >= max_terms:
-                break
-        if len(terms) >= max_terms:
-            break
-    if not terms:
-        return None
-    return " ".join(terms)
-
-
-def retrieve_related_code_for_compress(
-    workspace: Path,
-    query: str,
-    *,
-    top_k: int = 5,
-    max_chars: int = 4000,
-) -> str:
-    """
-    压缩前用 code index 补全相关代码片段（Tier 3）。
-
-    @param workspace 工作区根
-    @param query 检索词
-    @param top_k 条数
-    @param max_chars 返回最大字符
-    @return 格式化文本；无索引或失败返回空
-    """
-    try:
-        from llgraph.code_index.parallel_search import search_parallel
-        from llgraph.code_index.store import get_index_status
-
-        if not get_index_status(workspace).exists:
-            return ""
-        text = search_parallel(
-            workspace,
-            query,
-            top_k=top_k,
-            source="compress",
-            tool="search_code_parallel",
-        )
-        text = text.strip()
-        if len(text) > max_chars:
-            return text[: max_chars - 20] + "\n…(检索结果已截断)"
-        return text
-    except (RuntimeError, OSError, ValueError):
-        return ""
+    _ = messages
+    return build_artifact_trail(workspace, thread_id)
 
 
 def _messages_to_transcript(messages: list[BaseMessage]) -> str:
@@ -464,11 +405,13 @@ def _summarize_prompt_header() -> str:
     return (
         "你是 coding agent 的会话压缩器。根据对话片段做**智能摘要**（不是机械截断或删句）。"
         "只输出一个 JSON 对象，键必须且仅能包含："
-        "session_goal, files_modified, decisions, errors_resolved, pending_tasks, related_code, detail_pointers。"
+        "session_goal, files_modified, decisions, errors_resolved, detail_pointers。"
         "每个值为中文字符串；无信息则空字符串。"
-        "必须保留：用户目标、已改文件路径、关键决策与结论、未完成任务、错误根因；禁止编造。"
-        "files_modified 须为列表行，每行 `- 相对路径: 说明`。"
-        "detail_pointers 可写需回查 archive/spill 的说明。"
+        "必须保留：用户目标、已改文件路径、关键决策与结论、错误根因；禁止编造。"
+        "若本段含用户消息，session_goal 不得为空，须用 1～3 句概括用户核心诉求。"
+        "files_modified 须为列表行，每行 `- 相对路径: 说明`（仅真实改动，勿列对话提及路径）。"
+        "重要结论与后续方案写入 decisions；detail_pointers 可写需回查 archive/spill 的说明。"
+        "禁止输出 pending_tasks、related_code 或 markdown 代码块，仅输出 JSON。"
     )
 
 
@@ -515,7 +458,6 @@ def summarize_span_to_anchor_delta(
     *,
     existing_sections: dict[str, str],
     artifact_trail: str,
-    retrieval_block: str,
     model_name: str | None,
     summary_chunk_chars: int = 120_000,
 ) -> dict[str, str]:
@@ -526,7 +468,6 @@ def summarize_span_to_anchor_delta(
     @param span_messages 本轮新挤出段
     @param existing_sections 已有锚点（供 LLM 参考）
     @param artifact_trail 硬性文件清单
-    @param retrieval_block Tier3 检索结果
     @param model_name 压缩用模型
     @param summary_chunk_chars 单段 LLM 输入字符上限，超出则分块摘要后合并
     @return 章节增量 dict
@@ -547,8 +488,6 @@ def summarize_span_to_anchor_delta(
             prompt_parts.append(
                 f"\n硬性事实（必须写入 files_modified 或 decisions）：\n{artifact_trail}"
             )
-        if retrieval_block.strip() and idx == len(chunks) - 1:
-            prompt_parts.append(f"\n代码检索结果：\n{retrieval_block}")
         prompt_parts.append(f"\n本段对话：\n{transcript}")
         partial_deltas.append(
             _invoke_anchor_summary_llm(
@@ -559,21 +498,41 @@ def summarize_span_to_anchor_delta(
         )
 
     if len(partial_deltas) == 1:
-        return partial_deltas[0]
+        delta = partial_deltas[0]
+    else:
+        consolidate_prompt = [
+            _summarize_prompt_header(),
+            "",
+            "以下为多段对话分别摘要的 JSON，请合并为一份无重复、信息完整的 JSON：",
+            json.dumps(partial_deltas, ensure_ascii=False, indent=2),
+            "",
+            f"已有锚点：\n{existing_preview}",
+        ]
+        delta = _invoke_anchor_summary_llm(
+            workspace,
+            "\n".join(consolidate_prompt),
+            model_name=model_name,
+        )
 
-    consolidate_prompt = [
-        _summarize_prompt_header(),
-        "",
-        "以下为多段对话分别摘要的 JSON，请合并为一份无重复、信息完整的 JSON：",
-        json.dumps(partial_deltas, ensure_ascii=False, indent=2),
-        "",
-        f"已有锚点：\n{existing_preview}",
-    ]
-    return _invoke_anchor_summary_llm(
-        workspace,
-        "\n".join(consolidate_prompt),
-        model_name=model_name,
-    )
+    if span_messages and not _delta_has_semantic_content(delta):
+        retry_prompt = [
+            _summarize_prompt_header(),
+            "",
+            "上次摘要无效（session_goal/decisions/errors_resolved 均为空）。",
+            "请仅根据下列对话重新输出完整 JSON；session_goal 必须概括用户诉求。",
+            f"已有锚点：\n{existing_preview}",
+        ]
+        if artifact_trail.strip():
+            retry_prompt.append(f"\n硬性事实：\n{artifact_trail}")
+        retry_prompt.append(f"\n本段对话：\n{_messages_to_transcript(span_messages)}")
+        retry_delta = _invoke_anchor_summary_llm(
+            workspace,
+            "\n".join(retry_prompt),
+            model_name=model_name,
+        )
+        if _delta_has_semantic_content(retry_delta):
+            delta = merge_anchor_sections(delta, retry_delta)
+    return delta
 
 
 def _parse_anchor_delta_json(text: str) -> dict[str, str]:
@@ -593,6 +552,184 @@ def _parse_anchor_delta_json(text: str) -> dict[str, str]:
         if val is not None:
             result[key] = str(val).strip()
     return result
+
+
+def _delta_has_semantic_content(delta: dict[str, str]) -> bool:
+    return any((delta.get(key) or "").strip() for key in _SEMANTIC_SECTION_KEYS)
+
+
+def anchor_sections_have_semantic_content(sections: dict[str, str]) -> bool:
+    """锚点是否含任务级语义（非仅文件列表/指针）。"""
+    return any((sections.get(key) or "").strip() for key in _SEMANTIC_SECTION_KEYS)
+
+
+def _human_visible_text(content: Any) -> str:
+    from llgraph.context.context_continuity import strip_workspace_context_wrapper
+    from llgraph.core.user_message_content import extract_text_from_human_content
+
+    text = extract_text_from_human_content(content)
+    return strip_workspace_context_wrapper(text).strip()
+
+
+def _collect_user_texts(messages: list[BaseMessage]) -> list[str]:
+    texts: list[str] = []
+    seen: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, HumanMessage):
+            continue
+        text = _human_visible_text(getattr(msg, "content", ""))
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        texts.append(text)
+    return texts
+
+
+def _peek_first_user_text_from_archive(workspace: Path, thread_id: str) -> str:
+    from llgraph.session.session_manifest import session_archive_jsonl_path
+
+    path = session_archive_jsonl_path(workspace, thread_id)
+    if not path.is_file():
+        return ""
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                data = json.loads(line)
+                role = data.get("role") or data.get("type")
+                if role not in ("user", "human"):
+                    continue
+                content = data.get("content", "")
+                if isinstance(content, list):
+                    parts = [
+                        str(block.get("text", ""))
+                        for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    ]
+                    content = "\n".join(parts)
+                text = _human_visible_text(str(content or ""))
+                if text:
+                    return text
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    return ""
+
+
+def _sanitize_files_modified_section(text: str) -> str:
+    lines: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "对话提及" in line or line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def ensure_anchor_sections_minimum(
+    sections: dict[str, str],
+    *,
+    workspace: Path,
+    thread_id: str,
+    span_messages: list[BaseMessage] | None = None,
+    all_messages: list[BaseMessage] | None = None,
+) -> dict[str, str]:
+    """
+    保证锚点必有可读的语义内容（LLM 失败时从对话/edits 兜底）。
+
+    @param sections 当前章节
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @param span_messages 本轮待压缩段
+    @param all_messages 全量会话（注入上下文时用）
+    @return 补齐后的章节
+    """
+    result = dict(sections)
+    sources: list[BaseMessage] = []
+    if span_messages:
+        sources.extend(span_messages)
+    if all_messages:
+        sources.extend(all_messages)
+
+    user_texts = _collect_user_texts(sources)
+    if not result.get(SECTION_SESSION_GOAL, "").strip():
+        goal = user_texts[0] if user_texts else ""
+        if not goal:
+            goal = _peek_first_user_text_from_archive(workspace, thread_id)
+        if goal:
+            result[SECTION_SESSION_GOAL] = goal[:_SESSION_GOAL_MAX_CHARS]
+
+    edits = build_artifact_trail(workspace, thread_id)
+    cleaned_files = _sanitize_files_modified_section(result.get(SECTION_FILES_MODIFIED, ""))
+    if edits:
+        result[SECTION_FILES_MODIFIED] = _merge_file_lines(cleaned_files, edits)
+    else:
+        result[SECTION_FILES_MODIFIED] = cleaned_files
+
+    if not anchor_sections_have_semantic_content(result) and not result.get(
+        SECTION_FILES_MODIFIED, ""
+    ).strip():
+        if user_texts:
+            result[SECTION_SESSION_GOAL] = user_texts[0][:_SESSION_GOAL_MAX_CHARS]
+
+    return result
+
+
+def _anchor_compression_count(workspace: Path, thread_id: str) -> int:
+    path = conversation_anchor_json_path(workspace, thread_id)
+    if not path.is_file():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return int(data.get("compression_count", 0))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return 0
+
+
+def ensure_messages_include_conversation_anchor(
+    workspace: Path,
+    thread_id: str,
+    messages: list[BaseMessage],
+) -> list[BaseMessage]:
+    """
+    若存在压缩锚点 JSON，则将锚点上下文消息注入消息链（末条 user 之前）。
+
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @param messages 当前消息
+    @return 注入后的消息
+    """
+    if not thread_id.strip() or not messages:
+        return messages
+    if _anchor_compression_count(workspace, thread_id) < 1:
+        return messages
+
+    from llgraph.context.message_normalize import reorder_pinned_session_messages
+
+    stripped = [
+        m
+        for m in messages
+        if not is_conversation_anchor_message(m) and not is_conversation_summary_message(m)
+    ]
+    loaded = load_anchor_sections(workspace, thread_id)
+    enriched = ensure_anchor_sections_minimum(
+        loaded,
+        workspace=workspace,
+        thread_id=thread_id,
+        all_messages=messages,
+    )
+    if enriched != loaded:
+        save_anchor_sections(
+            workspace,
+            thread_id,
+            enriched,
+            compression_count_delta=0,
+        )
+    anchor_msg = build_conversation_anchor_message(workspace, thread_id, enriched)
+    return reorder_pinned_session_messages([*stripped, anchor_msg])
 
 
 def update_detail_pointers(
@@ -631,12 +768,10 @@ def run_anchor_update(
     archive_path: str | None,
     spill_dir: str,
     compress_model: str | None,
-    retrieval_enabled: bool,
-    retrieval_top_k: int,
     summary_chunk_chars: int = 120_000,
 ) -> tuple[dict[str, str], str | None]:
     """
-    Tier 2+3：增量更新锚点并落盘。
+    Tier 2：增量更新锚点并落盘。
 
     @param workspace 工作区根
     @param thread_id 会话 ID
@@ -644,41 +779,29 @@ def run_anchor_update(
     @param archive_path 归档路径
     @param spill_dir 落盘目录
     @param compress_model 模型
-    @param retrieval_enabled 是否 Tier3 检索
-    @param retrieval_top_k 检索条数
     @return (合并后 sections, anchor 文件路径)
     """
     existing = load_anchor_sections(workspace, thread_id)
     artifact = build_artifact_trail_for_compress(workspace, thread_id, span_messages)
-    retrieval_block = ""
-    if retrieval_enabled:
-        query = extract_compress_search_query(span_messages)
-        if query:
-            retrieval_block = retrieve_related_code_for_compress(
-                workspace,
-                query,
-                top_k=retrieval_top_k,
-            )
 
     delta = summarize_span_to_anchor_delta(
         workspace,
         span_messages,
         existing_sections=existing,
         artifact_trail=artifact,
-        retrieval_block=retrieval_block,
         model_name=compress_model,
         summary_chunk_chars=summary_chunk_chars,
     )
     if artifact.strip() and not delta.get(SECTION_FILES_MODIFIED):
         delta[SECTION_FILES_MODIFIED] = artifact
 
-    if retrieval_block.strip():
-        old_rc = delta.get(SECTION_RELATED_CODE, "").strip()
-        delta[SECTION_RELATED_CODE] = (
-            f"{old_rc}\n{retrieval_block}".strip() if old_rc else retrieval_block
-        )
-
     merged = merge_anchor_sections(existing, delta)
+    merged = ensure_anchor_sections_minimum(
+        merged,
+        workspace=workspace,
+        thread_id=thread_id,
+        span_messages=span_messages,
+    )
     anchor_file = conversation_anchor_json_path(workspace, thread_id)
     rel_anchor = _rel_workspace_path(workspace, anchor_file)
     merged = update_detail_pointers(

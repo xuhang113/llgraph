@@ -5,22 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 _SESSION_MANIFEST_TAG = "<session-manifest>"
 _CONVERSATION_ANCHOR_TAG = "<conversation-anchor>"
-
-
-def _is_session_manifest_message(msg: BaseMessage) -> bool:
-    if not isinstance(msg, SystemMessage):
-        return False
-    return _SESSION_MANIFEST_TAG in _message_text(getattr(msg, "content", ""))
-
-
-def _is_conversation_anchor_message(msg: BaseMessage) -> bool:
-    if not isinstance(msg, SystemMessage):
-        return False
-    return _CONVERSATION_ANCHOR_TAG in _message_text(getattr(msg, "content", ""))
 
 
 def _message_text(content: Any) -> str:
@@ -37,9 +25,49 @@ def _message_text(content: Any) -> str:
     return str(content or "")
 
 
+def _is_session_manifest_message(msg: BaseMessage) -> bool:
+    from llgraph.session.session_manifest import is_session_manifest_message
+
+    return is_session_manifest_message(msg)
+
+
+def _is_conversation_anchor_message(msg: BaseMessage) -> bool:
+    from llgraph.context.conversation_anchor import is_conversation_anchor_message
+
+    return is_conversation_anchor_message(msg)
+
+
+def _is_conversation_summary_message(msg: BaseMessage) -> bool:
+    from llgraph.context.conversation_anchor import is_conversation_summary_message
+
+    return is_conversation_summary_message(msg)
+
+
+def _is_business_user_message(msg: BaseMessage) -> bool:
+    from llgraph.context.conversation_anchor import is_pinned_session_context_message
+
+    return isinstance(msg, HumanMessage) and not is_pinned_session_context_message(msg)
+
+
+def migrate_legacy_pinned_message(msg: BaseMessage) -> BaseMessage:
+    """
+    将旧版 SystemMessage 形式的 manifest/anchor 转为 HumanMessage。
+
+    @param msg 原始消息
+    @return 迁移后消息
+    """
+    if isinstance(msg, HumanMessage):
+        return msg
+    if isinstance(msg, SystemMessage) and (
+        _is_session_manifest_message(msg) or _is_conversation_anchor_message(msg)
+    ):
+        return HumanMessage(content=_message_text(getattr(msg, "content", "")))
+    return msg
+
+
 def format_agent_chat_display_text(text: str) -> str:
     """
-    Web 聊天区助手正文：剥离 tool markup 与【规划】行。
+    Web 聊天区助手正文：剥离 tool markup 与【规划】行。保留空行，避免 GFM 表格吞掉后续段落。
 
     @param text 原始助手正文
     @return 用户可见文本
@@ -52,9 +80,12 @@ def format_agent_chat_display_text(text: str) -> str:
     lines = [
         ln
         for ln in cleaned.splitlines()
-        if ln.strip() and not ln.strip().startswith("【规划】")
+        if not ln.strip().startswith("【规划】")
     ]
-    return "\n".join(lines).strip()
+    collapsed = "\n".join(lines)
+    while "\n\n\n" in collapsed:
+        collapsed = collapsed.replace("\n\n\n", "\n\n")
+    return collapsed.strip()
 
 
 def _state_messages(state: Any) -> list[BaseMessage]:
@@ -75,7 +106,8 @@ def prepare_messages_for_llm_dispatch(
     """
     发往模型前的完整规范化（对齐 Cursor：落盘 canonical，调用前按模型 adapter 修链）。
 
-    顺序：按模型 profile 清理/展开 tool 链 → manifest/anchor 置顶 → 合并 system。
+    出站顺序：按模型 profile 清理 tool 链 → 出站窗口裁剪 → manifest/anchor 注入历史尾段
+    → 仅稳定 Agent 规范合并为 system → 本轮 user 在最后。
 
     @param messages 图状态中的消息
     @param agent_system_content build_system_prompt 正文
@@ -95,7 +127,20 @@ def prepare_messages_for_llm_dispatch(
     from llgraph.core.user_message_content import prepare_messages_for_multimodal_dispatch
 
     cleaned = prepare_messages_for_multimodal_dispatch(cleaned)
-    ordered = reorder_pinned_system_messages(cleaned)
+    if workspace is not None:
+        from llgraph.context.runtime_context import get_active_thread_id
+
+        thread_id = get_active_thread_id()
+        if thread_id:
+            from llgraph.context.conversation_anchor import (
+                ensure_messages_include_conversation_anchor,
+            )
+
+            cleaned = ensure_messages_include_conversation_anchor(
+                workspace,
+                thread_id,
+                cleaned,
+            )
     if workspace is not None:
         from llgraph.context.context_compressor import estimate_tokens
         from llgraph.context.context_dispatch_window import apply_dispatch_window_trim
@@ -107,22 +152,26 @@ def prepare_messages_for_llm_dispatch(
             prune_tool_messages_for_dispatch,
         )
 
-        ordered = prune_tool_messages_for_dispatch(ordered, workspace, ctx_settings)
-        ordered = dedupe_read_tool_messages_for_dispatch(ordered, ctx_settings)
-        ordered = apply_dispatch_window_trim(
-            ordered,
+        cleaned = prune_tool_messages_for_dispatch(cleaned, workspace, ctx_settings)
+        cleaned = dedupe_read_tool_messages_for_dispatch(cleaned, ctx_settings)
+        cleaned = apply_dispatch_window_trim(
+            cleaned,
             settings=ctx_settings,
             estimate_tokens=estimate_tokens,
         )
+    ordered = reorder_pinned_session_messages(cleaned)
     normalized = normalize_messages_for_llm(
         ordered,
         agent_system_content=agent_system_content,
         workspace=workspace,
         model_id=model_id,
     )
+    from llgraph.context.user_correction_nudge import append_user_correction_nudge_for_dispatch
+
+    with_correction = append_user_correction_nudge_for_dispatch(normalized)
     from llgraph.context.react_step_reminder import append_react_step_reminder_for_dispatch
 
-    with_reminder = append_react_step_reminder_for_dispatch(normalized)
+    with_reminder = append_react_step_reminder_for_dispatch(with_correction)
 
     if workspace is not None:
         from llgraph.context.outbound_redact import (
@@ -143,10 +192,9 @@ def normalize_messages_for_llm(
     model_id: str | None = None,
 ) -> list[BaseMessage]:
     """
-    将 agent system prompt 与会话内置顶 SystemMessage 合并为一条，其余保持顺序。
+    将稳定 Agent 系统规范合并为单条 SystemMessage；manifest/anchor 保留在 messages 尾段。
 
-    启用 prompt_cache 时：稳定 Agent 规范带 cache_control，manifest/anchor 为可变块不打断点。
-    仍为单条 SystemMessage（多 content block），满足 Anthropic 连续 system 要求。
+    启用 prompt_cache 时：仅 Agent 规范带 cache_control（最长稳定前缀）。
 
     @param messages 当前状态消息
     @param agent_system_content build_system_prompt 正文
@@ -167,28 +215,60 @@ def normalize_messages_for_llm(
     return [merged_system, *non_system]
 
 
-def reorder_pinned_system_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+def reorder_pinned_session_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
     """
-    将会话 manifest / anchor 置顶到业务消息之前（落盘状态整理）。
+    将会话 manifest / anchor 放到业务历史尾段（末条真实 user 之前），并迁移为 HumanMessage。
+
+    落盘/出站不含 SystemMessage；动态会话态不进 system，利于 Prompt Cache 前缀稳定。
 
     @param messages 原始消息
     @return 重排后的消息
     """
-    manifest = [m for m in messages if _is_session_manifest_message(m)]
-    anchor = [m for m in messages if _is_conversation_anchor_message(m)]
-    rest = [
-        m
-        for m in messages
-        if not _is_session_manifest_message(m)
-        and not _is_conversation_anchor_message(m)
-    ]
-    ordered: list[BaseMessage] = []
+    manifest: list[BaseMessage] = []
+    anchor: list[BaseMessage] = []
+    rest: list[BaseMessage] = []
+
+    for msg in messages:
+        if isinstance(msg, SystemMessage):
+            continue
+        if _is_session_manifest_message(msg):
+            manifest.append(migrate_legacy_pinned_message(msg))
+            continue
+        if _is_conversation_anchor_message(msg):
+            anchor.append(migrate_legacy_pinned_message(msg))
+            continue
+        if _is_conversation_summary_message(msg):
+            continue
+        rest.append(msg)
+
+    pinned: list[BaseMessage] = []
     if manifest:
-        ordered.append(manifest[-1])
+        pinned.append(manifest[-1])
     if anchor:
-        ordered.append(anchor[-1])
-    ordered.extend(rest)
-    return ordered if ordered else messages
+        pinned.append(anchor[-1])
+
+    if not pinned:
+        return messages
+
+    last_user_idx: int | None = None
+    for i in range(len(rest) - 1, -1, -1):
+        if _is_business_user_message(rest[i]):
+            last_user_idx = i
+            break
+
+    if not pinned:
+        body = rest
+    elif last_user_idx is None:
+        body = [*rest, *pinned]
+    else:
+        body = [*rest[:last_user_idx], *pinned, *rest[last_user_idx:]]
+
+    return body
+
+
+def reorder_pinned_system_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """兼容旧名。"""
+    return reorder_pinned_session_messages(messages)
 
 
 def make_prompt_normalizer(

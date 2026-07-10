@@ -119,19 +119,33 @@ class WorkspaceRuntimeManager:
             allow_write=rt.allow_write,
         )
 
-    def set_sandbox_enabled(self, workspace: Path, *, enabled: bool) -> Any:
+    def set_sandbox_enabled(
+        self,
+        workspace: Path,
+        *,
+        enabled: bool,
+        allow_write: bool | None = None,
+    ) -> Any:
         """
         切换工作区 Runtime 的 OS 沙箱开关（覆盖 sandbox.json）。
 
         @param workspace 工作区根
         @param enabled 是否启用
+        @param allow_write 当前写模式；None 时沿用 Runtime 缓存
         @return 更新后的 SandboxPolicy
         """
-        rt = self.get(workspace)
+        if allow_write is None:
+            key = str(workspace.expanduser().resolve())
+            with self._lock:
+                cached = self._runtimes.get(key)
+            allow_write = cached.allow_write if cached is not None else False
+        rt = self.get(workspace, allow_write=allow_write)
         rt.sandbox_cli_enabled = enabled
         self._rebuild_sandbox_policy(rt)
         policy = rt.sandbox_policy
         if enabled and not policy.enabled:
+            rt.sandbox_cli_enabled = False
+            self._rebuild_sandbox_policy(rt)
             warning = policy.startup_warning()
             raise ValueError(warning or "沙箱后端不可用，无法启用")
         return policy

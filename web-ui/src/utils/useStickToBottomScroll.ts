@@ -1,26 +1,38 @@
-import { useCallback, useEffect, useRef, type RefObject } from 'react';
+import { useCallback, useEffect, useRef, useState, type RefCallback } from 'react';
 
-const BOTTOM_THRESHOLD_PX = 48;
+const BOTTOM_THRESHOLD_PX = 64;
 
 function isAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.scrollTop - el.clientHeight <= BOTTOM_THRESHOLD_PX;
 }
 
 /**
- * 日志式滚动：内容更新时贴底；用户上滑后暂停，滑回底部再恢复。
+ * 日志式滚动：内容更新时贴底；用户上滑/拖滚动条后暂停，滑回底部再恢复。
  */
 export function useStickToBottomScroll<T extends HTMLElement>(
   contentDeps: readonly unknown[],
   options?: { enabled?: boolean; resetKey?: string | number; forcePin?: boolean },
-): { ref: RefObject<T | null>; stickToBottom: () => void } {
-  const ref = useRef<T | null>(null);
+): { ref: RefCallback<T>; stickToBottom: () => void; pinned: boolean } {
+  const elRef = useRef<T | null>(null);
+  const [scrollRoot, setScrollRoot] = useState<T | null>(null);
   const pinnedRef = useRef(true);
+  const [pinned, setPinned] = useState(true);
   const enabled = options?.enabled !== false;
   const forcePin = options?.forcePin === true;
   const resetKey = options?.resetKey;
 
+  const syncPinned = useCallback((next: boolean) => {
+    pinnedRef.current = next;
+    setPinned(next);
+  }, []);
+
+  const setRef = useCallback<RefCallback<T>>((node) => {
+    elRef.current = node;
+    setScrollRoot(node);
+  }, []);
+
   const scrollToBottom = useCallback(() => {
-    const el = ref.current;
+    const el = elRef.current;
     if (!el) {
       return;
     }
@@ -28,52 +40,72 @@ export function useStickToBottomScroll<T extends HTMLElement>(
   }, []);
 
   const stickToBottom = useCallback(() => {
-    pinnedRef.current = true;
+    syncPinned(true);
     scrollToBottom();
-  }, [scrollToBottom]);
+  }, [scrollToBottom, syncPinned]);
+
+  const shouldAutoStick = useCallback((): boolean => {
+    if (forcePin) {
+      return true;
+    }
+    const el = elRef.current;
+    if (!el) {
+      return pinnedRef.current;
+    }
+    return pinnedRef.current && isAtBottom(el);
+  }, [forcePin]);
 
   useEffect(() => {
-    pinnedRef.current = true;
+    syncPinned(true);
     requestAnimationFrame(() => scrollToBottom());
-  }, [resetKey, scrollToBottom]);
+  }, [resetKey, scrollToBottom, syncPinned]);
 
   useEffect(() => {
-    const el = ref.current;
+    const el = scrollRoot;
     if (!el || !enabled) {
       return;
     }
     const onScroll = () => {
-      pinnedRef.current = isAtBottom(el);
+      syncPinned(isAtBottom(el));
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) {
+        syncPinned(false);
+        return;
+      }
+      if (event.deltaY > 0 && isAtBottom(el)) {
+        syncPinned(true);
+      }
     };
     el.addEventListener('scroll', onScroll, { passive: true });
-    return () => el.removeEventListener('scroll', onScroll);
-  }, [enabled]);
+    el.addEventListener('wheel', onWheel, { passive: true });
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      el.removeEventListener('wheel', onWheel);
+    };
+  }, [scrollRoot, enabled, syncPinned]);
 
   useEffect(() => {
     if (!enabled) {
       return;
     }
     if (forcePin) {
-      pinnedRef.current = true;
+      syncPinned(true);
     }
-    if (!forcePin && !pinnedRef.current) {
-      return;
-    }
-    const el = ref.current;
-    if (!el) {
+    if (!shouldAutoStick()) {
       return;
     }
     const scroll = () => {
-      if (forcePin || pinnedRef.current) {
+      if (shouldAutoStick()) {
         scrollToBottom();
       }
     };
     requestAnimationFrame(() => requestAnimationFrame(scroll));
-  }, [enabled, forcePin, scrollToBottom, ...contentDeps]);
+  }, [enabled, forcePin, scrollToBottom, shouldAutoStick, syncPinned, ...contentDeps]);
 
   /** DOM 子树增高（trace 步骤展开、流式追加）时贴底 */
   useEffect(() => {
-    const el = ref.current;
+    const el = scrollRoot;
     if (!el || !enabled) {
       return;
     }
@@ -83,7 +115,7 @@ export function useStickToBottomScroll<T extends HTMLElement>(
         cancelAnimationFrame(raf);
       }
       raf = requestAnimationFrame(() => {
-        if (forcePin || pinnedRef.current) {
+        if (shouldAutoStick()) {
           scrollToBottom();
         }
       });
@@ -100,7 +132,7 @@ export function useStickToBottomScroll<T extends HTMLElement>(
         cancelAnimationFrame(raf);
       }
     };
-  }, [enabled, forcePin, scrollToBottom, resetKey]);
+  }, [scrollRoot, enabled, shouldAutoStick, scrollToBottom, resetKey]);
 
-  return { ref, stickToBottom };
+  return { ref: setRef, stickToBottom, pinned };
 }

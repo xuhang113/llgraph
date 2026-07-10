@@ -17,6 +17,10 @@ import PlanMainPanel from '../../components/console/PlanMainPanel';
 import WorkerMainPanel from '../../components/console/WorkerMainPanel';
 import ChatComposer from '../../components/console/ChatComposer';
 import { metaCommandModalTitle } from '../../utils/contextDisplay';
+import {
+  dedupeConsecutiveUserMessages,
+  parseAgentHistoryMessages,
+} from '../../utils/messageText';
 import ChatThread, { type ChatMessage } from '../../components/console/ChatThread';
 import CursorRightPanel, { type RightPanelTab } from '../../components/console/CursorRightPanel';
 import ConsoleOps, { type ConsoleOpsHandle } from '../../components/console/ConsoleOps';
@@ -42,11 +46,13 @@ import {
 } from '../../utils/composerDraft';
 import {
   countPendingConfirms,
-  dequeueConfirmHead,
+  clearConfirmQueue,
+  dequeueConfirm,
   hasPendingKind,
   peekConfirmHead,
 } from '../../utils/pendingConfirmQueue';
 import { applyPendingConfirmHead, ingestPlanConfirmFromDetail } from '../../utils/pendingConfirmUi';
+import { releaseStreamState } from './streamHelpers';
 import {
   clearComposerImagesCache,
   getComposerImagesCache,
@@ -64,6 +70,7 @@ import {
 import { useAppDialog } from '../../components/AppDialog';
 import {
   writeStoredWorkspaceMeta,
+  readStoredWorkspaceSlug,
   workspaceLabelFromPath,
 } from '../../utils/workspaceStorage';
 import {
@@ -77,10 +84,14 @@ import {
   SSE_TRACE_POLL_SKIP_MS,
 } from './constants';
 import {
+  readCachedLlmSettings,
   readStoredPanelWidth,
   clampPanelWidth,
   readStoredSessionThread,
   writeStoredSessionThread,
+  readStoredAllowWrite,
+  writeStoredAllowWrite,
+  writeStoredSandboxEnabled,
 } from './storage';
 import { planExecutionAllowWrite } from './planHelpers';
 import {
@@ -96,7 +107,7 @@ import {
 import { parseWorkerMessages } from './workerUtils';
 import { shouldSuppressSessionTrace } from './sseHelpers';
 import { SSE_TRACE_CONTENT_TYPES } from './constants';
-import { bumpSidebarSession } from './sidebarUtils';
+import { bumpSidebarSession, prependAgentSession } from './sidebarUtils';
 import type { TraceLine } from './types';
 import { useWorkspaceCatalog } from '../../hooks/useWorkspaceCatalog';
 import { createHandleSSEEvent } from '../../hooks/useConsoleSSE';
@@ -109,7 +120,9 @@ export default function ConsolePage() {
   const { alert, confirm, prompt } = useAppDialog();
   const [selected, setSelected] = useState<TreeNode | null>(null);
   const [caps, setCaps] = useState<Capabilities | null>(null);
-  const [llmSettings, setLlmSettings] = useState<LlmSettings | null>(null);
+  const [llmSettings, setLlmSettings] = useState<LlmSettings | null>(() =>
+    readCachedLlmSettings(readStoredWorkspaceSlug()),
+  );
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const messagesRef = useRef<ChatMessage[]>([]);
   const [traceLines, setTraceLines] = useState<TraceLine[]>([]);
@@ -122,7 +135,7 @@ export default function ConsolePage() {
   const [input, setInput] = useState('');
   const [composerImages, setComposerImages] = useState<ComposerImage[]>([]);
   const [busy, setBusy] = useState(false);
-  const [allowWrite, setAllowWrite] = useState(false);
+  const [allowWrite, setAllowWrite] = useState(() => readStoredAllowWrite());
 
   const {
     slug,
@@ -158,6 +171,7 @@ export default function ConsolePage() {
   const [streamText, setStreamText] = useState('');
   const [thinkingText, setThinkingText] = useState('');
   const [traceActivitySec, setTraceActivitySec] = useState(0);
+  const [currentTurnDurationSec, setCurrentTurnDurationSec] = useState<number | null>(null);
   const traceTurnStartRef = useRef(0);
   const traceLiveTsRef = useRef<Map<string, string>>(new Map());
   const lastSessionEventAtRef = useRef<Map<string, number>>(new Map());
@@ -219,8 +233,6 @@ export default function ConsolePage() {
   sidebarWidthRef.current = sidebarWidth;
   rightPanelWidthRef.current = rightPanelWidth;
   const pollRef = useRef<number | null>(null);
-  /** 本轮 awaiting_confirm 已自动展示过确认框，避免 loadHistory + effect 重复弹 */
-  const confirmAutoShownRef = useRef<string | null>(null);
   const maybePromptPlanConfirmRef = useRef<(detail: PlanDetail, threadId: string) => void>(() => {});
   const sessionRestoreSlugRef = useRef<string | null>(null);
   const plannerVerRef = useRef<Map<string, number>>(new Map());
@@ -576,16 +588,37 @@ export default function ConsolePage() {
           if (updateBusy && selectedRef.current?.thread_id === threadId) {
             setBusy(true);
           }
-        } else if (!localTurn) {
-          // 本地 turn_start 已标记执行中时不因 meta 短暂为 false 清 busy（长工具阻塞常见）
-          runningThreadsRef.current.delete(threadId);
-          streamAbortRef.current.delete(threadId);
-          streamLastEventAtRef.current.delete(threadId);
-          if (updateBusy && selectedRef.current?.thread_id === threadId) {
-            setBusy(false);
+        } else {
+          const lastEvt = lastSessionEventAtRef.current.get(threadId) ?? 0;
+          const staleLocalTurn =
+            localTurn && lastEvt > 0 && Date.now() - lastEvt > 8_000;
+          if (!localTurn || staleLocalTurn) {
+            runningThreadsRef.current.delete(threadId);
+            streamAbortRef.current.delete(threadId);
+            streamLastEventAtRef.current.delete(threadId);
+            if (updateBusy && selectedRef.current?.thread_id === threadId) {
+              setBusy(false);
+              if (staleLocalTurn) {
+                void api
+                  .messages(slug, threadId)
+                  .then((data) => {
+                    if (selectedRef.current?.thread_id !== threadId) {
+                      return;
+                    }
+                    const parsed = dedupeConsecutiveUserMessages(
+                      parseAgentHistoryMessages(data.messages || []),
+                    );
+                    setMessages(parsed);
+                    setStreamText('');
+                  })
+                  .catch(() => {});
+              }
+            }
           }
         }
-        return running || localTurn;
+        return (
+          running || runningThreadsRef.current.has(threadId)
+        );
       } catch {
         return runningThreadsRef.current.has(threadId);
       }
@@ -1026,6 +1059,17 @@ export default function ConsolePage() {
   }, [panelResizing]);
 
   useEffect(() => {
+    if (!slug || selected?.kind !== 'agent') {
+      return;
+    }
+    const wantWrite = readStoredAllowWrite();
+    if (wantWrite) {
+      setAllowWrite(true);
+      void api.setWriteMode(slug, true, selected.thread_id).catch(() => {});
+    }
+  }, [slug, selected?.thread_id, selected?.kind]);
+
+  useEffect(() => {
     if (!slug || treeReadySlug !== slug || agents.length === 0) {
       return;
     }
@@ -1263,9 +1307,21 @@ export default function ConsolePage() {
     if (!activeSlug) {
       return;
     }
+    setAllowWrite(true);
+    writeStoredAllowWrite(true);
     const { thread_id } = await api.createSession(activeSlug, 'agent');
-    refreshTree();
-    handleSelect({ kind: 'agent', thread_id, title: '新会话', children: [] });
+    const now = new Date().toISOString();
+    const newNode: TreeNode = {
+      kind: 'agent',
+      thread_id,
+      title: '新会话',
+      children: [],
+      updated_at: now,
+    };
+    prependAgentSession(setAgents, newNode);
+    void api.prewarmSession(activeSlug, thread_id, true).catch(() => {});
+    void api.setWriteMode(activeSlug, true, thread_id).catch(() => {});
+    handleSelect(newNode);
   };
 
   const handleNewPlan = async () => {
@@ -1500,10 +1556,10 @@ export default function ConsolePage() {
     setPlanConfirm,
     setTaskStepConfirm,
     taskStepDismissedRef,
-    confirmAutoShownRef,
     planStopInFlightRef,
     runningThreadsRef,
     streamAbortRef,
+    streamLastEventAtRef,
     beginStream,
     bindSSE,
     finalizeLiveTrace,
@@ -1526,7 +1582,6 @@ export default function ConsolePage() {
     panelTraceTurnsRef,
     traceLinesRef,
     traceStepsRef,
-    confirmAutoShownRef,
     surveyDismissedRef,
     taskStepDismissedRef,
     traceTurnStartRef,
@@ -1535,6 +1590,7 @@ export default function ConsolePage() {
     setBusy,
     setThinkingText,
     setTraceActivitySec,
+    setCurrentTurnDurationSec,
     setTraceLines,
     setTraceSteps,
     setPanelTraceLines,
@@ -1581,6 +1637,7 @@ export default function ConsolePage() {
     busy && traceSteps.length > 0 ? traceSteps : panelTraceSteps;
   const displayPanelTurns = buildDisplayTraceTurns(panelTraceTurns, currentTurnSteps, {
     busy,
+    currentDurationSec: currentTurnDurationSec ?? undefined,
     currentLabel:
       busy && currentTurnSteps.length > 0
         ? `第 ${panelTraceTurns.length + 1} 轮 · 进行中`
@@ -1635,6 +1692,7 @@ export default function ConsolePage() {
 
   const handleAllowWriteChange = async (enabled: boolean) => {
     setAllowWrite(enabled);
+    writeStoredAllowWrite(enabled);
     bumpContextRefresh();
     if (!slug) {
       return;
@@ -1675,6 +1733,7 @@ export default function ConsolePage() {
     if (!slug) {
       return;
     }
+    writeStoredSandboxEnabled(enabled);
     const threadId =
       selected?.kind === 'agent' || selected?.kind === 'plan' ? selected.thread_id : '';
     try {
@@ -1825,25 +1884,30 @@ export default function ConsolePage() {
         await api.planStart(slug, node.thread_id, text, allowWrite, bindSSE(node.thread_id), ac.signal);
       }
     } catch (e) {
+      releaseStreamState(
+        node.thread_id,
+        {
+          runningThreads: runningThreadsRef,
+          streamAbort: streamAbortRef,
+          streamLastEventAt: streamLastEventAtRef,
+        },
+        setBusy,
+      );
       if (e instanceof DOMException && e.name === 'AbortError') {
-        runningThreadsRef.current.delete(node.thread_id);
-        streamAbortRef.current.delete(node.thread_id);
-        streamLastEventAtRef.current.delete(node.thread_id);
-        setBusy(false);
         return;
       }
-      streamAbortRef.current.delete(node.thread_id);
-      streamLastEventAtRef.current.delete(node.thread_id);
       void syncRemoteTrace(node.thread_id);
       setMessages((prev) => [
         ...prev,
         { id: `err-${Date.now()}`, role: 'system', text: String(e) },
       ]);
-      setBusy(runningThreadsRef.current.has(node.thread_id));
     } finally {
       if (!runningThreadsRef.current.has(node.thread_id)) {
-        streamAbortRef.current.delete(node.thread_id);
-        streamLastEventAtRef.current.delete(node.thread_id);
+        releaseStreamState(node.thread_id, {
+          runningThreads: runningThreadsRef,
+          streamAbort: streamAbortRef,
+          streamLastEventAt: streamLastEventAtRef,
+        });
         setBusy(false);
       }
     }
@@ -1852,6 +1916,7 @@ export default function ConsolePage() {
   const handleSend = async () => {
     const text = input.trim();
     const images = composerImages;
+    // busy 时仍允许打开/处理待确认；此处仅拦截普通发送
     if ((!text && images.length === 0) || !selected || busy) {
       return;
     }
@@ -2199,7 +2264,7 @@ export default function ConsolePage() {
                         <button
                           type="button"
                           className="plan-confirm-summary-chip"
-                          onClick={openPendingConfirm}
+                          onClick={openPendingPlanConfirm}
                         >
                           待确认计划
                         </button>
@@ -2254,7 +2319,7 @@ export default function ConsolePage() {
                         <button
                           type="button"
                           className="plan-confirm-summary-chip"
-                          onClick={openPendingConfirm}
+                          onClick={openPendingPlanConfirm}
                         >
                           待确认计划
                         </button>
@@ -2265,7 +2330,13 @@ export default function ConsolePage() {
                           <button type="button" className="cursor-btn-primary" onClick={() => void handlePlanContinue()}>
                             继续执行
                           </button>
-                          <button type="button" onClick={openPendingConfirm}>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              taskStepDismissedRef.current = null;
+                              setTaskStepConfirm(pendingTaskStepId);
+                            }}
+                          >
                             打开确认框
                           </button>
                         </div>
@@ -2419,16 +2490,7 @@ export default function ConsolePage() {
             if (slug && confirmThreadId) {
               const head = peekConfirmHead(slug, confirmThreadId);
               if (head?.kind === 'survey') {
-                surveyDismissedRef.current = head.id;
-              }
-            }
-            setSurvey(null);
-          }}
-          onSubmit={async (answers) => {
-            if (slug && confirmThreadId) {
-              const head = peekConfirmHead(slug, confirmThreadId);
-              if (head?.kind === 'survey') {
-                dequeueConfirmHead(slug, confirmThreadId);
+                dequeueConfirm(slug, confirmThreadId, head.id);
                 applyPendingConfirmHead(
                   slug,
                   confirmThreadId,
@@ -2438,14 +2500,32 @@ export default function ConsolePage() {
             }
             surveyDismissedRef.current = null;
             setSurvey(null);
+          }}
+          onSubmit={async (answers) => {
+            const head =
+              slug && confirmThreadId ? peekConfirmHead(slug, confirmThreadId) : null;
+            const surveyItemId = head?.kind === 'survey' ? head.id : null;
+            surveyDismissedRef.current = null;
             try {
               const { message } = await api.formatSurveyAnswers(slug, answers, allowWrite);
+              if (surveyItemId && confirmThreadId) {
+                dequeueConfirm(slug, confirmThreadId, surveyItemId);
+                applyPendingConfirmHead(
+                  slug,
+                  confirmThreadId,
+                  { setSurvey, setPlanConfirm, setTaskStepConfirm },
+                );
+              }
+              setSurvey(null);
               if (selected?.kind === 'agent') {
-                sendAgentMessage(selected, message);
+                void sendAgentMessage(selected, message);
               } else if (selected?.kind === 'plan') {
-                sendPlanMessage(selected, message);
+                void sendPlanMessage(selected, message);
               }
             } catch (err) {
+              if (surveyItemId && confirmThreadId && head?.kind === 'survey') {
+                setSurvey(head.payload as SurveySpec);
+              }
               await alert(err instanceof Error ? err.message : String(err));
             }
           }}
@@ -2459,14 +2539,20 @@ export default function ConsolePage() {
             if (slug && confirmThreadId) {
               const head = peekConfirmHead(slug, confirmThreadId);
               if (head?.kind === 'task_step_confirm') {
-                taskStepDismissedRef.current = head.id;
+                dequeueConfirm(slug, confirmThreadId, head.id);
+                applyPendingConfirmHead(
+                  slug,
+                  confirmThreadId,
+                  { setSurvey, setPlanConfirm, setTaskStepConfirm },
+                );
               }
             }
+            taskStepDismissedRef.current = null;
             setTaskStepConfirm(null);
           }}
           onContinue={() => {
             setTaskStepConfirm(null);
-            handlePlanContinue();
+            void handlePlanContinue();
           }}
         />
       )}
@@ -2475,6 +2561,9 @@ export default function ConsolePage() {
         <PlanConfirmDialog
           payload={planConfirm}
           onCancel={() => {
+            if (slug && confirmThreadId) {
+              clearConfirmQueue(slug, confirmThreadId, 'plan_confirm');
+            }
             setPlanConfirm(null);
           }}
           onConfirm={handlePlanConfirm}

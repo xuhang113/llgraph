@@ -1,15 +1,15 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, type Capabilities, type ContextUsage, type IndexStatus, type PlanDetail } from '../../api/client';
+import { api, type Capabilities, type ContextDetail, type ContextUsage, type IndexStatus, type PlanDetail } from '../../api/client';
 import type { TraceStep } from '../../types/trace';
 import { partitionTraceMiscLines, filterTraceMiscWhenSteps, traceStepsFingerprint } from '../../types/trace';
 import { useStickToBottomScroll } from '../../utils/useStickToBottomScroll';
 import WorkflowGraph from '../WorkflowGraph';
 import TraceStepList from './TraceStepList';
 import TraceTurnList from './TraceTurnList';
+import ContextDetailSections from './ContextDetailSections';
 import type { TraceTurn } from '../../types/trace';
 import { useAppDialog } from '../AppDialog';
 import {
-  CONTEXT_BREAKDOWN_LABELS,
   formatContextTokens,
 } from '../../utils/contextDisplay';
 
@@ -108,6 +108,7 @@ export default function CursorRightPanel({
   const [toolsLoading, setToolsLoading] = useState(false);
   const [toolsError, setToolsError] = useState('');
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(null);
+  const [contextDetail, setContextDetail] = useState<ContextDetail | null>(null);
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [contextBusy, setContextBusy] = useState(false);
   const [indexBusy, setIndexBusy] = useState(false);
@@ -155,11 +156,12 @@ export default function CursorRightPanel({
     }
     setContextBusy(true);
     try {
-      const [ctx, idx] = await Promise.all([
-        api.contextUsage(slug, allowWrite, isAgent ? threadId : ''),
+      const [detail, idx] = await Promise.all([
+        api.contextDetail(slug, allowWrite, isAgent ? threadId : ''),
         api.indexStatus(slug),
       ]);
-      setContextUsage(ctx);
+      setContextDetail(detail);
+      setContextUsage(detail.usage);
       setIndexStatus(idx);
     } catch (err) {
       setContextMsg(err instanceof Error ? err.message : String(err));
@@ -471,16 +473,7 @@ export default function CursorRightPanel({
                       />
                     </div>
                   </div>
-                  <ul className="cursor-context-breakdown">
-                    {Object.entries(contextUsage.breakdown)
-                      .filter(([, v]) => v > 0)
-                      .map(([key, value]) => (
-                        <li key={key}>
-                          <span>{CONTEXT_BREAKDOWN_LABELS[key] || key}</span>
-                          <span>{formatContextTokens(value)}</span>
-                        </li>
-                      ))}
-                  </ul>
+                  <ContextDetailSections detail={contextDetail} loading={contextBusy} compact />
                   <p className="small muted">
                     消息 {contextUsage.message_count} · 工具 {contextUsage.tool_count}
                     {contextUsage.mcp_tool_count > 0 ? `（MCP ${contextUsage.mcp_tool_count}）` : ''}

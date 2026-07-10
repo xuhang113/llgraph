@@ -61,7 +61,18 @@ function newConfirmId(kind: PendingConfirmKind): string {
   return `${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** 入队；plan_confirm / task_step_confirm 同 kind 只保留最新一项。 */
+function surveyDedupeKey(item: PendingConfirmItem): string {
+  if (item.assistantMessageId) {
+    return `aid:${item.assistantMessageId}`;
+  }
+  try {
+    return `hash:${JSON.stringify(item.payload)}`;
+  } catch {
+    return `id:${item.id}`;
+  }
+}
+
+/** 入队；plan/task_step 同 kind 只保留最新；survey 按 assistantMessageId / payload 去重。 */
 export function enqueueConfirm(
   slug: string,
   threadId: string,
@@ -78,6 +89,12 @@ export function enqueueConfirm(
   let next: PendingConfirmItem[];
   if (entry.kind === 'plan_confirm' || entry.kind === 'task_step_confirm') {
     next = [...queue.filter((q) => q.kind !== entry.kind), entry];
+  } else if (entry.kind === 'survey') {
+    const key = surveyDedupeKey(entry);
+    next = [
+      ...queue.filter((q) => q.kind !== 'survey' || surveyDedupeKey(q) !== key),
+      entry,
+    ];
   } else {
     next = [...queue, entry];
   }

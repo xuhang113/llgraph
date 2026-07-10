@@ -10,8 +10,11 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
+from llgraph.core.agent_invoke_timing import read_invoke_timing
+from llgraph.core.tool_invoke_timing import read_tool_message_elapsed
 from llgraph.display.assistant_content import AssistantTurnContent, build_assistant_turn_content
 from llgraph.display.execution_log import _usage_dict_from_mapping
+from llgraph.session.session_run_log import UserCancelledError
 from llgraph.survey.survey_prompt import strip_survey_for_display
 
 DEFAULT_PREVIEW_LINES = 4
@@ -329,6 +332,29 @@ class TraceStepRecord:
     summary: str
     body_lines: list[str] = field(default_factory=list)
     usage: StepUsage | None = None
+    invoke_timing: dict[str, Any] | None = None
+    elapsed_kind: str = "wall"
+
+
+def _resolve_elapsed_kind(kind: str) -> str:
+    """步骤耗时语义：model=仅模型 / tool=工具等待 / preprocess=预处理 / wall=墙钟。"""
+    if kind in ("plan", "thinking", "reply"):
+        return "model"
+    if kind == "tool":
+        return "tool"
+    if kind in ("compress", "tool_prune", "preprocess", "search_params", "tools"):
+        return "preprocess"
+    return "wall"
+
+
+def _format_step_elapsed_label(elapsed_kind: str, elapsed: float) -> str:
+    """折叠行上的耗时标签。"""
+    prefix = {
+        "model": "仅模型",
+        "tool": "工具等待",
+        "preprocess": "预处理",
+    }.get(elapsed_kind, "耗时")
+    return f"{prefix} {_format_duration(elapsed)}"
 
 
 def _format_token_amount(tokens: int) -> str:
@@ -368,6 +394,30 @@ def _extract_usage_from_ai_message(msg: AIMessage | AIMessageChunk) -> StepUsage
         cache_creation_input_tokens=part.get("cache_creation_input_tokens", 0),
         cache_reported=cache_reported,
     )
+
+
+def _format_invoke_timing_inline(timing: dict[str, Any] | None) -> str:
+    """
+    模型决策步骤上的 prepare / HTTP / request_id 摘要。
+
+    @param timing invoke_timing 字典
+    @return ANSI 后缀或空
+    """
+    if not timing:
+        return ""
+    parts: list[str] = []
+    prepare = float(timing.get("prepare_sec") or 0.0)
+    http = float(timing.get("http_sec") or 0.0)
+    if prepare > 0.001:
+        parts.append(f"prepare {_format_duration(prepare)}")
+    if http > 0.001:
+        parts.append(f"http {_format_duration(http)}")
+    req = str(timing.get("request_id") or "").strip()
+    if req:
+        parts.append(f"req {req}")
+    if not parts:
+        return ""
+    return "  " + _c(" · ".join(parts), "90")
 
 
 def _format_step_usage_inline(usage: StepUsage) -> str:
@@ -413,10 +463,15 @@ class TraceSession:
     use_rich: bool = False
     """助手回复是否用 Rich（默认关；/trace rich on 或 LLGRAPH_MD_RICH=1）。"""
     last_turn_steps: list[TraceStepRecord] = field(default_factory=list)
+    """stream 结束后本轮步骤快照。"""
+    pending_invoke_steps: list[TraceStepRecord] = field(default_factory=list)
+    """invoke 前预处理步骤；stream 开始时并入 TurnTracePrinter。"""
     last_turn_raw_reply: str = ""
     trace_sink: Any = None
     """当前轮 TurnTracePrinter；供工具内部子过程（检索参数等）注册步骤。"""
     active_printer: Any = None
+    react_phase: str = ""
+    """ReAct 步间阶段（供 Web 心跳与 run_log 排查）。"""
 
     def shows_process(self) -> bool:
         """是否展示规划/工具过程（steps 折叠或 all 完整）。"""
@@ -469,7 +524,7 @@ def print_invoke_prelude(trace_session: TraceSession | None) -> None:
         return
     emit_trace_milestone(
         trace,
-        "准备中…  加载历史 / 压缩上下文 / 修链（大会话可能需 1～2 分钟）",
+        "准备中…  invoke 前预处理（详见 trace 步骤）",
     )
 
 
@@ -659,9 +714,12 @@ class TurnTracePrinter:
         body: str = "",
         body_lines: list[str] | None = None,
         usage: StepUsage | None = None,
+        invoke_timing: dict[str, Any] | None = None,
+        elapsed_kind: str | None = None,
     ) -> int:
         self._step_index += 1
         lines = body_lines if body_lines is not None else (body.splitlines() if body else [])
+        resolved_kind = elapsed_kind or _resolve_elapsed_kind(kind)
         self._steps.append(
             TraceStepRecord(
                 step_id=self._step_index,
@@ -671,9 +729,15 @@ class TurnTracePrinter:
                 summary=summary,
                 body_lines=lines,
                 usage=usage,
+                invoke_timing=invoke_timing,
+                elapsed_kind=resolved_kind,
             )
         )
         return self._step_index
+
+    def mark_agent_step_start(self) -> None:
+        """工具执行 / 中途压缩结束后，重置「模型决策」计时起点。"""
+        self._step_start = time.perf_counter()
 
     def on_thinking_chunk(self, text: str) -> None:
         """
@@ -776,20 +840,29 @@ class TurnTracePrinter:
         self._pending_usage = None
         return pending
 
-    def _format_step_token_suffix(self, usage: StepUsage | None) -> str:
+    def _format_step_token_suffix(
+        self,
+        usage: StepUsage | None,
+        invoke_timing: dict[str, Any] | None = None,
+    ) -> str:
         """
-        步骤行 token 后缀（默认展示）。
+        步骤行 token / 分段计时后缀（默认展示）。
 
         @param usage 本步用量
+        @param invoke_timing prepare/http/request_id
         @return ANSI 后缀或空
         """
-        if not self._session.show_step_tokens:
-            return ""
-        if usage is not None:
+        parts: list[str] = []
+        if self._session.show_step_tokens and usage is not None:
             inline = _format_step_usage_inline(usage)
             if inline:
-                return "  " + _c(inline, "35")
-        return ""
+                parts.append(_c(inline, "35"))
+        timing_suffix = _format_invoke_timing_inline(invoke_timing)
+        if timing_suffix:
+            parts.append(timing_suffix.strip())
+        if not parts:
+            return ""
+        return "  " + "  ".join(parts)
 
     def _print_step_inline_detail(
         self,
@@ -844,20 +917,26 @@ class TurnTracePrinter:
         summary: str,
         *,
         usage: StepUsage | None = None,
+        invoke_timing: dict[str, Any] | None = None,
         step_marker: str = "▶",
         inline_preview: int | None = None,
     ) -> None:
         resolved = usage
-        if resolved is None and self._steps:
-            last = self._steps[-1]
-            if last.step_id == step_id:
-                resolved = last.usage
+        step_elapsed_kind = _resolve_elapsed_kind("plan")
+        if self._steps:
+            step = next((s for s in self._steps if s.step_id == step_id), None)
+            if step is not None:
+                if resolved is None:
+                    resolved = step.usage
+                if invoke_timing is None:
+                    invoke_timing = step.invoke_timing
+                step_elapsed_kind = step.elapsed_kind
         self._line(
             _c(f"[{_timestamp()}] ", "90")
             + _c(f"{step_marker} #{step_id} {title}", "32")
-            + _c(f"  ({_format_duration(elapsed)})", "90")
+            + _c(f"  ({_format_step_elapsed_label(step_elapsed_kind, elapsed)})", "90")
             + f"  {summary}"
-            + self._format_step_token_suffix(resolved)
+            + self._format_step_token_suffix(resolved, invoke_timing)
             + _step_expand_hint(self._session, step_id),
         )
         self._print_step_inline_detail(step_id, preview_limit=inline_preview)
@@ -920,6 +999,29 @@ class TurnTracePrinter:
                 inline_preview=inline_preview,
             )
         return step_id
+
+    def adopt_prelude_steps(self, steps: list[TraceStepRecord]) -> None:
+        """
+        合并 invoke 前已记录的预处理步骤（Web 侧可能已通过 SSE 推送）。
+
+        @param steps pending_invoke_steps
+        """
+        if not steps:
+            return
+        self._steps.extend(steps)
+        self._step_index = max((s.step_id for s in steps), default=0)
+        if not self._session.shows_process() or self._session.trace_sink is not None:
+            return
+        for step in steps:
+            self._line(
+                _c(f"[{_timestamp()}] ", "90")
+                + _c(f"◇ #{step.step_id} {step.title}", "35")
+                + _c(
+                    f"  ({_format_step_elapsed_label(step.elapsed_kind, step.elapsed)})",
+                    "90",
+                )
+                + f"  {step.summary}",
+            )
 
     def on_turn_start(
         self,
@@ -1001,6 +1103,10 @@ class TurnTracePrinter:
                     )
             plan_summary = _format_planned_tools_summary(tool_calls, verbose=verbose)
             resolved_usage = self._resolve_step_usage(step_usage)
+            invoke_timing = None
+            timing = read_invoke_timing(last)
+            if timing is not None:
+                invoke_timing = timing.to_dict()
             step_id = self._register_step(
                 "plan",
                 "模型决策",
@@ -1008,6 +1114,7 @@ class TurnTracePrinter:
                 plan_summary,
                 body_lines=plan_body,
                 usage=resolved_usage,
+                invoke_timing=invoke_timing,
             )
             if verbose:
                 self._line(
@@ -1030,6 +1137,7 @@ class TurnTracePrinter:
                     elapsed,
                     plan_summary,
                     usage=resolved_usage,
+                    invoke_timing=invoke_timing,
                 )
                 if any(call.get("name") == "web_search" for call in tool_calls):
                     self._line(
@@ -1048,10 +1156,11 @@ class TurnTracePrinter:
                             label += f" 等{len(tool_names)}个"
                         emit_trace_milestone(self._session, f"执行 {label}…")
             self._streamed_reply = False
-        elif text and not self._streamed_reply:
-            self._final_text = text
+        elif text:
+            if not self._streamed_reply:
+                self._final_text = text
             if self._session.shows_process() and not self._session.is_verbose():
-                self._emit_final_reply_block(text)
+                self._emit_final_reply_block(self._final_text or text)
 
         self._step_start = time.perf_counter()
 
@@ -1081,6 +1190,8 @@ class TurnTracePrinter:
         args_by_id = _tool_call_args_by_id(messages)
         for msg in tool_msgs:
             name = msg.name or "tool"
+            tool_elapsed = read_tool_message_elapsed(msg)
+            step_elapsed = tool_elapsed if tool_elapsed is not None else elapsed
             tool_args = args_by_id.get(getattr(msg, "tool_call_id", "") or "", {})
             step_title = _format_tool_step_title(name, tool_args)
             full_text = _message_text(msg.content)
@@ -1098,14 +1209,15 @@ class TurnTracePrinter:
                 step_id = self._register_step(
                     "tool",
                     step_title,
-                    elapsed,
+                    step_elapsed,
                     output_summary,
                     body_lines=lines,
+                    elapsed_kind="tool",
                 )
                 self._print_step_summary(
                     step_id,
                     step_title,
-                    elapsed,
+                    step_elapsed,
                     f"· {output_summary}",
                 )
 
@@ -1221,16 +1333,24 @@ class TurnTracePrinter:
             self._final_text += chunk_text
             return
         self._finalize_thinking_step(reset_after=True)
-        # Markdown 渲染开启时累积全文，结束时一次性渲染（避免流式半截 MD）
-        if getattr(self._session, "render_markdown", True):
+        web_stream = self._session.trace_sink is not None
+        # Markdown 整段渲染仅经典终端；Web SSE 必须逐 chunk 推送 stream_delta
+        if (
+            not web_stream
+            and getattr(self._session, "render_markdown", True)
+        ):
             from llgraph.terminal.markdown_render import markdown_render_enabled
 
             if markdown_render_enabled():
                 self._final_text += chunk_text
                 return
-        # steps 折叠：中间轮次只累积，最终回复在 on_agent_update 整段输出
+        # steps 折叠：trace 侧栏仍等整段再注册步骤；Web 主聊天通过 stream_delta 流式展示
         if self._session.shows_process() and not self._session.is_verbose():
             self._final_text += chunk_text
+            visible = self._survey_filter.feed(chunk_text)
+            if visible and web_stream:
+                self._streamed_reply = True
+                self._stream(visible)
             return
         if not self._printed_final_header:
             elapsed = time.perf_counter() - self._step_start
@@ -1280,7 +1400,7 @@ class TurnTracePrinter:
             self._line(
                 _c(f"[{_timestamp()}] ", "90")
                 + _c("✓ 本轮完成", "32")
-                + _c(f"  {_format_duration(total)}", "90"),
+                + _c(f"  总耗时 {_format_duration(total)}", "90"),
             )
             if self._session.mode == TraceMode.STEPS and self._steps:
                 total_usage = _sum_steps_usage(self._steps)
@@ -1386,7 +1506,7 @@ def print_trace_step_list(session: TraceSession) -> None:
                 if inline:
                     token_part = f"  [{inline}]"
         _trace_line(session, 
-            f"  ▶ #{step.step_id} {step.title}  ({_format_duration(step.elapsed)})"
+            f"  ▶ #{step.step_id} {step.title}  ({_format_step_elapsed_label(step.elapsed_kind, step.elapsed)})"
             f"  {step.summary}{token_part}"
             f"  · 点击左侧展开",
         )
@@ -1411,7 +1531,7 @@ def print_trace_step_detail(session: TraceSession, target: str) -> None:
         return
     _trace_line(session, 
         _c(f"▼ #{step.step_id} {step.title}", "32")
-        + _c(f"  ({_format_duration(step.elapsed)})", "90")
+        + _c(f"  ({_format_step_elapsed_label(step.elapsed_kind, step.elapsed)})", "90")
         + f"  {step.summary}",
     )
     if step.usage is not None:
@@ -1639,53 +1759,56 @@ def _stream_collect_silent(
     thinking_emit_len = 0
     thinking_emit_at = 0.0
 
-    for item in agent.stream(
-        input_state,
-        config=config,
-        stream_mode=["updates", "messages"],
-    ):
-        if cancel_check is not None and cancel_check():
-            break
-        if not isinstance(item, tuple) or len(item) != 2:
-            continue
-        mode, chunk = item
-        if mode == "updates" and isinstance(chunk, dict):
-            for node_name, state_update in chunk.items():
-                messages = (state_update or {}).get("messages", [])
-                if node_name == "tools":
-                    _web_progress_milestone(session, "工具执行中…")
-                elif node_name == "agent":
-                    if any(
-                        isinstance(m, AIMessage) and (getattr(m, "tool_calls", None) or [])
-                        for m in messages
+    try:
+        for item in agent.stream(
+            input_state,
+            config=config,
+            stream_mode=["updates", "messages"],
+        ):
+            if cancel_check is not None and cancel_check():
+                break
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            mode, chunk = item
+            if mode == "updates" and isinstance(chunk, dict):
+                for node_name, state_update in chunk.items():
+                    messages = (state_update or {}).get("messages", [])
+                    if node_name == "tools":
+                        _web_progress_milestone(session, "工具执行中…")
+                    elif node_name == "agent":
+                        if any(
+                            isinstance(m, AIMessage) and (getattr(m, "tool_calls", None) or [])
+                            for m in messages
+                        ):
+                            _web_progress_milestone(session, "模型决策中…")
+                tool_names.extend(_collect_tool_names_from_updates(chunk))
+                continue
+            if mode != "messages" or not isinstance(chunk, tuple):
+                continue
+            msg_chunk, metadata = chunk
+            meta = metadata if isinstance(metadata, dict) else {}
+            if meta.get("langgraph_node", "") != "agent":
+                continue
+            thinking = _extract_thinking_from_message_chunk(msg_chunk)
+            if thinking:
+                sink = session.trace_sink
+                if sink is not None and hasattr(sink, "thinking_update"):
+                    now = time.perf_counter()
+                    if (
+                        thinking_emit_len == 0
+                        or len(thinking) - thinking_emit_len >= 300
+                        or now - thinking_emit_at >= 0.35
                     ):
-                        _web_progress_milestone(session, "模型决策中…")
-            tool_names.extend(_collect_tool_names_from_updates(chunk))
-            continue
-        if mode != "messages" or not isinstance(chunk, tuple):
-            continue
-        msg_chunk, metadata = chunk
-        meta = metadata if isinstance(metadata, dict) else {}
-        if meta.get("langgraph_node", "") != "agent":
-            continue
-        thinking = _extract_thinking_from_message_chunk(msg_chunk)
-        if thinking:
-            sink = session.trace_sink
-            if sink is not None and hasattr(sink, "thinking_update"):
-                now = time.perf_counter()
-                if (
-                    thinking_emit_len == 0
-                    or len(thinking) - thinking_emit_len >= 300
-                    or now - thinking_emit_at >= 0.35
-                ):
-                    thinking_emit_at = now
-                    thinking_emit_len = len(thinking)
-                    sink.thinking_update(thinking.strip())
-        if getattr(msg_chunk, "tool_calls", None) or []:
-            continue
-        text = _extract_text_from_message_chunk(msg_chunk)
-        if text:
-            final_parts.append(text)
+                        thinking_emit_at = now
+                        thinking_emit_len = len(thinking)
+                        sink.thinking_update(thinking.strip())
+            if getattr(msg_chunk, "tool_calls", None) or []:
+                continue
+            text = _extract_text_from_message_chunk(msg_chunk)
+            if text:
+                final_parts.append(text)
+    except UserCancelledError:
+        pass
 
     result = "".join(final_parts).strip()
     if result:
@@ -1698,6 +1821,133 @@ def _stream_collect_silent(
         tool_names=tool_names,
         duration_sec=time.perf_counter() - turn_start,
     )
+
+
+def _set_react_phase(session: TraceSession, phase: str) -> None:
+    session.react_phase = phase.strip()
+
+
+def _react_post_tools_maintenance(
+    agent: Any,
+    *,
+    thread_id: str,
+    workspace: Path,
+    session: TraceSession,
+    cancel_check: Any | None,
+    printer: Any,
+) -> None:
+    """
+    tools 节点结束后：裁剪 tool 输出、步间压缩，并写 run_log 阶段日志。
+
+    @param agent LangGraph agent
+    @param thread_id 会话 ID
+    @param workspace 工作区根
+    @param session trace 会话
+    @param cancel_check 取消检查
+    @param printer TurnTracePrinter
+    """
+    import time
+
+    from llgraph.context.context_compressor import maybe_compress_during_react
+    from llgraph.context.incremental_context import maybe_prune_tools_during_react
+    from llgraph.display.trace_emit import emit_compress_trace_step, emit_tool_prune_trace_step
+    from llgraph.session.session_run_log import UserCancelledError, log_react_phase
+
+    wall_start = time.perf_counter()
+
+    def _milestone(text: str, phase: str) -> None:
+        _set_react_phase(session, phase)
+        if session.shows_process():
+            emit_trace_milestone(session, text)
+        log_react_phase(workspace, thread_id, phase=phase)
+
+    _milestone("整理工具结果…", "post_tools_start")
+    try:
+        t0 = time.perf_counter()
+        _milestone("工具结果裁剪…", "tool_prune_start")
+        react_prune = maybe_prune_tools_during_react(
+            agent,
+            thread_id=thread_id,
+            workspace=workspace,
+        )
+        prune_detail: dict[str, Any] = {"pruned": react_prune is not None}
+        if react_prune is not None:
+            prune_detail.update(
+                {
+                    "pruned_count": react_prune.pruned_count,
+                    "tokens_before": react_prune.before_tokens,
+                    "tokens_after": react_prune.after_tokens,
+                }
+            )
+            emit_tool_prune_trace_step(
+                react_prune,
+                thread_id=thread_id,
+                workspace=workspace,
+            )
+        log_react_phase(
+            workspace,
+            thread_id,
+            phase="tool_prune_done",
+            detail=prune_detail,
+            duration_sec=time.perf_counter() - t0,
+        )
+
+        if cancel_check is not None and cancel_check():
+            raise UserCancelledError("用户停止当前生成")
+
+        t1 = time.perf_counter()
+        _milestone("检查上下文压缩…", "compress_check_start")
+        _milestone("压缩摘要 LLM 调用中…（大会话可能 1～3 分钟）", "compress_llm_start")
+        react_compress = maybe_compress_during_react(
+            agent,
+            thread_id=thread_id,
+            workspace=workspace,
+        )
+        compress_detail: dict[str, Any] = {"compressed": react_compress is not None}
+        if react_compress is not None:
+            compress_detail.update(
+                {
+                    "tokens_before": react_compress.before_tokens,
+                    "tokens_after": react_compress.after_tokens,
+                    "messages_before": react_compress.before_count,
+                    "messages_after": react_compress.after_count,
+                    "llm_sec": round(react_compress.llm_sec, 3),
+                }
+            )
+            emit_compress_trace_step(
+                react_compress,
+                thread_id=thread_id,
+                workspace=workspace,
+            )
+        log_react_phase(
+            workspace,
+            thread_id,
+            phase="compress_done",
+            detail=compress_detail,
+            duration_sec=time.perf_counter() - t1,
+        )
+
+        if cancel_check is not None and cancel_check():
+            raise UserCancelledError("用户停止当前生成")
+
+        _milestone("模型决策中…", "await_agent_llm")
+        printer.mark_agent_step_start()
+        log_react_phase(
+            workspace,
+            thread_id,
+            phase="post_tools_end",
+            duration_sec=time.perf_counter() - wall_start,
+        )
+    except Exception as exc:
+        log_react_phase(
+            workspace,
+            thread_id,
+            phase="post_tools_error",
+            detail={"failed_phase": session.react_phase},
+            duration_sec=time.perf_counter() - wall_start,
+            error=exc,
+        )
+        raise
 
 
 def stream_agent_turn(
@@ -1762,6 +2012,9 @@ def stream_agent_turn(
 
     printer = TurnTracePrinter(session)
     session.active_printer = printer
+    if session.pending_invoke_steps:
+        printer.adopt_prelude_steps(list(session.pending_invoke_steps))
+        session.pending_invoke_steps = []
     printer.on_turn_start(
         user_message,
         workspace=ws_path,
@@ -1774,80 +2027,122 @@ def stream_agent_turn(
     saw_tool_round = False
     streaming_reply = False
     last_tool_body = ""
+    stream_end_reason = "complete"
+    last_node_name = ""
 
-    for item in agent.stream(
-        input_state,
-        config=config,
-        stream_mode=["updates", "messages"],
-    ):
-        if cancel_check is not None and cancel_check():
-            break
-        if not isinstance(item, tuple) or len(item) != 2:
-            continue
-        mode, payload = item
+    try:
+        for item in agent.stream(
+            input_state,
+            config=config,
+            stream_mode=["updates", "messages"],
+        ):
+            if cancel_check is not None and cancel_check():
+                stream_end_reason = "cancel_break"
+                if with_memory and ws_path is not None:
+                    from llgraph.session.session_run_log import log_react_phase
 
-        if mode == "updates" and isinstance(payload, dict):
-            for node_name, state_update in payload.items():
-                messages = (state_update or {}).get("messages", [])
-                if node_name == "agent":
-                    if any(
-                        isinstance(m, AIMessage) and (m.tool_calls or [])
-                        for m in messages
-                    ):
+                    log_react_phase(
+                        ws_path,
+                        thread_id,
+                        phase="stream_cancel_break",
+                        detail={"last_node": last_node_name},
+                    )
+                break
+            if not isinstance(item, tuple) or len(item) != 2:
+                continue
+            mode, payload = item
+
+            if mode == "updates" and isinstance(payload, dict):
+                for node_name, state_update in payload.items():
+                    last_node_name = str(node_name)
+                    messages = (state_update or {}).get("messages", [])
+                    if node_name == "agent":
+                        if any(
+                            isinstance(m, AIMessage) and (m.tool_calls or [])
+                            for m in messages
+                        ):
+                            saw_tool_round = True
+                            streaming_reply = False
+                            if not session.shows_process():
+                                _web_progress_milestone(session, "模型决策中…")
+                        printer.on_agent_update(messages)
+                    elif node_name == "turn_fallback":
+                        printer.on_agent_update(messages)
+                    elif node_name == "tools":
                         saw_tool_round = True
                         streaming_reply = False
                         if not session.shows_process():
-                            _web_progress_milestone(session, "模型决策中…")
-                    printer.on_agent_update(messages)
-                elif node_name == "turn_fallback":
-                    printer.on_agent_update(messages)
-                elif node_name == "tools":
-                    saw_tool_round = True
-                    streaming_reply = False
-                    if not session.shows_process():
-                        _web_progress_milestone(session, "工具执行中…")
-                    for msg in messages:
-                        if isinstance(msg, ToolMessage):
-                            last_tool_body = _message_text(msg.content)
-                    if write_failure_tracker is not None:
-                        write_failure_tracker.inspect_tool_messages(messages)
-                    printer.on_tools_update(messages)
-                    if with_memory and ws_path is not None:
-                        from llgraph.context.context_compressor import (
-                            format_compress_report,
-                            maybe_compress_during_react,
-                        )
-                        from llgraph.terminal.ops_notice import ops_notice
-
-                        react_compress = maybe_compress_during_react(
-                            agent,
-                            thread_id=thread_id,
-                            workspace=ws_path,
-                        )
-                        if react_compress is not None:
-                            ops_notice(
-                                "ReAct 中途压缩: " + format_compress_report(react_compress)
+                            _web_progress_milestone(session, "工具执行中…")
+                        for msg in messages:
+                            if isinstance(msg, ToolMessage):
+                                last_tool_body = _message_text(msg.content)
+                        if write_failure_tracker is not None:
+                            write_failure_tracker.inspect_tool_messages(messages)
+                        printer.on_tools_update(messages)
+                        if with_memory and ws_path is not None:
+                            _react_post_tools_maintenance(
+                                agent,
+                                thread_id=thread_id,
+                                workspace=ws_path,
+                                session=session,
+                                cancel_check=cancel_check,
+                                printer=printer,
                             )
+                        else:
+                            printer.mark_agent_step_start()
 
-        elif mode == "messages" and isinstance(payload, tuple) and len(payload) == 2:
-            msg_chunk, metadata = payload
-            meta = metadata if isinstance(metadata, dict) else {}
-            if meta.get("langgraph_node", "") != "agent":
-                continue
-            if isinstance(msg_chunk, (AIMessage, AIMessageChunk)):
-                printer.absorb_usage_from_chunk(msg_chunk)
-            thinking = _extract_thinking_from_message_chunk(msg_chunk)
-            if thinking:
-                printer.on_thinking_chunk(thinking)
-            if getattr(msg_chunk, "tool_calls", None) or []:
-                streaming_reply = False
-                continue
-            text = _extract_text_from_message_chunk(msg_chunk)
-            if not text:
-                continue
-            if saw_tool_round or not streaming_reply:
-                streaming_reply = True
-            printer.on_text_chunk(text)
+            elif mode == "messages" and isinstance(payload, tuple) and len(payload) == 2:
+                msg_chunk, metadata = payload
+                meta = metadata if isinstance(metadata, dict) else {}
+                if meta.get("langgraph_node", "") != "agent":
+                    continue
+                if isinstance(msg_chunk, (AIMessage, AIMessageChunk)):
+                    printer.absorb_usage_from_chunk(msg_chunk)
+                thinking = _extract_thinking_from_message_chunk(msg_chunk)
+                if thinking:
+                    printer.on_thinking_chunk(thinking)
+                if getattr(msg_chunk, "tool_calls", None) or []:
+                    streaming_reply = False
+                    continue
+                text = _extract_text_from_message_chunk(msg_chunk)
+                if not text:
+                    continue
+                if saw_tool_round or not streaming_reply:
+                    streaming_reply = True
+                printer.on_text_chunk(text)
+    except UserCancelledError:
+        stream_end_reason = "user_cancelled"
+    except Exception as exc:
+        stream_end_reason = "error"
+        if with_memory and ws_path is not None:
+            from llgraph.session.session_run_log import log_react_phase
+
+            log_react_phase(
+                ws_path,
+                thread_id,
+                phase="stream_error",
+                detail={"last_node": last_node_name},
+                error=exc,
+            )
+        raise
+    finally:
+        if with_memory and ws_path is not None:
+            from llgraph.session.session_run_log import log_react_phase
+
+            log_react_phase(
+                ws_path,
+                thread_id,
+                phase="stream_end",
+                detail={
+                    "reason": stream_end_reason,
+                    "last_node": last_node_name,
+                    "saw_tool_round": saw_tool_round,
+                    "streaming_reply": streaming_reply,
+                    "step_count": len(getattr(printer, "_steps", []) or []),
+                },
+                duration_sec=time.perf_counter() - turn_start,
+            )
+        _set_react_phase(session, "")
 
     display_text, raw_text = printer.on_turn_end(last_step_body=last_tool_body)
     session.last_turn_steps = list(printer._steps)

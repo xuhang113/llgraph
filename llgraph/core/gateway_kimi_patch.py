@@ -128,15 +128,30 @@ def _ensure_thinking_block_in_content(
         and str(b.get("type", "")).lower() in ("thinking", "redacted_thinking")
         for b in content
     )
-    if has_thinking:
-        block["content"] = content
-        return
+    if not has_thinking:
+        original = _extract_thinking_block_from_ai(source)
+        if original is not None:
+            content.insert(0, original)
+        elif reasoning.strip():
+            content.insert(0, {"type": "thinking", "thinking": reasoning.strip()})
+    from llgraph.context.chat_history_repair import (
+        THINKING_ONLY_DISPATCH_TEXT,
+        TOOL_ASSISTANT_DISPATCH_TEXT,
+    )
 
-    original = _extract_thinking_block_from_ai(source)
-    if original is not None:
-        content.insert(0, original)
-    elif reasoning.strip():
-        content.insert(0, {"type": "thinking", "thinking": reasoning.strip()})
+    has_text = any(
+        isinstance(b, dict)
+        and str(b.get("type", "")).lower() == "text"
+        and str(b.get("text", "")).strip() not in ("", " ")
+        for b in content
+    )
+    has_tool = any(
+        isinstance(b, dict) and str(b.get("type", "")).lower() == "tool_use"
+        for b in content
+    )
+    if not has_text:
+        placeholder = TOOL_ASSISTANT_DISPATCH_TEXT if has_tool else THINKING_ONLY_DISPATCH_TEXT
+        content.append({"type": "text", "text": placeholder})
     block["content"] = content
 
 
@@ -214,6 +229,58 @@ def _formatted_assistant_needs_thinking_inject(
     return True
 
 
+def _tool_use_ids_from_formatted(block: dict[str, Any]) -> tuple[str, ...]:
+    """提取 formatted assistant 中的 tool_use id 列表。"""
+    content = block.get("content")
+    if not isinstance(content, list):
+        return ()
+    ids: list[str] = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "tool_use":
+            tid = str(item.get("id") or "").strip()
+            if tid:
+                ids.append(tid)
+    return tuple(ids)
+
+
+def _tool_call_ids_from_ai(msg: AIMessage) -> tuple[str, ...]:
+    """提取 AIMessage.tool_calls 中的 id 列表。"""
+    calls = getattr(msg, "tool_calls", None) or []
+    ids: list[str] = []
+    for call in calls:
+        if isinstance(call, dict):
+            tid = str(call.get("id") or "").strip()
+        else:
+            tid = str(getattr(call, "id", "") or "").strip()
+        if tid:
+            ids.append(tid)
+    return tuple(ids)
+
+
+def _match_source_ai_for_block(
+    block: dict[str, Any],
+    source_ais: list[AIMessage],
+    sequential_idx: int,
+) -> AIMessage | None:
+    """
+    为 formatted assistant 匹配源 AIMessage。
+
+    优先按 tool_use / tool_call id 对齐，避免序号错位；否则回退到顺序下标。
+    """
+    tool_ids = _tool_use_ids_from_formatted(block)
+    if tool_ids:
+        for msg in source_ais:
+            if _tool_call_ids_from_ai(msg) == tool_ids:
+                return msg
+        for msg in source_ais:
+            src_ids = set(_tool_call_ids_from_ai(msg))
+            if src_ids and src_ids.issuperset(tool_ids):
+                return msg
+    if 0 <= sequential_idx < len(source_ais):
+        return source_ais[sequential_idx]
+    return None
+
+
 def inject_reasoning_into_formatted_messages(
     source_messages: list[BaseMessage],
     formatted_messages: list[dict[str, Any]],
@@ -224,6 +291,7 @@ def inject_reasoning_into_formatted_messages(
     为 formatted assistant 消息补上 reasoning_content（可选 content.thinking）。
 
     tool 轮与 thinking-only 续跑轮均会注入（后者用于 Think step 历史回传）。
+    源消息优先按 tool_use id 对齐，降低序号映射错位。
 
     @param source_messages 原始 LangChain 消息（出站修链后）
     @param formatted_messages Anthropic 格式 messages
@@ -236,7 +304,7 @@ def inject_reasoning_into_formatted_messages(
     for block in formatted_messages:
         if block.get("role") != "assistant":
             continue
-        source = source_ais[ai_idx] if ai_idx < len(source_ais) else None
+        source = _match_source_ai_for_block(block, source_ais, ai_idx)
         ai_idx += 1
 
         if _formatted_assistant_has_tool_use(block):
@@ -460,6 +528,14 @@ def patch_gateway_kimi_reasoning_payload() -> None:
                 desired_thinking,
                 model_id=model_text,
             )
+        from llgraph.core.dispatch_payload_guard import validate_and_repair_formatted_messages
+
+        repaired, issues = validate_and_repair_formatted_messages(formatted)
+        payload["messages"] = repaired
+        if issues:
+            from llgraph.terminal.ops_notice import ops_notice
+
+            ops_notice(f"出站消息已自动修复 {len(issues)} 处（避免网关 400）。")
         return payload
 
     anthropic_chat_models.ChatAnthropic._get_request_payload = _patched_get_request_payload

@@ -1,4 +1,4 @@
-import type { Workspace } from '../../api/client';
+import type { LlmSettings, Workspace } from '../../api/client';
 import { readStoredRecentWorkspaces, readStoredWorkspaceSlug } from '../../utils/workspaceStorage';
 import {
   LAST_SESSION_THREAD_KEY,
@@ -89,4 +89,101 @@ export function readInitialRightPanelWidth(): number {
     RIGHT_PANEL_WIDTH_MIN,
     RIGHT_PANEL_WIDTH_MAX,
   );
+}
+
+const ALLOW_WRITE_KEY = 'llgraph-allow-write';
+const ALLOW_WRITE_VERSION_KEY = 'llgraph-allow-write-version';
+const ALLOW_WRITE_VERSION = '3';
+
+/** 工具栏「允许写」偏好；Web 缺省为 true。 */
+export function readStoredAllowWrite(): boolean {
+  try {
+    const version = localStorage.getItem(ALLOW_WRITE_VERSION_KEY);
+    if (version !== ALLOW_WRITE_VERSION) {
+      localStorage.setItem(ALLOW_WRITE_VERSION_KEY, ALLOW_WRITE_VERSION);
+      localStorage.setItem(ALLOW_WRITE_KEY, '1');
+      return true;
+    }
+    const raw = localStorage.getItem(ALLOW_WRITE_KEY);
+    if (raw === null) {
+      return true;
+    }
+    return raw === '1' || raw === 'true';
+  } catch {
+    return true;
+  }
+}
+
+export function writeStoredAllowWrite(enabled: boolean): void {
+  try {
+    localStorage.setItem(ALLOW_WRITE_VERSION_KEY, ALLOW_WRITE_VERSION);
+    localStorage.setItem(ALLOW_WRITE_KEY, enabled ? '1' : '0');
+  } catch {
+    /* ignore */
+  }
+}
+
+const LLM_SETTINGS_CACHE_KEY = 'llgraph-llm-settings-cache';
+
+const SANDBOX_ENABLED_KEY = 'llgraph-sandbox-enabled';
+const SANDBOX_ENABLED_VERSION_KEY = 'llgraph-sandbox-enabled-version';
+const SANDBOX_ENABLED_VERSION = '1';
+
+/** Web 工具栏「沙箱」偏好；缺省为 true。 */
+export function readStoredSandboxEnabled(): boolean {
+  try {
+    const version = localStorage.getItem(SANDBOX_ENABLED_VERSION_KEY);
+    if (version !== SANDBOX_ENABLED_VERSION) {
+      localStorage.setItem(SANDBOX_ENABLED_VERSION_KEY, SANDBOX_ENABLED_VERSION);
+      localStorage.setItem(SANDBOX_ENABLED_KEY, '1');
+      return true;
+    }
+    const raw = localStorage.getItem(SANDBOX_ENABLED_KEY);
+    if (raw === null) {
+      return true;
+    }
+    return raw === '1' || raw === 'true';
+  } catch {
+    return true;
+  }
+}
+
+export function writeStoredSandboxEnabled(enabled: boolean): void {
+  try {
+    localStorage.setItem(SANDBOX_ENABLED_VERSION_KEY, SANDBOX_ENABLED_VERSION);
+    localStorage.setItem(SANDBOX_ENABLED_KEY, enabled ? '1' : '0');
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 刷新后立即展示上次模型列表（避免长时间「加载模型…」）。 */
+export function readCachedLlmSettings(slug: string): LlmSettings | null {
+  if (!slug) {
+    return null;
+  }
+  try {
+    const raw = localStorage.getItem(LLM_SETTINGS_CACHE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const map = JSON.parse(raw) as Record<string, LlmSettings>;
+    return map[slug] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeCachedLlmSettings(slug: string, settings: LlmSettings): void {
+  if (!slug) {
+    return;
+  }
+  try {
+    const raw = localStorage.getItem(LLM_SETTINGS_CACHE_KEY);
+    const map = raw ? (JSON.parse(raw) as Record<string, LlmSettings>) : {};
+    map[slug] = settings;
+    localStorage.setItem(LLM_SETTINGS_CACHE_KEY, JSON.stringify(map));
+  } catch {
+    /* ignore */
+  }
 }

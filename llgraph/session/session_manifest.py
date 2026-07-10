@@ -8,13 +8,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import BaseMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage
 
 from llgraph.config.catalog_paths import format_catalog_path, scope_label
 from llgraph.context.context_session import ContextSession
 from llgraph.loaders.rules_loader import discover_rules
 from llgraph.loaders.skills_loader import SkillEntry, discover_skills
-from llgraph.context.message_normalize import reorder_pinned_system_messages
+from llgraph.context.message_normalize import reorder_pinned_session_messages
 from llgraph.session.user_storage import session_messages_path, user_sessions_root
 
 SESSION_MANIFEST_TAG = "<session-manifest>"
@@ -96,19 +96,29 @@ def conversation_anchor_json_path(workspace: Path, thread_id: str) -> Path:
     return session_manifest_dir(workspace, thread_id) / "conversation_anchor.json"
 
 
+def _manifest_message_text(msg: BaseMessage) -> str:
+    content = getattr(msg, "content", "") or ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts)
+    return str(content)
+
+
 def is_session_manifest_message(msg: BaseMessage) -> bool:
     """
-    是否为会话锚点 SystemMessage（压缩时保留）。
+    是否为会话 manifest 上下文消息（压缩时不摘要；非 system）。
 
     @param msg LangChain 消息
-    @return 是否锚点消息
+    @return 是否 manifest 消息
     """
-    if not isinstance(msg, SystemMessage):
-        return False
-    content = getattr(msg, "content", "") or ""
-    if not isinstance(content, str):
-        content = str(content)
-    return SESSION_MANIFEST_TAG in content
+    return SESSION_MANIFEST_TAG in _manifest_message_text(msg)
 
 
 
@@ -294,7 +304,7 @@ def build_session_manifest_message_content(
     allow_write: bool = False,
 ) -> str:
     """
-    构建置顶 SystemMessage 正文（压缩时不摘要此消息）。
+    构建 manifest 上下文消息正文（压缩时不摘要此消息）。
 
     @param workspace 工作区根
     @param thread_id 线程 ID
@@ -367,7 +377,7 @@ def build_session_manifest_message_content(
     return "\n".join(parts).strip()
 
 
-def build_session_manifest_system_message(
+def build_session_manifest_message(
     workspace: Path,
     thread_id: str,
     session: ContextSession,
@@ -377,9 +387,9 @@ def build_session_manifest_system_message(
     spill_dir: str | None = None,
     anchor_path: str | None = None,
     allow_write: bool = False,
-) -> SystemMessage:
+) -> HumanMessage:
     """
-    构建会话锚点 SystemMessage。
+    构建会话 manifest 上下文消息（HumanMessage，注入历史尾段而非 system）。
 
     @param workspace 工作区根
     @param thread_id 线程 ID
@@ -388,7 +398,7 @@ def build_session_manifest_system_message(
     @param archive_path 归档路径
     @param spill_dir 落盘目录
     @param anchor_path 结构化锚点路径
-    @return SystemMessage
+    @return HumanMessage
     """
     content = build_session_manifest_message_content(
         workspace,
@@ -400,7 +410,31 @@ def build_session_manifest_system_message(
         anchor_path=anchor_path,
         allow_write=allow_write,
     )
-    return SystemMessage(content=content)
+    return HumanMessage(content=content)
+
+
+def build_session_manifest_system_message(
+    workspace: Path,
+    thread_id: str,
+    session: ContextSession,
+    user_message: str,
+    *,
+    archive_path: str | None = None,
+    spill_dir: str | None = None,
+    anchor_path: str | None = None,
+    allow_write: bool = False,
+) -> HumanMessage:
+    """兼容旧名；返回 HumanMessage。"""
+    return build_session_manifest_message(
+        workspace,
+        thread_id,
+        session,
+        user_message,
+        archive_path=archive_path,
+        spill_dir=spill_dir,
+        anchor_path=anchor_path,
+        allow_write=allow_write,
+    )
 
 
 def strip_manifest_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -420,7 +454,7 @@ def sync_session_manifest_to_agent_state(
     allow_write: bool = False,
 ) -> str | None:
     """
-    落盘 manifest.json 并将锚点 SystemMessage 置顶到 agent 状态。
+    落盘 manifest.json 并将 manifest 注入 agent 状态（历史尾段，非 system）。
 
     @param agent LangGraph agent
     @param thread_id 线程 ID
@@ -460,7 +494,7 @@ def sync_session_manifest_to_agent_state(
     except Exception:
         messages = []
 
-    pinned = build_session_manifest_system_message(
+    pinned = build_session_manifest_message(
         workspace,
         thread_id,
         session,
@@ -471,7 +505,14 @@ def sync_session_manifest_to_agent_state(
         allow_write=allow_write,
     )
     rest = strip_manifest_messages(messages)
-    new_messages = reorder_pinned_system_messages([pinned, *rest])
+    new_messages = reorder_pinned_session_messages([*rest, pinned])
+    from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
+
+    new_messages = ensure_messages_include_conversation_anchor(
+        workspace,
+        thread_id,
+        new_messages,
+    )
     try:
         agent.update_state(config, {"messages": new_messages})
     except Exception:
@@ -521,7 +562,7 @@ def sync_session_manifest_after_compress(
     except Exception:
         return manifest_rel
 
-    manifest_msg = build_session_manifest_system_message(
+    manifest_msg = build_session_manifest_message(
         workspace,
         thread_id,
         session,
@@ -531,14 +572,21 @@ def sync_session_manifest_after_compress(
         anchor_path=anchor_path or payload.get("anchor_path"),
         allow_write=allow_write,
     )
-    new_messages = reorder_pinned_system_messages(
-        [manifest_msg, *strip_manifest_messages(messages)]
+    new_messages = reorder_pinned_session_messages(
+        [*strip_manifest_messages(messages), manifest_msg]
+    )
+    from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
+
+    new_messages = ensure_messages_include_conversation_anchor(
+        workspace,
+        thread_id,
+        new_messages,
     )
     try:
         agent.update_state(config, {"messages": new_messages})
-        from llgraph.session.session_file_store import save_session_messages
+        from llgraph.session.session_file_store import save_agent_session_messages
 
-        save_session_messages(workspace, thread_id, new_messages)
+        save_agent_session_messages(workspace, thread_id, new_messages, sync_pool=True)
     except Exception:
         pass
     return manifest_rel

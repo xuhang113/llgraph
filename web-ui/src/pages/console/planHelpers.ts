@@ -10,14 +10,21 @@ export function planExecutionAllowWrite(detail: PlanDetail): boolean {
 }
 
 export function planNeedsConfirm(detail: PlanDetail): boolean {
+  const phase = String(detail.phase || '');
+  if (phase === 'cancelled' || phase === 'completed') {
+    return false;
+  }
+  if (detail.job?.running || detail.plan_state?.cancel_requested) {
+    return false;
+  }
   const pending = detail.plan_state?.pending_interrupt;
   if (pending && typeof pending === 'object' && pending.type === 'plan_confirm') {
     return true;
   }
-  if (detail.phase !== 'awaiting_confirm') {
+  if (phase !== 'awaiting_confirm') {
     return false;
   }
-  return !detail.job?.running;
+  return true;
 }
 
 export function buildPlanConfirmPayload(detail: PlanDetail): Record<string, unknown> {

@@ -60,9 +60,8 @@ def test_auto_dispatch_keeps_extra_turn_when_budget_allows() -> None:
         keep_recent_token_ratio=0.25,
         compress_model=None,
         session_archive_on_compress=True,
-        compress_retrieval_enabled=True,
-        compress_retrieval_top_k=5,
         compress_tool_mask_max_chars=2000,
+        read_tool_mask_max_chars=12000,
         tool_result_max_chars=40_000,
         read_tool_result_max_chars=40_000,
         read_file_max_bytes=600_000,
@@ -92,7 +91,9 @@ def test_auto_dispatch_keeps_extra_turn_when_budget_allows() -> None:
         dispatch_dedupe_read_paths=True,
         dispatch_min_tool_rounds=12,
         grep_context_lines=5,
+        grep_max_inline_chars=48000,
         spill_hit_context_lines=100,
+        tool_prune_token_ratio=0.7,
     )
     trimmed = trim_messages_for_dispatch_window_auto(
         messages,

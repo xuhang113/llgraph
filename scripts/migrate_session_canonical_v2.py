@@ -46,7 +46,7 @@ def migrate_one(workspace: Path, thread_id: str) -> None:
     save_session_meta(workspace, thread_id, meta)
     print(
         f"{thread_id}: {before} -> {len(cleaned)} 条; "
-        f"归档 system {report.archived_system_messages}; "
+        f"移除 system {report.dropped_system_messages}; "
         f"扁平 AI {report.flattened_ai_messages}; "
         f"校验 {'OK' if not issues else issues}",
     )

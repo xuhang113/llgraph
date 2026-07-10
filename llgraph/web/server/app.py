@@ -20,7 +20,7 @@ from llgraph.commands.meta_commands import (
     resolve_meta_display_mode,
 )
 from llgraph.code_index.paths import DEFAULT_SEARCH_TOP_K
-from llgraph.core.session_bootstrap import AgentRuntimeBundle, build_agent_session_for_thread
+from llgraph.core.session_bootstrap import AgentRuntimeBundle, get_or_build_agent_session_for_thread
 from llgraph.terminal.output import capture_terminal_output, format_captured_output
 from llgraph.console.discovery import (
     build_session_tree,
@@ -68,6 +68,10 @@ from llgraph.console.runtime.workspace_runtime import RUNTIME_MANAGER
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
+    # 预热 llm-settings 依赖，避免首屏「加载模型列表」卡在 Python 冷 import
+    from llgraph.console.runtime import llm_settings_api  # noqa: F401
+
+    _ = llm_settings_api
     yield
     HUB.close_all()
 
@@ -248,6 +252,32 @@ class CodeSearchBody(BaseModel):
     path_prefix: str = "."
 
 
+def _ensure_web_default_sandbox(workspace: Path, *, allow_write: bool) -> None:
+    """
+    Web Console 首次访问工作区时默认启用 OS 沙箱（若后端可用）。
+
+    @param workspace 工作区根
+    @param allow_write 当前写模式（影响 bindWriteMode）
+    """
+    rt = RUNTIME_MANAGER.get(workspace, allow_write=allow_write)
+    if rt.sandbox_cli_enabled is False:
+        return
+    if rt.sandbox_policy is not None and rt.sandbox_policy.enabled:
+        return
+    from llgraph.config.sandbox_settings import resolve_sandbox_settings
+
+    if rt.sandbox_cli_enabled is None and resolve_sandbox_settings(workspace).enabled:
+        return
+    try:
+        RUNTIME_MANAGER.set_sandbox_enabled(
+            workspace,
+            enabled=True,
+            allow_write=allow_write,
+        )
+    except ValueError:
+        pass
+
+
 def _sandbox_payload(rt) -> dict[str, Any]:
     """序列化沙箱状态。"""
     policy = rt.sandbox_policy
@@ -278,6 +308,51 @@ def _ws(slug: str) -> Path:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+def _resolve_session_kind(workspace: Path, thread_id: str) -> str | None:
+    """
+    解析会话类型（meta 缺 session_kind 时按 thread_id 推断）。
+
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @return agent | plan | worker；无法识别时 None
+    """
+    from llgraph.session.session_delete import is_plan_main_thread
+
+    meta = load_session_meta(workspace, thread_id.strip())
+    raw = meta.get("session_kind")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    tid = thread_id.strip()
+    if tid.startswith("cli-"):
+        return "agent"
+    if is_plan_main_thread(tid):
+        return "plan"
+    if tid.startswith("plan-"):
+        return "worker"
+    return None
+
+
+def _agent_runtime_bundle(workspace: Path, *, allow_write: bool) -> AgentRuntimeBundle:
+    """构造 Agent 运行时 bundle（Web 热路径共享）。"""
+    rt = RUNTIME_MANAGER.get(workspace, allow_write=allow_write)
+    return AgentRuntimeBundle(
+        workspace=workspace,
+        trace_session=rt.trace_session,
+        context_session=rt.context_session,
+        allow_write=allow_write,
+        mcp_tools=rt.mcp_tools,
+        mcp_registry=rt.mcp_registry,
+        watch_service=None,
+        web_search_enabled=rt.web_search_enabled,
+        sandbox_policy=rt.sandbox_policy,
+        sandbox_cli_enabled=rt.sandbox_cli_enabled,
+        no_spill=False,
+        memory_kind="memory",
+        mcp_summary=rt.mcp_summary,
+        watch_active=False,
+    )
+
+
 def _meta_agent_session(
     workspace: Path,
     thread_id: str,
@@ -294,27 +369,10 @@ def _meta_agent_session(
     """
     if not thread_id.strip():
         return None
-    meta = load_session_meta(workspace, thread_id.strip())
-    if meta.get("session_kind") != "agent":
+    if _resolve_session_kind(workspace, thread_id.strip()) != "agent":
         return None
-    rt = RUNTIME_MANAGER.get(workspace, allow_write=allow_write)
-    bundle = AgentRuntimeBundle(
-        workspace=workspace,
-        trace_session=rt.trace_session,
-        context_session=rt.context_session,
-        allow_write=allow_write,
-        mcp_tools=rt.mcp_tools,
-        mcp_registry=rt.mcp_registry,
-        watch_service=None,
-        web_search_enabled=rt.web_search_enabled,
-        sandbox_policy=rt.sandbox_policy,
-        sandbox_cli_enabled=rt.sandbox_cli_enabled,
-        no_spill=False,
-        memory_kind="memory",
-        mcp_summary=rt.mcp_summary,
-        watch_active=False,
-    )
-    return build_agent_session_for_thread(bundle, thread_id.strip())
+    bundle = _agent_runtime_bundle(workspace, allow_write=allow_write)
+    return get_or_build_agent_session_for_thread(bundle, thread_id.strip())
 
 
 def _session_edit_tracker(workspace: Path, thread_id: str) -> Any:
@@ -423,8 +481,10 @@ def get_session_tree(slug: str) -> dict[str, Any]:
 @app.get("/api/workspaces/{slug}/capabilities")
 def get_capabilities(slug: str, allow_write: bool = False) -> dict[str, Any]:
     """工具 / MCP / Skill 清单。"""
-    payload = load_capabilities(_ws(slug), allow_write=allow_write)
-    rt = RUNTIME_MANAGER.get(_ws(slug), allow_write=allow_write)
+    workspace = _ws(slug)
+    _ensure_web_default_sandbox(workspace, allow_write=allow_write)
+    payload = load_capabilities(workspace, allow_write=allow_write)
+    rt = RUNTIME_MANAGER.get(workspace, allow_write=allow_write)
     payload["sandbox"] = _sandbox_payload(rt)
     return payload
 
@@ -710,26 +770,25 @@ def get_context_usage(
     """上下文 token 用量（结构化，对标 /context）。"""
     workspace = _ws(slug)
     rt = RUNTIME_MANAGER.get(workspace, allow_write=allow_write)
-    agent_session = _meta_agent_session(
-        workspace,
-        thread_id,
-        allow_write=allow_write,
-    )
     from llgraph.context.context_settings import resolve_context_settings
     from llgraph.context.context_stats import collect_context_usage
     from llgraph.core.model_context_window import format_context_budget_note
 
-    web_enabled = (
-        agent_session.web_search_enabled
-        if agent_session is not None
-        else rt.web_search_enabled
+    from llgraph.session.session_file_store import session_has_messages_file
+
+    tid = thread_id.strip()
+    has_session = bool(
+        tid
+        and _resolve_session_kind(workspace, tid) == "agent"
+        and session_has_messages_file(workspace, tid)
     )
     breakdown = collect_context_usage(
         workspace,
         context_session=rt.context_session,
         allow_write=allow_write,
-        web_search_enabled=web_enabled,
-        agent_session=agent_session,
+        web_search_enabled=rt.web_search_enabled,
+        thread_id=tid,
+        mcp_tools=rt.mcp_tools,
     )
     settings = resolve_context_settings(workspace)
     limit = settings.max_tokens_estimate
@@ -760,8 +819,32 @@ def get_context_usage(
             model_id=settings.context_model_id,
             ratio=settings.auto_compress_ratio,
         ),
-        "has_session": agent_session is not None,
+        "has_session": has_session,
     }
+
+
+@app.get("/api/workspaces/{slug}/context/detail")
+def get_context_detail(
+    slug: str,
+    allow_write: bool = False,
+    thread_id: str = "",
+    max_preview_chars: int = 6000,
+) -> dict[str, Any]:
+    """上下文详情：分项 preview + 落盘消息 + 下轮出站预览（排查用，只读）。"""
+    workspace = _ws(slug)
+    rt = RUNTIME_MANAGER.get(workspace, allow_write=allow_write)
+    from llgraph.context.context_inspect import collect_context_detail
+
+    payload = collect_context_detail(
+        workspace,
+        context_session=rt.context_session,
+        thread_id=thread_id,
+        allow_write=allow_write,
+        web_search_enabled=rt.web_search_enabled,
+        mcp_tools=rt.mcp_tools,
+        max_preview_chars=max_preview_chars,
+    )
+    return payload.to_dict()
 
 
 @app.post("/api/workspaces/{slug}/compress")
@@ -834,7 +917,6 @@ def get_index_status_api(slug: str) -> dict[str, Any]:
     from llgraph.code_index.paths import meta_path
     from llgraph.code_index.store import get_index_status
 
-    status = get_index_status(workspace)
     idx_cfg = resolve_index_settings(workspace)
     manifest = load_manifest(workspace)
     sync_complete = None
@@ -847,6 +929,25 @@ def get_index_status_api(slug: str) -> dict[str, Any]:
             sync_complete = meta.get("sync_complete")
         except (OSError, json.JSONDecodeError):
             pass
+
+    try:
+        status = get_index_status(workspace)
+    except RuntimeError as exc:
+        return {
+            "exists": False,
+            "chunk_count": 0,
+            "vector_dim": 0,
+            "last_indexed_at": None,
+            "lance_path": "",
+            "manifest_files": len(manifest),
+            "sync_complete": sync_complete,
+            "watch_enabled": idx_cfg.watch_enabled,
+            "watch_with_agent": idx_cfg.watch_with_agent,
+            "embedding": str(exc),
+            "max_files": idx_cfg.max_files,
+            "deps_missing": True,
+        }
+
     return {
         "exists": status.exists,
         "chunk_count": status.chunk_count,
@@ -859,6 +960,7 @@ def get_index_status_api(slug: str) -> dict[str, Any]:
         "watch_with_agent": idx_cfg.watch_with_agent,
         "embedding": format_embedding_status(workspace),
         "max_files": idx_cfg.max_files,
+        "deps_missing": False,
     }
 
 
@@ -1082,6 +1184,9 @@ def get_worker(slug: str, thread_id: str, task_id: str) -> dict:
 def get_session(slug: str, thread_id: str) -> dict:
     """会话元数据。"""
     workspace = _ws(slug)
+    from llgraph.console.runtime.agent_service import reconcile_stale_agent_chat
+
+    reconcile_stale_agent_chat(workspace, thread_id)
     meta = load_session_meta(workspace, thread_id)
     _, total = read_jsonl_lines(session_messages_path(workspace, thread_id), offset=0, limit=0)
     lock = LOCKS.get(thread_id)
@@ -1099,7 +1204,7 @@ def get_session(slug: str, thread_id: str) -> dict:
         "meta": meta,
         "title": resolve_session_display_title(workspace, thread_id),
         "message_total": total,
-        "allow_write": bool(meta.get("allow_write", False)),
+        "allow_write": bool(meta.get("allow_write", True)),
         "running": lock is not None and lock.owner == "web",
         "lock": {"owner": lock.owner, "since": lock.since} if lock else None,
         "last_run": read_session_last_run(workspace, thread_id),
@@ -1355,6 +1460,94 @@ def create_session(slug: str, body: CreateSessionBody) -> dict[str, str]:
     raise HTTPException(status_code=400, detail="kind 须为 agent 或 plan")
 
 
+@app.post("/api/workspaces/{slug}/sessions/{thread_id}/warm")
+def warm_session_endpoint(
+    slug: str,
+    thread_id: str,
+    allow_write: bool = Query(True),
+) -> dict[str, Any]:
+    """主动预热 Agent 会话（build_agent + 入 LRU 保活池），缩短首条消息延迟。"""
+    import time
+
+    workspace = _ws(slug)
+    tid = thread_id.strip()
+    if _resolve_session_kind(workspace, tid) != "agent":
+        raise HTTPException(status_code=400, detail="仅 Agent 会话可预热")
+    t0 = time.monotonic()
+    ctx = _meta_agent_session(workspace, tid, allow_write=allow_write)
+    if ctx is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {
+        "ok": True,
+        "thread_id": tid,
+        "duration_sec": round(time.monotonic() - t0, 3),
+    }
+
+
+@app.post("/api/workspaces/{slug}/sessions/warm-recent")
+def warm_recent_sessions_endpoint(
+    slug: str,
+    limit: int = Query(-1, ge=-1, le=32),
+    days: int = Query(-1, ge=-1, le=30),
+    allow_write: bool = Query(True),
+    background: bool = Query(True),
+) -> dict[str, Any]:
+    """
+    预热最近 N 个 Agent 会话（默认读 agent.json → agent_pool，warm_recent_limit=0 表示关闭）。
+
+    超出 LRU 容量时自动淘汰最旧条目；不宜一次性预热过多（每实例占内存 + LangGraph 图）。
+    """
+    import threading
+    from datetime import datetime, timedelta, timezone
+
+    from llgraph.config.agent_pool_settings import resolve_agent_pool_settings
+    from llgraph.core.agent_session_pool import warm_recent_agent_sessions
+    from llgraph.session.session_registry import _parse_iso_datetime, discover_sessions
+
+    workspace = _ws(slug)
+    pool_settings = resolve_agent_pool_settings(workspace)
+    effective_limit = pool_settings.warm_recent_limit if limit < 0 else limit
+    effective_days = pool_settings.warm_recent_days if days < 0 else days
+    if effective_limit <= 0:
+        return {"ok": True, "queued": 0, "limit": 0, "background": background}
+
+    summaries = discover_sessions(workspace)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=effective_days)
+    candidates: list[str] = []
+    for summary in summaries:
+        if not summary.thread_id.startswith("cli-"):
+            continue
+        updated = _parse_iso_datetime(summary.updated_at)
+        if updated is not None and updated < cutoff:
+            continue
+        candidates.append(summary.thread_id)
+
+    bundle = _agent_runtime_bundle(workspace, allow_write=allow_write)
+    queued = min(effective_limit, len(candidates))
+
+    def _run() -> None:
+        warm_recent_agent_sessions(bundle, candidates, limit=effective_limit)
+
+    if background:
+        threading.Thread(target=_run, daemon=True).start()
+        return {
+            "ok": True,
+            "queued": queued,
+            "limit": effective_limit,
+            "days": effective_days,
+            "background": True,
+        }
+
+    warmed = warm_recent_agent_sessions(bundle, candidates, limit=effective_limit)
+    return {
+        "ok": True,
+        "warmed": warmed,
+        "limit": effective_limit,
+        "days": effective_days,
+        "background": False,
+    }
+
+
 @app.delete("/api/workspaces/{slug}/sessions/{thread_id}")
 def delete_session_endpoint(slug: str, thread_id: str) -> dict[str, Any]:
     """删除 Agent 或 Plan 会话（Plan 含 Worker 级联，委托 llgraph）。"""
@@ -1411,6 +1604,9 @@ async def agent_chat(
         workspace = _ws(slug)
         loop = asyncio.get_event_loop()
         session_channel = f"session:{thread_id}"
+        from llgraph.console.runtime.agent_service import reconcile_stale_agent_chat
+
+        reconcile_stale_agent_chat(workspace, thread_id)
         for _ in range(60):
             if HUB.has_subscribers(session_channel):
                 break
@@ -1705,6 +1901,8 @@ def _repo_root() -> Path:
 
 
 def _static_dir() -> Path | None:
+    if os.environ.get("LLGRAPH_WEB_NO_STATIC", "").strip() in ("1", "true", "yes"):
+        return None
     env = os.environ.get("LLGRAPH_WEB_STATIC", "").strip()
     if env:
         path = Path(env).expanduser().resolve()

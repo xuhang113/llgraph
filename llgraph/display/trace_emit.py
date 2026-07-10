@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from llgraph.code_index.search_params import ParallelSearchParams
 
 _SEARCH_PARAMS_INLINE_PREVIEW = 8
@@ -46,6 +48,223 @@ def format_search_params_trace_summary(params: ParallelSearchParams) -> str:
     if sem_preview:
         parts.append(f"semantic={sem_preview!r}")
     return " · ".join(parts)
+
+
+def emit_invoke_prelude_step(
+    session: Any,
+    *,
+    title: str,
+    summary: str,
+    elapsed: float,
+    body_lines: list[str] | None = None,
+    kind: str = "preprocess",
+) -> int:
+    """
+    invoke 前预处理步骤：写入 pending_invoke_steps 并即时推送 Web SSE。
+
+    @param session TraceSession
+    @param title 步骤标题
+    @param summary 折叠行摘要
+    @param elapsed 墙钟耗时（秒）
+    @param body_lines 展开详情
+    @param kind 步骤类型（compress / tool_prune / preprocess）
+    @return 步骤编号；未展示时 0
+    """
+    from llgraph.display.trace_display import TraceStepRecord, _resolve_elapsed_kind
+
+    if session is None or session.is_silent() or not session.shows_process():
+        return 0
+
+    step_id = len(session.pending_invoke_steps) + 1
+    record = TraceStepRecord(
+        step_id=step_id,
+        kind=kind,
+        title=title,
+        elapsed=elapsed,
+        summary=summary,
+        body_lines=body_lines or [],
+        elapsed_kind=_resolve_elapsed_kind(kind),
+    )
+    printer = session.active_printer
+    if printer is not None:
+        return printer.emit_preprocess_step(
+            title,
+            summary,
+            record.body_lines,
+            elapsed,
+            kind=kind,
+            inline_preview=2,
+        )
+
+    session.pending_invoke_steps.append(record)
+    sink = session.trace_sink
+    if sink is not None and hasattr(sink, "step_added"):
+        sink.step_added(record)
+    return step_id
+
+
+def format_compress_skip_summary(
+    agent: Any,
+    *,
+    thread_id: str,
+    workspace: Any,
+) -> str:
+    """上下文未触发压缩时的 trace 摘要。"""
+    from llgraph.context.context_compressor import ContextCompressor, estimate_tokens
+    from llgraph.context.incremental_context import resolve_auto_compress_threshold
+
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = agent.get_state(config)
+        messages = list((state.values or {}).get("messages") or [])
+    except Exception:
+        messages = []
+    compressor = ContextCompressor(workspace, thread_id)
+    tokens = estimate_tokens(messages) if messages else 0
+    threshold = resolve_auto_compress_threshold(compressor.settings)
+    ratio_pct = int(compressor.settings.auto_compress_ratio * 100)
+    return f"估算 ~{tokens} · 阈值 ~{threshold}（{ratio_pct}% 窗）· 未触发"
+
+
+def format_sanitize_summary(report: Any) -> str:
+    """canonical sanitize 步骤摘要。"""
+    if report is None or not getattr(report, "changed", False):
+        return "无变更"
+    parts: list[str] = []
+    if report.removed_orphan_tools:
+        parts.append(f"移除 orphan tool ×{report.removed_orphan_tools}")
+    if report.patched_tool_results:
+        parts.append(f"补齐 tool 占位 ×{report.patched_tool_results}")
+    if report.normalized_ai_messages:
+        parts.append(f"规范化 AI ×{report.normalized_ai_messages}")
+    if report.expanded_tool_rounds:
+        parts.append(f"展开 tool 轮 ×{report.expanded_tool_rounds}")
+    return " · ".join(parts) if parts else "已清理"
+
+
+def emit_compress_trace_step(
+    report: Any,
+    *,
+    thread_id: str,
+    workspace: Any | None = None,
+    session: Any | None = None,
+    elapsed_sec: float | None = None,
+) -> None:
+    """
+    在 trace 中注册「上下文压缩」步骤（invoke 前 / ReAct 中途）。
+
+    @param report CompressReport
+    @param thread_id 会话 thread
+    @param workspace 工作区根（写 execution 日志）
+    """
+    from llgraph.context.context_compressor import CompressReport, format_compress_report
+    from llgraph.display.trace_display import LAST_TRACE_SESSION
+
+    if not isinstance(report, CompressReport) or not thread_id.strip():
+        return
+
+    session = session or LAST_TRACE_SESSION
+    body = format_compress_report(report).splitlines()
+    pct = int(report.saved_ratio * 100)
+    summary = (
+        f"token {report.before_tokens}→{report.after_tokens}（约释放 {pct}%）"
+        f" · {report.trigger}"
+    )
+    if report.llm_sec > 0:
+        summary += f" · LLM {_format_compress_elapsed(report.llm_sec)}"
+
+    wall = elapsed_sec if elapsed_sec is not None else report.elapsed_sec
+    if session is not None and session.shows_process():
+        printer = session.active_printer
+        if printer is not None:
+            printer.emit_preprocess_step(
+                "上下文压缩",
+                summary,
+                body,
+                wall,
+                kind="compress",
+                inline_preview=4,
+            )
+        else:
+            emit_invoke_prelude_step(
+                session,
+                title="上下文压缩",
+                summary=summary,
+                elapsed=wall,
+                body_lines=body,
+                kind="compress",
+            )
+
+    if workspace is not None:
+        from llgraph.display.execution_log import log_compress_event
+
+        log_compress_event(
+            workspace,
+            thread_id=thread_id,
+            report=report,
+            trigger=report.trigger or "auto",
+        )
+
+
+def _format_compress_elapsed(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    return f"{seconds:.2f}s"
+
+
+def emit_tool_prune_trace_step(
+    report: Any,
+    *,
+    thread_id: str,
+    workspace: Any | None = None,
+    session: Any | None = None,
+    elapsed_sec: float | None = None,
+) -> None:
+    """
+    在 trace 中注册「工具结果落盘」步骤（ReAct 步间增量写回）。
+
+    @param report ToolPruneReport
+    @param thread_id 会话 thread
+    @param workspace 工作区根（预留 execution 日志）
+    """
+    from llgraph.context.incremental_context import ToolPruneReport, format_tool_prune_report
+    from llgraph.display.trace_display import LAST_TRACE_SESSION
+
+    if not isinstance(report, ToolPruneReport) or not thread_id.strip():
+        return
+
+    session = session or LAST_TRACE_SESSION
+    body = format_tool_prune_report(report).splitlines()
+    summary = (
+        f"{report.pruned_count} 条→指针 · "
+        f"token {report.before_tokens}→{report.after_tokens}"
+    )
+    if report.trigger:
+        summary += f" · {report.trigger}"
+
+    wall = elapsed_sec if elapsed_sec is not None else report.elapsed_sec
+    if session is not None and session.shows_process():
+        printer = session.active_printer
+        if printer is not None:
+            printer.emit_preprocess_step(
+                "工具结果裁剪",
+                summary,
+                body,
+                wall,
+                kind="tool_prune",
+                inline_preview=2,
+            )
+        else:
+            emit_invoke_prelude_step(
+                session,
+                title="工具结果裁剪",
+                summary=summary,
+                elapsed=wall,
+                body_lines=body,
+                kind="tool_prune",
+            )
+
+    _ = workspace
 
 
 def emit_parallel_search_params_trace(

@@ -44,6 +44,31 @@ def create_checkpointer(
         return saver
 
 
+def resolve_thread_checkpointer_key(workspace: Path, thread_id: str) -> str:
+    """
+    工作区 + thread 维度的 MemorySaver 键。
+
+    @param workspace 工作区根
+    @param thread_id 会话 thread
+    @return 全局唯一 checkpoint 键
+    """
+    ws = workspace.expanduser().resolve()
+    tid = (thread_id or "").strip() or "__default__"
+    return f"{ws}:{tid}"
+
+
+def release_checkpointer(workspace: Path, thread_id: str) -> None:
+    """
+    LRU 淘汰时释放进程内 MemorySaver。
+
+    @param workspace 工作区根
+    @param thread_id 会话 thread
+    """
+    key = resolve_thread_checkpointer_key(workspace, thread_id)
+    with _CHECKPOINTER_LOCK:
+        _MEMORY_SAVERS.pop(key, None)
+
+
 def checkpointer_kind(workspace: Path, *, with_memory: bool) -> str:
     """
     当前会话持久化方式说明。

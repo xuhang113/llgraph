@@ -12,6 +12,11 @@ from typing import Any
 from langchain_core.messages import BaseMessage, ToolMessage
 
 from llgraph.context.context_settings import SpillSettings, resolve_spill_settings
+from llgraph.context.search_result_clip import (
+    clip_search_tool_result,
+    is_search_tool,
+    split_search_hit_blocks,
+)
 
 # 单行错误/状态类结果不 spill
 _SHORT_RESULT_MAX_CHARS = 280
@@ -28,6 +33,10 @@ _ERROR_PREFIXES = (
 )
 
 _READ_TOOLS = frozenset({"read_file", "read_files"})
+_READ_PATH_HDR = re.compile(r"^---\s+(.+?)\s+\(行\s+\d+", re.MULTILINE)
+_ARCHIVE_READ_HEAD_LINES = 15
+_ARCHIVE_READ_TAIL_LINES = 15
+_ARCHIVE_SEARCH_HIT_BLOCKS = 8
 
 
 @dataclass
@@ -94,6 +103,8 @@ class ContextSpill:
             return False
         if tool_name in self.settings.spill_exempt_tools:
             return False
+        if is_search_tool(tool_name):
+            return False
         text = content.strip()
         if not text:
             return False
@@ -122,6 +133,12 @@ class ContextSpill:
         @param content 原始工具输出
         @return 可能已替换为指针的文本
         """
+        if is_search_tool(tool_name):
+            return clip_search_tool_result(
+                tool_name,
+                content,
+                max_chars=self.settings.grep_max_inline_chars,
+            )
         if not self._should_spill(tool_name, content):
             return content
 
@@ -279,6 +296,123 @@ class ContextSpill:
         return len(self.records)
 
 
+def build_search_tool_archive_pointer(
+    content: str,
+    tool_name: str,
+    *,
+    total_chars: int | None = None,
+    max_blocks: int = _ARCHIVE_SEARCH_HIT_BLOCKS,
+) -> str | None:
+    """
+    将 grep/search 工具输出压缩为带命中块预览的归档指针。
+
+    @param content 原始工具输出
+    @param tool_name 工具名
+    @param total_chars 原文字符数（默认 len(content)）
+    @param max_blocks 最多保留命中块数
+    @return 归档指针；无结构化命中时返回 None
+    """
+    if not is_search_tool(tool_name):
+        return None
+    orig_len = total_chars if total_chars is not None else len(content)
+    if "未找到匹配" in content:
+        return (
+            f"[历史 {tool_name} 已归档] 0 命中（原长 {orig_len} 字符）；"
+            f"需要时重新调用 {tool_name}。"
+        )
+
+    blocks = split_search_hit_blocks(content)
+    hit_blocks = [b for b in blocks if b.startswith("---")]
+    if not hit_blocks:
+        return None
+
+    def _score(block: str) -> tuple[int, int]:
+        return (1 if ">>>" in block else 0, -len(block))
+
+    ranked = sorted(hit_blocks, key=_score, reverse=True)
+    selected = ranked[:max_blocks]
+    parts = [
+        f"[历史 {tool_name} 已归档] 原长 {orig_len} 字符；",
+        f"保留 {len(selected)}/{len(hit_blocks)} 个命中块预览；",
+        f"需要时重新调用 {tool_name} 或 read_file 查看源文件。",
+        "--- 命中预览 ---",
+    ]
+    parts.extend(selected)
+    if len(hit_blocks) > len(selected):
+        parts.append(
+            f"…（另有 {len(hit_blocks) - len(selected)} 个命中块已省略）"
+        )
+    parts.append("--- 预览结束 ---")
+    return "\n".join(parts)
+
+
+def build_read_tool_archive_pointer(
+    content: str,
+    *,
+    total_chars: int | None = None,
+    head_lines: int = _ARCHIVE_READ_HEAD_LINES,
+    tail_lines: int = _ARCHIVE_READ_TAIL_LINES,
+) -> str | None:
+    """
+    将 read 工具输出压缩为带 head/tail 预览的归档指针。
+
+    @param content 原始 read 输出
+    @param total_chars 原文字符数（默认 len(content)）
+    @param head_lines 开头预览行数
+    @param tail_lines 末尾预览行数
+    @return 归档指针；非 read 格式时返回 None
+    """
+    match = _READ_PATH_HDR.search(content)
+    if not match:
+        return None
+    rel = match.group(1).strip()
+    orig_len = total_chars if total_chars is not None else len(content)
+    lines = content.splitlines()
+    body_lines = lines[1:] if len(lines) > 1 else []
+    parts = [
+        f"[历史 read 已归档] 源文件 `{rel}`（原长 {orig_len} 字符）；",
+        "需要时用 read_file(path, start_line, end_line) 按行读取，或 grep_files 搜关键字。",
+    ]
+    if body_lines:
+        if len(body_lines) <= head_lines + tail_lines:
+            parts.append("--- 内容预览 ---")
+            parts.append(ContextSpill._clip_preview_lines(body_lines))
+        else:
+            parts.append("--- 开头预览 ---")
+            parts.append(ContextSpill._clip_preview_lines(body_lines[:head_lines]))
+            parts.append("--- 末尾预览 ---")
+            parts.append(ContextSpill._clip_preview_lines(body_lines[-tail_lines:]))
+        parts.append("--- 预览结束 ---")
+    return "\n".join(parts)
+
+
+def _mask_search_tool_message(msg: ToolMessage, content: str) -> ToolMessage:
+    tool_name = str(getattr(msg, "name", "") or "search")
+    archived = build_search_tool_archive_pointer(content, tool_name)
+    short = archived or (
+        f"[历史 {tool_name} 已归档] 原长 {len(content)} 字符；"
+        f"需要时重新调用 {tool_name} 或 read_file/grep_files 按需读取。"
+    )
+    return ToolMessage(
+        content=short,
+        tool_call_id=msg.tool_call_id,
+        name=getattr(msg, "name", None),
+    )
+
+
+def _mask_read_tool_message(msg: ToolMessage, content: str) -> ToolMessage:
+    archived = build_read_tool_archive_pointer(content)
+    short = archived or (
+        f"[历史 read 已归档] 原长 {len(content)} 字符；"
+        f"需要时用 read_file 或 grep_files 按需读取。"
+    )
+    return ToolMessage(
+        content=short,
+        tool_call_id=msg.tool_call_id,
+        name=getattr(msg, "name", None),
+    )
+
+
 def apply_spill_to_tools(tools: list[Any], spill: ContextSpill | None) -> list[Any]:
     """
     为 LangChain 工具包装 spill 逻辑。
@@ -346,20 +480,16 @@ def mask_tool_message_to_dispatch_pointer(msg: ToolMessage) -> ToolMessage:
             f"[历史工具输出已归档] 详见 {rel}；"
             f"需要时用 read_file 或 grep_files 读取。"
         )
+    elif _READ_PATH_HDR.search(content) or getattr(msg, "name", None) in _READ_TOOLS:
+        return _mask_read_tool_message(msg, content)
+    elif is_search_tool(str(getattr(msg, "name", "") or "")):
+        return _mask_search_tool_message(msg, content)
     else:
-        read_hdr = re.search(r"^---\s+(.+?)\s+\(行\s+\d+", content, re.MULTILINE)
-        if read_hdr:
-            rel = read_hdr.group(1).strip()
-            short = (
-                f"[历史 read 已归档] 源文件 `{rel}`（原长 {len(content)} 字符）；"
-                f"需要时用 read_file(path, start_line, end_line) 按行读取，或 grep_files 搜关键字。"
-            )
-        else:
-            tool_name = getattr(msg, "name", None) or "tool"
-            short = (
-                f"[历史 {tool_name} 已归档] 原长 {len(content)} 字符；"
-                f"需要时重新调用该工具或 read_file/grep_files 按需读取。"
-            )
+        tool_name = getattr(msg, "name", None) or "tool"
+        short = (
+            f"[历史 {tool_name} 已归档] 原长 {len(content)} 字符；"
+            f"需要时重新调用该工具或 read_file/grep_files 按需读取。"
+        )
     return ToolMessage(
         content=short,
         tool_call_id=msg.tool_call_id,
@@ -384,7 +514,11 @@ def mask_tool_message_content(
     content = msg.content if isinstance(msg.content, str) else str(msg.content)
     if len(content) <= max_chars:
         return msg
-    if "[历史工具输出已归档]" in content or "[历史工具输出已省略" in content:
+    if (
+        "[历史工具输出已归档]" in content
+        or "[历史工具输出已省略" in content
+        or "[历史 read 已归档]" in content
+    ):
         return msg
     if "[工具结果已落盘" in content:
         return msg
@@ -396,49 +530,20 @@ def mask_tool_message_content(
             f"[历史工具输出已归档] 详见 {rel}；"
             f"需要时用 read_file 或 grep_files 读取。"
         )
+    elif _READ_PATH_HDR.search(content) or getattr(msg, "name", None) in _READ_TOOLS:
+        return _mask_read_tool_message(msg, content)
+    elif is_search_tool(str(getattr(msg, "name", "") or "")):
+        return _mask_search_tool_message(msg, content)
     else:
-        read_hdr = re.search(r"^---\s+(.+?)\s+\(行\s+\d+", content, re.MULTILINE)
-        if read_hdr:
-            rel = read_hdr.group(1).strip()
-            short = (
-                f"[历史 read 已归档] 源文件 `{rel}`（原长 {len(content)} 字符）；"
-                f"需要时用 read_file(path, start_line, end_line) 按行读取，或 grep_files 搜关键字。"
-            )
-        else:
-            short = (
-                f"[历史工具输出已省略，原长 {len(content)} 字符] "
-                f"详见 manifest archive_path 或重新执行工具。"
-            )
+        short = (
+            f"[历史工具输出已省略，原长 {len(content)} 字符] "
+            f"详见 manifest archive_path 或重新执行工具。"
+        )
     return ToolMessage(
         content=short,
         tool_call_id=msg.tool_call_id,
         name=getattr(msg, "name", None),
     )
-
-
-def compact_tool_messages_for_compress(
-    messages: list[BaseMessage],
-    workspace: Path,
-    *,
-    max_chars: int,
-) -> list[BaseMessage]:
-    """
-    压缩前将超长 ToolMessage 替换为简短指针（无全文时仅截断说明）。
-
-    @param messages 消息列表
-    @param workspace 工作区根
-    @param max_chars 超过此长度则压缩 tool 内容
-    @return 新消息列表
-    """
-    new_messages: list[BaseMessage] = []
-    for msg in messages:
-        if not isinstance(msg, ToolMessage):
-            new_messages.append(msg)
-            continue
-        new_messages.append(
-            mask_tool_message_content(msg, workspace, max_chars=max_chars)
-        )
-    return new_messages
 
 
 def format_spill_stats(

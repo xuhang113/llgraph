@@ -69,6 +69,8 @@ def create_gateway_llm(workspace: Path | None = None) -> ChatAnthropic:
     }
     if thinking_payload is not None:
         llm_kwargs["thinking"] = thinking_payload
+    # 单次模型 HTTP 超时，避免网关无响应时 Web 会话永久占锁
+    llm_kwargs["timeout"] = float(llm_cfg.request_timeout_sec)
     llm = ChatAnthropic(**llm_kwargs)
     # 供 gateway reasoning 注入读取 agent.json dispatch profile
     object.__setattr__(llm, "llgraph_workspace", ws)

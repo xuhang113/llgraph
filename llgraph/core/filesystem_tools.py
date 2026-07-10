@@ -149,8 +149,10 @@ def _format_empty_grep_message(
     return (
         f"未找到匹配内容: pattern={pattern!r} path={path!r}。\n"
         f"{scope}\n"
+        "若 pattern 是业务概念而非代码符号，请一次 OR 合并实现 API/配置项/注释关键词，"
+        "或改用 search_code_parallel(query=行为描述)。\n"
         f"{tail}\n"
-        "禁止同 path 重复 grep；须换更宽的 path 或换工具。"
+        "禁止同 path 重复 grep；须换词表或换工具。"
     )
 
 

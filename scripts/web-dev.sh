@@ -35,7 +35,13 @@ EOF
 }
 
 ensure_env() {
-  bash "$ROOT/scripts/setup.sh" web -q
+  # 仅首次或显式强制时同步依赖；profile=dev 保留 index/mcp 等 Web Console 所需能力
+  if [[ ! -x "$ROOT/.venv/bin/llgraph" ]] || [[ "${LLGRAPH_FORCE_SETUP:-}" == "1" ]]; then
+    bash "$ROOT/scripts/setup.sh" dev -q
+  fi
+  # shellcheck source=lib/web-ui-npm.sh
+  source "$ROOT/scripts/lib/web-ui-npm.sh"
+  web_ui_ensure_npm "$ROOT"
   resolve_llgraph_cmd
   mkdir -p "$RUN_DIR"
 }
@@ -151,11 +157,15 @@ cmd_start() {
   if $dev_mode; then
     ensure_port_free "$API_PORT"
     ensure_port_free "$VITE_PORT"
-    nohup "${LLGRAPH_CMD[@]}" web --host "$API_HOST" --port "$API_PORT" >>"$API_LOG" 2>&1 &
+    export LLGRAPH_WEB_NO_STATIC=1
+    nohup env LLGRAPH_WEB_NO_STATIC=1 \
+      "${LLGRAPH_CMD[@]}" web --host "$API_HOST" --port "$API_PORT" >>"$API_LOG" 2>&1 &
     echo $! >"$API_PID_FILE"
     nohup npm --prefix web-ui run dev -- --host 127.0.0.1 --port "$VITE_PORT" >>"$VITE_LOG" 2>&1 &
     echo $! >"$VITE_PID_FILE"
-    echo "UI: http://127.0.0.1:$VITE_PORT  API: http://$API_HOST:$API_PORT"
+    echo "开发 UI（热更新）: http://127.0.0.1:$VITE_PORT"
+    echo "API 后端:          http://$API_HOST:$API_PORT"
+    echo "改 web-ui 无需 npm run build；请勿用 8765 打开页面"
     return
   fi
 
@@ -186,13 +196,20 @@ wait_api() {
 cmd_dev() {
   ensure_env
   ensure_port_free "$API_PORT"
+  export LLGRAPH_WEB_NO_STATIC=1
   "${LLGRAPH_CMD[@]}" web --host "$API_HOST" --port "$API_PORT" &
   local api_pid=$!
   echo $api_pid >"$API_PID_FILE"
   trap 'kill "$api_pid" 2>/dev/null || true; rm -f "$API_PID_FILE"' EXIT INT TERM
-  echo "API: http://$API_HOST:$API_PORT"
+  echo ""
+  echo "=============================================="
+  echo "  开发 UI（Vite 热更新）: http://127.0.0.1:$VITE_PORT"
+  echo "  API 后端:              http://$API_HOST:$API_PORT"
+  echo "  改 web-ui 源码会自动刷新，无需 npm run build"
+  echo "  请勿用 8765 打开页面（该端口仅提供 API）"
+  echo "=============================================="
+  echo ""
   wait_api
-  echo "UI:  http://127.0.0.1:$VITE_PORT"
   (cd web-ui && npm run dev -- --host 127.0.0.1 --port "$VITE_PORT")
 }
 

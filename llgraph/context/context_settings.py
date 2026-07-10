@@ -18,9 +18,8 @@ class ContextSettings:
     keep_recent_token_ratio: float
     compress_model: str | None
     session_archive_on_compress: bool
-    compress_retrieval_enabled: bool
-    compress_retrieval_top_k: int
     compress_tool_mask_max_chars: int
+    read_tool_mask_max_chars: int
     tool_result_max_chars: int
     tool_result_preview_lines: int
     spill_dir: str
@@ -50,7 +49,9 @@ class ContextSettings:
     dispatch_dedupe_read_paths: bool
     dispatch_min_tool_rounds: int
     grep_context_lines: int
+    grep_max_inline_chars: int
     spill_hit_context_lines: int
+    tool_prune_token_ratio: float
 
 
 def is_auto_compress_strategy(strategy: str) -> bool:
@@ -106,12 +107,12 @@ CONTEXT_CONFIG_DOCS: dict[str, str] = {
     "auto_compress_ratio": "自动触发压缩的上下文占用比例阈值（auto 默认 0.85，legacy 默认 0.65）。",
     "keep_recent_turns": "legacy 策略压缩后至少保留的 user 轮数下限。",
     "incremental_tool_prune": "是否将较早 ToolMessage 超长输出替换为指针（默认 true）。",
-    "keep_recent_tool_messages": "incremental_tool_prune 落盘会话时保留全文 ToolMessage 条数（auto 默认 4）。",
+    "keep_recent_tool_messages": "incremental_tool_prune 落盘会话时保留全文 ToolMessage 条数（auto 默认 6）。",
     "dispatch_tool_chain_compress": (
         "发往模型前是否压缩 tool 链：较早 ToolMessage 替换为指针，仅最近 N 条保留全文（默认 true）。"
     ),
     "dispatch_keep_full_tool_messages": (
-        "dispatch_tool_chain_compress 时出站保留全文的 ToolMessage 条数（默认 2）。"
+        "dispatch_tool_chain_compress 时出站保留全文的 ToolMessage 条数（auto 默认 6）。"
     ),
     "spill_exempt_tools": "不参与落盘的工具名；默认空（read_file/read_files 超长也会落盘+指针）。",
     "tool_result_max_chars": "grep/shell 等工具 spill 阈值（auto 默认 12000）。",
@@ -127,13 +128,27 @@ CONTEXT_CONFIG_DOCS: dict[str, str] = {
         "read_file/read_files 单次返回最大行数（auto 默认 6000，通用推荐区间 4000~8000 的中位）；"
         "超出截断并提示继续 read。"
     ),
-    "tool_result_preview_head_lines": "read 落盘时除尾部外保留的开头预览行数（auto 默认 25，含 package/import）。",
+    "tool_result_preview_head_lines": "read 落盘/归档时保留的开头预览行数（auto 默认 25，含 package/import）。",
+    "tool_result_preview_lines": "read 落盘/归档时保留的末尾预览行数（auto 默认 40）。",
+    "compress_tool_mask_max_chars": "incremental_tool_prune 时非 read 工具超过此长度则替换为指针（auto 默认 6000）。",
+    "read_tool_mask_max_chars": (
+        "read_file/read_files 在 incremental 与出站归档前的保留全文阈值（auto 默认 12000）；"
+        "超过后压缩为带 head/tail 预览的指针，避免仅一行路径导致误判。"
+    ),
     "dispatch_dedupe_read_paths": "出站时同路径旧 read 替换为短指针，仅保留最新一次全文（auto 默认 true）。",
     "dispatch_min_tool_rounds": (
         "单 user 长 ReAct 时，出站至少保留的 tool 段数；超 token 预算后裁剪更早段（auto 默认 12）。"
     ),
     "grep_context_lines": "grep_files / ripgrep 每条命中上下附加上下文行数（auto 默认 5）。",
+    "grep_max_inline_chars": (
+        "grep/search 类工具结果内联字符上限（auto 默认 48000）；"
+        "检索工具不落盘，超长时保留命中块预览并内联截断。"
+    ),
     "spill_hit_context_lines": "read 落盘时，对历史 grep/parallel 命中行在源文件 ±N 行嵌入预览（auto 默认 100）。",
+    "tool_prune_token_ratio": (
+        "历史 ToolMessage mask 起始比例（相对 LLM 压缩阈值，auto 默认 0.7）；"
+        "低于该比例时不 mask 历史 tool，仅对超大单次结果 spill。"
+    ),
 }
 
 
@@ -202,6 +217,7 @@ class SpillSettings:
     tool_result_preview_head_lines: int
     spill_dir: str
     spill_exempt_tools: tuple[str, ...]
+    grep_max_inline_chars: int
     spill_hit_context_lines: int
 
 
@@ -358,27 +374,25 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
 
     spill_exempt_tools = _parse_spill_exempt_tools(ctx)
 
-    retrieval_on = ctx.get("compress_retrieval_enabled", True)
-    if isinstance(retrieval_on, str):
-        retrieval_on = retrieval_on.strip().lower() not in ("0", "false", "no")
-
-    retrieval_top_k = ctx.get("compress_retrieval_top_k", 5)
-    try:
-        retrieval_top_k = max(1, min(15, int(retrieval_top_k)))
-    except (TypeError, ValueError):
-        retrieval_top_k = 5
-
-    mask_chars = ctx.get("compress_tool_mask_max_chars", 2000)
+    default_mask_chars = 6000 if is_auto_compress_strategy(compress_strategy) else 2000
+    mask_chars = ctx.get("compress_tool_mask_max_chars", default_mask_chars)
     try:
         mask_chars = max(200, min(max_tool_chars, int(mask_chars)))
     except (TypeError, ValueError):
-        mask_chars = 2000
+        mask_chars = default_mask_chars
+
+    default_read_mask = 12_000 if is_auto_compress_strategy(compress_strategy) else max(mask_chars, 8000)
+    read_mask_raw = ctx.get("read_tool_mask_max_chars", default_read_mask)
+    try:
+        read_tool_mask_max_chars = max(mask_chars, int(read_mask_raw))
+    except (TypeError, ValueError):
+        read_tool_mask_max_chars = default_read_mask
 
     incremental_prune = ctx.get("incremental_tool_prune", True)
     if isinstance(incremental_prune, str):
         incremental_prune = incremental_prune.strip().lower() not in ("0", "false", "no")
 
-    default_keep_tools = 4 if is_auto_compress_strategy(compress_strategy) else 12
+    default_keep_tools = 6 if is_auto_compress_strategy(compress_strategy) else 12
     keep_tools = ctx.get("keep_recent_tool_messages", default_keep_tools)
     try:
         keep_tools = max(2, int(keep_tools))
@@ -393,7 +407,7 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
             "no",
         )
 
-    default_dispatch_keep_tools = 4 if is_auto_compress_strategy(compress_strategy) else 2
+    default_dispatch_keep_tools = 6 if is_auto_compress_strategy(compress_strategy) else 2
     dispatch_keep_tools = ctx.get("dispatch_keep_full_tool_messages", default_dispatch_keep_tools)
     try:
         dispatch_keep_tools = max(1, int(dispatch_keep_tools))
@@ -424,6 +438,18 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         spill_hit_context_lines = max(0, min(300, int(spill_hit_raw)))
     except (TypeError, ValueError):
         spill_hit_context_lines = 100
+
+    grep_inline_raw = ctx.get("grep_max_inline_chars", 48_000)
+    try:
+        grep_max_inline_chars = max(8_000, min(200_000, int(grep_inline_raw)))
+    except (TypeError, ValueError):
+        grep_max_inline_chars = 48_000
+
+    tool_prune_ratio_raw = ctx.get("tool_prune_token_ratio", 0.7)
+    try:
+        tool_prune_token_ratio = min(0.95, max(0.0, float(tool_prune_ratio_raw)))
+    except (TypeError, ValueError):
+        tool_prune_token_ratio = 0.7
 
     trigger_cap: int | None = None
     trigger_raw = ctx.get("compress_trigger_max_tokens")
@@ -489,9 +515,8 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         keep_recent_token_ratio=keep_token_ratio,
         compress_model=compress_model,
         session_archive_on_compress=bool(archive),
-        compress_retrieval_enabled=bool(retrieval_on),
-        compress_retrieval_top_k=retrieval_top_k,
         compress_tool_mask_max_chars=mask_chars,
+        read_tool_mask_max_chars=read_tool_mask_max_chars,
         tool_result_max_chars=max_tool_chars,
         read_tool_result_max_chars=read_max_chars,
         read_file_max_bytes=read_file_max_bytes,
@@ -521,7 +546,9 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         dispatch_dedupe_read_paths=dispatch_dedupe_read_paths,
         dispatch_min_tool_rounds=dispatch_min_tool_rounds,
         grep_context_lines=grep_context_lines,
+        grep_max_inline_chars=grep_max_inline_chars,
         spill_hit_context_lines=spill_hit_context_lines,
+        tool_prune_token_ratio=tool_prune_token_ratio,
     )
 
 
@@ -541,5 +568,6 @@ def resolve_spill_settings(workspace: Path) -> SpillSettings:
         tool_result_preview_head_lines=ctx.tool_result_preview_head_lines,
         spill_dir=ctx.spill_dir,
         spill_exempt_tools=ctx.spill_exempt_tools,
+        grep_max_inline_chars=ctx.grep_max_inline_chars,
         spill_hit_context_lines=ctx.spill_hit_context_lines,
     )

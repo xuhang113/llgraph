@@ -5,6 +5,7 @@ from __future__ import annotations
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from llgraph.context.chat_history_repair import ai_message_has_tool_calls
+from llgraph.context.conversation_anchor import is_pinned_session_context_message
 
 
 def _segment_messages(messages: list[BaseMessage]) -> list[list[BaseMessage]]:
@@ -68,14 +69,18 @@ def split_messages_for_compress(
 
     for seg in reversed(segments):
         seg_tokens = estimate_tokens(seg)
-        has_user = any(isinstance(m, HumanMessage) for m in seg)
+        has_user = any(
+            isinstance(m, HumanMessage) and not is_pinned_session_context_message(m) for m in seg
+        )
         if kept_segments:
             if tokens_used + seg_tokens > token_budget and user_turns >= min_user_turns:
                 break
         kept_segments.insert(0, seg)
         tokens_used += seg_tokens
         if has_user:
-            user_turns += sum(1 for m in seg if isinstance(m, HumanMessage))
+            user_turns += sum(
+                1 for m in seg if isinstance(m, HumanMessage) and not is_pinned_session_context_message(m)
+            )
 
     if not kept_segments:
         return list(messages), []

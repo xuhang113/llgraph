@@ -15,12 +15,14 @@ import {
   mergeChatWithPendingUserMessages,
   parseAgentHistoryMessages,
   mergeRunningSessionMessages,
+  enrichChatWithTraceReplies,
   userMessageAlreadyInChat,
 } from '../utils/messageText';
 import { buildPlanChatMessages } from '../utils/planChat';
 import { planPlannerSubThread, planPlannerVersion } from '../utils/planPlannerTrace';
 import type { TraceLine } from '../pages/console/types';
 import { planExecutionAllowWrite } from '../pages/console/planHelpers';
+import { readStoredAllowWrite, readStoredSandboxEnabled } from '../pages/console/storage';
 import {
   loadTraceTurnsFromRemote,
   panelLinesFromTexts,
@@ -120,18 +122,38 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
 
       try {
       if (node.kind === 'agent') {
-        let sessionAllowWrite = false;
-        try {
-          const sessionInfo = await api.sessionMeta(slug, node.thread_id);
-          sessionAllowWrite = Boolean(sessionInfo.allow_write);
-        } catch {
-          /* 无 meta 时默认只读 */
-        }
+        const sessionAllowWrite = readStoredAllowWrite();
         if (!isCurrent()) {
           return;
         }
         setAllowWrite(sessionAllowWrite);
-        api.capabilities(slug, sessionAllowWrite).then(setCaps).catch(() => setCaps(null));
+        if (sessionAllowWrite) {
+          void api.setWriteMode(slug, true, node.thread_id).catch(() => {});
+        }
+        void api
+          .capabilities(slug, sessionAllowWrite)
+          .then(async (capsData) => {
+            if (!isCurrent()) {
+              return;
+            }
+            setCaps(capsData);
+            if (
+              readStoredSandboxEnabled() &&
+              capsData.sandbox &&
+              !capsData.sandbox.enabled &&
+              capsData.sandbox.cli_override !== false
+            ) {
+              try {
+                const res = await api.setSandbox(slug, true, node.thread_id, sessionAllowWrite);
+                if (isCurrent() && res.sandbox) {
+                  setCaps((prev) => (prev ? { ...prev, sandbox: res.sandbox } : prev));
+                }
+              } catch {
+                /* 沙箱后端不可用时保持未勾选 */
+              }
+            }
+          })
+          .catch(() => setCaps(null));
 
         let data: { messages: MessageItem[] };
         try {
@@ -183,13 +205,34 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
           clearPendingUserMessage(slug, node.thread_id);
           releaseTurnOpen(node.thread_id, turnOpenRef.current);
         }
+        if (panelLines.length === 0 && panelSteps.length === 0) {
+          const cached = loadTracePanelCache(slug, node.thread_id);
+          if (cached) {
+            panelLines = panelLinesFromTexts(cached.log_lines);
+            panelSteps = cached.steps;
+          } else {
+            const fromChat = restorePanelTraceFromMessages(parsed);
+            panelLines = fromChat.lines;
+            panelSteps = fromChat.steps;
+          }
+        }
+        let traceTurnsForEnrich = panelTurns;
+        let traceStepsForEnrich = panelSteps;
+        if (traceTurnsForEnrich.length === 0 && traceStepsForEnrich.length > 0) {
+          traceTurnsForEnrich = parseTraceTurnsFromRemote(undefined, traceStepsForEnrich);
+          traceStepsForEnrich = [];
+        }
         const chatMerged = dedupeUserMessages(
           dedupeConsecutiveUserMessages(
-            mergeChatWithPendingUserMessages(parsed, {
-              traceLines: sessionRunning ? panelLines.map((l) => l.text) : [],
-              pendingText: pendingUser,
-              allowTraceUser: sessionRunning,
-            }),
+            enrichChatWithTraceReplies(
+              mergeChatWithPendingUserMessages(parsed, {
+                traceLines: sessionRunning ? panelLines.map((l) => l.text) : [],
+                pendingText: pendingUser,
+                allowTraceUser: sessionRunning,
+              }),
+              traceStepsForEnrich,
+              traceTurnsForEnrich,
+            ),
           ),
         );
         if (pendingUser && userMessageAlreadyInChat(chatMerged, pendingUser)) {
@@ -217,17 +260,6 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
           setSessionChatCache(slug, node.thread_id, chatMerged);
         }
         bumpContextRefresh();
-        if (panelLines.length === 0 && panelSteps.length === 0) {
-          const cached = loadTracePanelCache(slug, node.thread_id);
-          if (cached) {
-            panelLines = panelLinesFromTexts(cached.log_lines);
-            panelSteps = cached.steps;
-          } else {
-            const fromChat = restorePanelTraceFromMessages(parsed);
-            panelLines = fromChat.lines;
-            panelSteps = fromChat.steps;
-          }
-        }
         if (panelTurns.length === 0 && panelSteps.length > 0) {
           panelTurns = parseTraceTurnsFromRemote(undefined, panelSteps);
           panelSteps = [];

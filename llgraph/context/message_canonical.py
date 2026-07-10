@@ -4,7 +4,7 @@
 落盘目标（对齐多厂商最小公约）：
 - OpenAI Chat Completions：assistant.tool_calls 后紧跟 role=tool，id 对齐；允许 1 AI + 多 Tool。
 - Anthropic Messages：tool_use 与 tool_result 之间不得插入其它消息；tool_result 在 user 消息中（由 LangChain 转换）。
-- 存储层：仅保留 LangGraph 原生 Human/AI/Tool + 置顶 System（manifest/anchor/archive），业务区不含 System。
+- 存储层：仅 LangGraph 原生 Human/AI/Tool；manifest/anchor 为 Human 上下文消息，位于末条 user 前；不含 SystemMessage。
 
 参考：
 - https://docs.anthropic.com/en/api/messages
@@ -20,11 +20,10 @@ from typing import Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from llgraph.context.conversation_anchor import is_conversation_anchor_message
-from llgraph.context.message_normalize import _message_text
+from llgraph.context.message_normalize import _message_text, migrate_legacy_pinned_message, reorder_pinned_session_messages
 from llgraph.session.session_manifest import is_session_manifest_message
 
 CANONICAL_FORMAT_VERSION = 2
-_SESSION_ARCHIVE_TAG = "<session-system-archive>"
 _LLGRAPH_META_KEY = "llgraph"
 
 
@@ -33,7 +32,7 @@ class CanonicalV2Report:
     """canonical v2 转换报告。"""
 
     flattened_ai_messages: int = 0
-    archived_system_messages: int = 0
+    dropped_system_messages: int = 0
     removed_orphan_tools: int = 0
     normalized_ai_messages: int = 0
     patched_tool_results: int = 0
@@ -42,23 +41,11 @@ class CanonicalV2Report:
     def changed(self) -> bool:
         return (
             self.flattened_ai_messages > 0
-            or self.archived_system_messages > 0
+            or self.dropped_system_messages > 0
             or self.removed_orphan_tools > 0
             or self.normalized_ai_messages > 0
             or self.patched_tool_results > 0
         )
-
-
-def is_session_archive_message(msg: BaseMessage) -> bool:
-    """
-    是否为合并后的中段 system 归档消息。
-
-    @param msg LangChain 消息
-    @return 是否归档 system
-    """
-    if not isinstance(msg, SystemMessage):
-        return False
-    return _SESSION_ARCHIVE_TAG in _message_text(getattr(msg, "content", ""))
 
 
 def _extract_thinking_for_meta(msg: AIMessage) -> str:
@@ -149,26 +136,11 @@ def _flatten_ai_for_storage(msg: AIMessage) -> tuple[AIMessage, bool]:
     return msg.model_copy(update={"content": merged_text, "additional_kwargs": extra}), True
 
 
-def _build_archive_system(parts: list[str]) -> SystemMessage | None:
-    """
-    合并多条中段 system 为单条归档消息。
-
-    @param parts 正文片段
-    @return SystemMessage 或 None
-    """
-    merged = "\n\n---\n\n".join(p for p in parts if p.strip()).strip()
-    if not merged:
-        return None
-    return SystemMessage(
-        content=f"{_SESSION_ARCHIVE_TAG}\n\n{merged}",
-    )
-
-
 def to_canonical_v2_messages(
     messages: list[BaseMessage],
 ) -> tuple[list[BaseMessage], CanonicalV2Report]:
     """
-    转为 canonical v2：置顶 system + 无中段 system + 纯文本 AI + 合法 tool 链。
+    转为 canonical v2：无 SystemMessage + 纯文本 AI + 合法 tool 链。
 
     @param messages 原始消息
     @return (canonical 消息列表, 报告)
@@ -188,29 +160,19 @@ def to_canonical_v2_messages(
     report.normalized_ai_messages = repair_report.normalized_ai_messages
     report.patched_tool_results = repair_report.patched_tool_results
 
-    manifest: SystemMessage | None = None
-    anchor: SystemMessage | None = None
-    archive_parts: list[str] = []
+    manifest: BaseMessage | None = None
+    anchor: BaseMessage | None = None
     conversation: list[BaseMessage] = []
 
     for msg in safe:
+        if is_session_manifest_message(msg):
+            manifest = migrate_legacy_pinned_message(msg)
+            continue
+        if is_conversation_anchor_message(msg):
+            anchor = migrate_legacy_pinned_message(msg)
+            continue
         if isinstance(msg, SystemMessage):
-            if is_session_manifest_message(msg):
-                manifest = msg
-                continue
-            if is_conversation_anchor_message(msg):
-                anchor = msg
-                continue
-            if is_session_archive_message(msg):
-                text = _message_text(getattr(msg, "content", "")).strip()
-                if text:
-                    archive_parts.append(text)
-                report.archived_system_messages += 1
-                continue
-            text = _message_text(getattr(msg, "content", "")).strip()
-            if text:
-                archive_parts.append(text)
-                report.archived_system_messages += 1
+            report.dropped_system_messages += 1
             continue
 
         if isinstance(msg, AIMessage):
@@ -222,15 +184,14 @@ def to_canonical_v2_messages(
 
         conversation.append(msg)
 
-    ordered: list[BaseMessage] = []
+    ordered: list[BaseMessage] = list(conversation)
+    pinned_tail: list[BaseMessage] = []
     if manifest is not None:
-        ordered.append(manifest)
+        pinned_tail.append(manifest)
     if anchor is not None:
-        ordered.append(anchor)
-    archive_msg = _build_archive_system(archive_parts)
-    if archive_msg is not None:
-        ordered.append(archive_msg)
-    ordered.extend(conversation)
+        pinned_tail.append(anchor)
+    if pinned_tail:
+        ordered = reorder_pinned_session_messages([*ordered, *pinned_tail])
     return ordered if ordered else messages, report
 
 
@@ -244,19 +205,10 @@ def validate_canonical_v2_invariants(messages: list[BaseMessage]) -> list[str]:
     from llgraph.context.chat_history_repair import ai_message_has_tool_calls
 
     issues: list[str] = []
-    seen_conversation = False
     for idx, msg in enumerate(messages):
         if isinstance(msg, SystemMessage):
-            if seen_conversation:
-                issues.append(f"index {idx}: 业务区出现 SystemMessage")
-            if (
-                not is_session_manifest_message(msg)
-                and not is_conversation_anchor_message(msg)
-                and not is_session_archive_message(msg)
-            ):
-                issues.append(f"index {idx}: 未标记的 SystemMessage")
+            issues.append(f"index {idx}: 落盘消息不得含 SystemMessage")
             continue
-        seen_conversation = True
         if isinstance(msg, ToolMessage):
             if idx == 0:
                 issues.append("index 0: 首条为 ToolMessage")

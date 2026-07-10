@@ -87,6 +87,11 @@
     "include_answer": true,
     "timeout_sec": 25
   },
+  "agent_pool": {
+    "pool_size": 5,
+    "warm_recent_limit": 3,
+    "warm_recent_days": 7
+  },
   "context": {
     "outbound_redact": {
       "enabled": true,

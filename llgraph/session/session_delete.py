@@ -199,6 +199,12 @@ def delete_session(workspace: Path, thread_id: str) -> SessionDeleteResult:
             removed_paths=tuple(removed_display),
             error="; ".join(errors),
         )
+    try:
+        from llgraph.core.agent_session_pool import invalidate_agent_session_thread
+
+        invalidate_agent_session_thread(workspace, tid)
+    except Exception:
+        pass
     return SessionDeleteResult(
         thread_id=tid,
         ok=True,

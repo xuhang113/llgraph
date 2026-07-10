@@ -23,9 +23,12 @@ export function parseTraceTurnsFromRemote(
                 kind: String(step.kind ?? ''),
                 title: String(step.title ?? ''),
                 elapsed: Number(step.elapsed ?? 0),
+                elapsed_kind: String(step.elapsed_kind ?? resolveElapsedKind(String(step.kind ?? ''))),
                 summary: String(step.summary ?? ''),
                 body_lines: Array.isArray(step.body_lines) ? step.body_lines.map(String) : [],
                 usage: (step.usage as StepUsage | null | undefined) ?? null,
+                invoke_timing:
+                  (step.invoke_timing as InvokeTiming | null | undefined) ?? null,
               }))
           : [];
         const turnIndex = Number(row.turn_index ?? index + 1);
@@ -48,16 +51,24 @@ export function parseTraceTurnsFromRemote(
 export function buildDisplayTraceTurns(
   completedTurns: TraceTurn[],
   currentSteps: TraceStep[],
-  opts: { busy: boolean; currentLabel?: string },
+  opts: { busy: boolean; currentLabel?: string; currentDurationSec?: number },
 ): TraceTurn[] {
   const completed = completedTurns.filter((turn) => !turn.live);
   if (currentSteps.length === 0) {
     return completed;
   }
   const turnIndex = completed.length + 1;
-  const label =
+  let label =
     opts.currentLabel ||
     (opts.busy ? `第 ${turnIndex} 轮 · 进行中` : `第 ${turnIndex} 轮`);
+  if (
+    !opts.busy &&
+    opts.currentDurationSec != null &&
+    Number.isFinite(opts.currentDurationSec) &&
+    opts.currentDurationSec > 0
+  ) {
+    label = `第 ${turnIndex} 轮 · ${formatTraceDuration(opts.currentDurationSec)}`;
+  }
   return [
     ...completed,
     {
@@ -78,6 +89,12 @@ export interface StepUsage {
   cache_reported?: boolean;
 }
 
+export interface InvokeTiming {
+  prepare_sec?: number;
+  http_sec?: number;
+  request_id?: string;
+}
+
 export interface TraceStep {
   step_id: number;
   kind: string;
@@ -86,6 +103,9 @@ export interface TraceStep {
   summary: string;
   body_lines?: string[];
   usage?: StepUsage | null;
+  invoke_timing?: InvokeTiming | null;
+  /** model=仅模型 / tool=工具等待 / preprocess=预处理 / wall=墙钟 */
+  elapsed_kind?: string;
 }
 
 export function formatTraceDuration(seconds: number): string {
@@ -93,6 +113,38 @@ export function formatTraceDuration(seconds: number): string {
     return `${Math.round(seconds * 1000)}ms`;
   }
   return `${seconds.toFixed(2)}s`;
+}
+
+export function formatStepElapsedLabel(step: TraceStep): string {
+  const kind = step.elapsed_kind ?? resolveElapsedKind(step.kind);
+  const prefix =
+    kind === 'model'
+      ? '仅模型'
+      : kind === 'tool'
+        ? '工具等待'
+        : kind === 'preprocess'
+          ? '预处理'
+          : '耗时';
+  return `${prefix} ${formatTraceDuration(step.elapsed)}`;
+}
+
+export function resolveElapsedKind(kind: string): string {
+  if (kind === 'plan' || kind === 'thinking' || kind === 'reply') {
+    return 'model';
+  }
+  if (kind === 'tool') {
+    return 'tool';
+  }
+  if (
+    kind === 'compress' ||
+    kind === 'tool_prune' ||
+    kind === 'preprocess' ||
+    kind === 'search_params' ||
+    kind === 'tools'
+  ) {
+    return 'preprocess';
+  }
+  return 'wall';
 }
 
 export function formatTokenAmount(tokens: number): string {
@@ -130,6 +182,26 @@ export function formatStepUsage(usage?: StepUsage | null): string {
   return parts.join(' · ');
 }
 
+export function formatInvokeTiming(timing?: InvokeTiming | null): string {
+  if (!timing) {
+    return '';
+  }
+  const parts: string[] = [];
+  const prepare = timing.prepare_sec ?? 0;
+  const http = timing.http_sec ?? 0;
+  if (prepare > 0.001) {
+    parts.push(`prepare ${formatTraceDuration(prepare)}`);
+  }
+  if (http > 0.001) {
+    parts.push(`http ${formatTraceDuration(http)}`);
+  }
+  const req = (timing.request_id ?? '').trim();
+  if (req) {
+    parts.push(`req ${req}`);
+  }
+  return parts.join(' · ');
+}
+
 export function stepMarker(step: TraceStep): string {
   if (step.kind === 'thinking') {
     return '◎';
@@ -141,6 +213,9 @@ export function stepMarker(step: TraceStep): string {
     return '▶';
   }
   if (step.kind === 'preprocess' || step.kind === 'search_params') {
+    return '◇';
+  }
+  if (step.kind === 'tool_prune' || step.kind === 'compress') {
     return '◇';
   }
   if (step.kind === 'tool' || step.title.startsWith('执行')) {

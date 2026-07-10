@@ -299,7 +299,7 @@ def worker_node(state: dict[str, Any], ctx: PlanRuntimeContext) -> dict[str, Any
                     updates.append({"error": f"Worker {tid} 失败: {exc}"})
         merged = _merge_worker_updates(state, ctx, updates, batch=task_ids)
 
-    if state.get("step_confirm_each_task"):
-        interrupt({"type": "task_step_confirm", "task_id": task_ids[-1] if task_ids else None})
+    if state.get("step_confirm_each_task") and task_ids:
+        interrupt({"type": "task_step_confirm", "task_id": task_ids[-1]})
 
     return merged

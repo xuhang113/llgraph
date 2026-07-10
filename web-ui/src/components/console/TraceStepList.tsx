@@ -1,7 +1,8 @@
 import type { TraceStep } from '../../types/trace';
 import {
+  formatInvokeTiming,
+  formatStepElapsedLabel,
   formatStepUsage,
-  formatTraceDuration,
   stepMarker,
 } from '../../types/trace';
 
@@ -35,7 +36,8 @@ export default function TraceStepList({
         const lineLimit = expandBodies ? body.length : previewLines;
         const marker = stepMarker(step);
         const usageText = formatStepUsage(step.usage);
-        const summaryText = [step.summary, usageText].filter(Boolean).join('  ');
+        const timingText = formatInvokeTiming(step.invoke_timing);
+        const summaryText = [step.summary, usageText, timingText].filter(Boolean).join('  ');
 
         return (
           <details
@@ -51,7 +53,7 @@ export default function TraceStepList({
                 #{index + 1} {step.title}
               </span>
               <span className="cursor-trace-step-meta">
-                ({formatTraceDuration(step.elapsed)})
+                ({formatStepElapsedLabel(step)})
               </span>
               {summaryText && (
                 <span className="cursor-trace-step-summary-text">{summaryText}</span>

@@ -1,6 +1,8 @@
 import type { MessageItem } from '../api/client';
 import type { ChatImageAttachment } from '../types/chatImage';
 import type { ChatMessage } from '../components/console/ChatThread';
+import type { TraceStep, TraceTurn } from '../types/trace';
+import { extractReplyTextFromTraceStep } from '../pages/console/traceUtils';
 import { stripSurveyForDisplay } from './surveyDisplay';
 
 /**
@@ -264,13 +266,11 @@ export function stripInboundToolCallMarkup(text: string): string {
   return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-/** Web 聊天区助手正文：剥离 tool markup 与【规划】行。 */
+/** Web 聊天区助手正文：剥离 tool markup 与【规划】行。保留空行，避免 GFM 表格吞掉后续段落。 */
 export function formatAgentChatDisplayText(text: string): string {
   const cleaned = stripSurveyForDisplay(stripInboundToolCallMarkup(text || ''));
-  const lines = cleaned
-    .split('\n')
-    .filter((ln) => ln.trim() && !ln.trim().startsWith('【规划】'));
-  return lines.join('\n').trim();
+  const lines = cleaned.split('\n').filter((ln) => !ln.trim().startsWith('【规划】'));
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
 export function isInjectedSystemContent(text: string): boolean {
@@ -311,7 +311,197 @@ export function thinkNudgeDetailText(_raw?: string): string {
   );
 }
 
-/** 检索/排查过程中的中间笔记，不应作为最终助手答复展示。 */
+/** 与后端 TOOL_ASSISTANT_DISPATCH_TEXT 等对齐：出站/落盘占位，非用户可见答复。 */
+export const DISPATCH_PLACEHOLDER_TEXTS = [
+  '（调用工具中，无可见正文。）',
+  '（无用户可见正文，思考见 thinking 块。）',
+  '（历史思考过程未落盘，占位以满足 Kimi 等网关校验。）',
+] as const;
+
+export function isDispatchPlaceholderText(text: string): boolean {
+  const t = text.trim();
+  return DISPATCH_PLACEHOLDER_TEXTS.some((p) => t === p);
+}
+
+/** 用户消息比对：折叠空白，便于 trace 120 字预览与落盘全文对齐。 */
+export function normalizeUserMessageForMatch(text: string): string {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/(?:…|\.\.\.)+$/u, '');
+}
+
+export function userMessagesEquivalent(a: string, b: string): boolean {
+  const left = normalizeUserMessageForMatch(a);
+  const right = normalizeUserMessageForMatch(b);
+  if (!left || !right) {
+    return false;
+  }
+  if (left === right) {
+    return true;
+  }
+  const headLen = 120;
+  const leftHead = left.slice(0, headLen);
+  const rightHead = right.slice(0, headLen);
+  return (
+    left.startsWith(rightHead)
+    || right.startsWith(leftHead)
+    || leftHead.startsWith(rightHead)
+    || rightHead.startsWith(leftHead)
+  );
+}
+
+/** trace reply 可能拼接多段 dispatch 占位符前缀，剥离后再参与去重。 */
+export function stripLeadingDispatchPlaceholders(text: string): string {
+  let t = text.trim();
+  let changed = true;
+  while (changed && t) {
+    changed = false;
+    for (const placeholder of DISPATCH_PLACEHOLDER_TEXTS) {
+      if (t.startsWith(placeholder)) {
+        t = t.slice(placeholder.length).trim();
+        changed = true;
+      }
+    }
+  }
+  return t;
+}
+
+/** trace reply 正文前缀：占位符或「继续读取…」类过渡句，非用户可见答复。 */
+const ASSISTANT_REPLY_PREFIX_RE =
+  /^(?:（无用户可见正文[^）]*）|（调用工具中，无可见正文。）|（历史思考过程未落盘[^）]*）)+/u;
+
+function normalizeAssistantReplyForMatch(text: string): string {
+  return stripLeadingDispatchPlaceholders(formatAgentChatDisplayText(text))
+    .replace(ASSISTANT_REPLY_PREFIX_RE, '')
+    .trim();
+}
+
+export function assistantReplyTextsMatch(existing: string, candidate: string): boolean {
+  const left = normalizeAssistantReplyForMatch(existing);
+  const right = normalizeAssistantReplyForMatch(candidate);
+  if (!left || !right) {
+    return false;
+  }
+  if (left === right) {
+    return true;
+  }
+  const shorter = left.length <= right.length ? left : right;
+  const longer = left.length <= right.length ? right : left;
+  if (shorter.length < 48) {
+    return false;
+  }
+  return longer.startsWith(shorter) || longer.includes(shorter);
+}
+
+/** 从 messages.jsonl raw 读取 llgraph.turn_reply_text（结构化轮末正文）。 */
+export function extractLlgraphTurnReplyText(raw?: Record<string, unknown>): string {
+  if (!raw) {
+    return '';
+  }
+  const data = (raw.data ?? raw) as Record<string, unknown>;
+  if (!data || typeof data !== 'object') {
+    return '';
+  }
+  const kwargs = data.additional_kwargs as Record<string, unknown> | undefined;
+  if (!kwargs || typeof kwargs !== 'object') {
+    return '';
+  }
+  const llgraph = kwargs.llgraph as Record<string, unknown> | undefined;
+  if (!llgraph || typeof llgraph !== 'object') {
+    return '';
+  }
+  const reply = llgraph.turn_reply_text;
+  return typeof reply === 'string' ? reply.trim() : '';
+}
+
+function resolveAssistantVisibleText(
+  m: MessageItem,
+  display: string,
+): string {
+  const turnReply = extractLlgraphTurnReplyText(m.raw);
+  let visible = formatAgentChatDisplayText(display);
+  if (isDispatchPlaceholderText(visible) && turnReply) {
+    visible = formatAgentChatDisplayText(turnReply);
+  }
+  if (isDispatchPlaceholderText(visible)) {
+    return '';
+  }
+  return visible;
+}
+
+/** turn_done / 历史重载：若解析结果缺最终答复，用 SSE 或 trace 兜底。 */
+export function appendAssistantReplyIfMissing(chat: ChatMessage[], text: string): ChatMessage[] {
+  const normalized = normalizeAssistantReplyForMatch(text);
+  if (!normalized || isDispatchPlaceholderText(normalized)) {
+    return chat;
+  }
+  for (let i = chat.length - 1; i >= 0; i -= 1) {
+    const msg = chat[i];
+    if (msg.role === 'assistant' && assistantReplyTextsMatch(msg.text, normalized)) {
+      return chat;
+    }
+    if (msg.role === 'user') {
+      break;
+    }
+  }
+  return [...chat, { id: `done-${Date.now()}`, role: 'assistant', text: normalized }];
+}
+
+export function reconcileHistoryAfterTurnDone(
+  parsed: ChatMessage[],
+  fallbackReply: string,
+): ChatMessage[] {
+  const merged = dedupeConsecutiveUserMessages(parsed);
+  const normalizedFallback = normalizeAssistantReplyForMatch(fallbackReply);
+  if (!normalizedFallback || isDispatchPlaceholderText(normalizedFallback)) {
+    return merged;
+  }
+  const hasMatchingAssistant = merged.some(
+    (m) => m.role === 'assistant' && assistantReplyTextsMatch(m.text, normalizedFallback),
+  );
+  if (hasMatchingAssistant) {
+    return merged;
+  }
+  return appendAssistantReplyIfMissing(merged, normalizedFallback);
+}
+
+/** 从 trace reply 步骤补全聊天区缺失的助手正文。 */
+export function enrichChatWithTraceReplies(
+  chat: ChatMessage[],
+  steps: TraceStep[],
+  turns?: TraceTurn[],
+): ChatMessage[] {
+  const replies: string[] = [];
+  const collect = (step: TraceStep) => {
+    if (step.kind !== 'reply') {
+      return;
+    }
+    const text = normalizeAssistantReplyForMatch(extractReplyTextFromTraceStep(step));
+    if (text && !isDispatchPlaceholderText(text)) {
+      replies.push(text);
+    }
+  };
+  if (turns && turns.length > 0) {
+    for (const turn of turns) {
+      for (const step of turn.steps) {
+        collect(step);
+      }
+    }
+  } else {
+    for (const step of steps) {
+      collect(step);
+    }
+  }
+  let result = chat;
+  for (const reply of replies) {
+    result = appendAssistantReplyIfMissing(result, reply);
+  }
+  return result;
+}
+
+/** @deprecated 仅保留导出兼容；展示分类改按 user 轮次 + tool_calls 结构判定。 */
 export function isInterimInvestigationText(text: string): boolean {
   const t = formatAgentChatDisplayText(text).trim();
   if (!t || t.length < 48) {
@@ -343,10 +533,66 @@ export function isInterimInvestigationText(text: string): boolean {
   return score >= 3;
 }
 
+/** 是否为真实用户轮次起点（排除 manifest/anchor/注入块/think_nudge）。 */
+function isRealUserTurnBoundary(m: MessageItem): boolean {
+  const type = String(m.type || '').toLowerCase();
+  if (!type.includes('human') && type !== 'user') {
+    return false;
+  }
+  const msgKind = String((m as { kind?: string }).kind || '').toLowerCase();
+  const display = resolveHistoryDisplayText(
+    m.content,
+    m.display_text,
+    m.raw,
+    m.tool_calls,
+  );
+  if (msgKind === 'think_nudge' || isThinkContinueNudge(display)) {
+    return false;
+  }
+  const cleaned = stripInjectedContext(display);
+  const images = resolveHistoryImages(m.content, (m as { images?: ChatImageAttachment[] }).images);
+  if ((!cleaned && images.length === 0) || (cleaned && isInjectedSystemContent(cleaned))) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * 每个 user 轮内最后一条 AI 消息索引（结构化「本轮正文」锚点）。
+ * 对齐 ReAct：中间 AI（含 tool_calls 或其后仍有 AI）→ 思考；轮末无 tool_calls 的 AI → 助手回复。
+ */
+function computeLastAiIndexInEachTurn(messages: MessageItem[]): Set<number> {
+  const lastAiInTurn = new Set<number>();
+  const turnStarts: number[] = [];
+  for (let i = 0; i < messages.length; i += 1) {
+    if (isRealUserTurnBoundary(messages[i])) {
+      turnStarts.push(i);
+    }
+  }
+  if (turnStarts.length === 0) {
+    turnStarts.push(0);
+  }
+  for (let t = 0; t < turnStarts.length; t += 1) {
+    const start = turnStarts[t];
+    const end = t + 1 < turnStarts.length ? turnStarts[t + 1] : messages.length;
+    let lastAi = -1;
+    for (let i = start; i < end; i += 1) {
+      const rowType = String(messages[i].type || '').toLowerCase();
+      if (rowType.includes('ai') || rowType.includes('assistant')) {
+        lastAi = i;
+      }
+    }
+    if (lastAi >= 0) {
+      lastAiInTurn.add(lastAi);
+    }
+  }
+  return lastAiInTurn;
+}
+
 function assistantMessageRole(
   visible: string,
   hasTools: boolean,
-  afterThinkNudge: boolean,
+  isLastAiInTurn: boolean,
 ): 'assistant' | 'thinking' | null {
   if (!visible.trim()) {
     return null;
@@ -354,10 +600,7 @@ function assistantMessageRole(
   if (hasTools) {
     return 'thinking';
   }
-  if (afterThinkNudge && isInterimInvestigationText(visible)) {
-    return 'thinking';
-  }
-  if (isInterimInvestigationText(visible)) {
+  if (!isLastAiInTurn) {
     return 'thinking';
   }
   return 'assistant';
@@ -380,7 +623,7 @@ export function parseApiMessagesToChat(
   const chat: ChatMessage[] = [];
   const toolTraces: Array<{ id: string; text: string }> = [];
 
-  let afterThinkNudge = false;
+  const lastAiInTurn = computeLastAiIndexInEachTurn(messages);
 
   for (let i = 0; i < messages.length; i += 1) {
     const m = messages[i];
@@ -410,7 +653,6 @@ export function parseApiMessagesToChat(
           banner: 'nudge',
           text: thinkNudgeDetailText(display),
         });
-        afterThinkNudge = true;
         continue;
       }
       const cleaned = stripInjectedContext(display);
@@ -419,24 +661,25 @@ export function parseApiMessagesToChat(
         continue;
       }
       chat.push({ id: `${idPrefix}-${i}`, role: 'user', text: cleaned, images });
-      afterThinkNudge = false;
     } else if (type.includes('ai') || type.includes('assistant')) {
-      const visible = formatAgentChatDisplayText(display);
+      const visible = resolveAssistantVisibleText(m, display);
       const hasTools = Boolean(m.tool_calls && Array.isArray(m.tool_calls) && m.tool_calls.length > 0);
       const thinkingMeta = extractLlgraphThinkingText(m.raw);
-      const role = assistantMessageRole(visible, hasTools, afterThinkNudge);
+      const role = assistantMessageRole(visible, hasTools, lastAiInTurn.has(i));
       if (role === 'thinking') {
-        const thinkBody = thinkingMeta || visible;
-        if (thinkBody.trim()) {
-          chat.push({ id: `${idPrefix}-${i}`, role: 'thinking', text: thinkBody });
+        let thinkBody = thinkingMeta || visible;
+        if (isDispatchPlaceholderText(thinkBody)) {
+          thinkBody = thinkingMeta;
         }
-        afterThinkNudge = false;
+        if (!thinkBody.trim() || isDispatchPlaceholderText(thinkBody)) {
+          continue;
+        }
+        chat.push({ id: `${idPrefix}-${i}`, role: 'thinking', text: thinkBody });
         continue;
       }
-      if (role === 'assistant') {
+      if (role === 'assistant' && visible.trim()) {
         chat.push({ id: `${idPrefix}-${i}`, role: 'assistant', text: visible });
       }
-      afterThinkNudge = false;
     } else if (display.trim() && !isInjectedSystemContent(display)) {
       const visible = formatAgentChatDisplayText(display);
       if (visible.trim()) {
@@ -494,7 +737,7 @@ export function dedupeUserMessages(chat: ChatMessage[]): ChatMessage[] {
   }
   for (let i = 0; i < chat.length - 1; i += 1) {
     const m = chat[i];
-    if (m.role === 'user' && m.text.trim() === t) {
+    if (m.role === 'user' && userMessagesEquivalent(m.text, t)) {
       return chat.slice(0, -1);
     }
   }
@@ -520,15 +763,12 @@ export function userMessageAlreadyInChat(chat: ChatMessage[], candidate: string)
   if (!t) {
     return true;
   }
-  const matches = (u: string) =>
-    u === t || u.startsWith(t) || t.startsWith(u.slice(0, Math.min(u.length, 120)));
   for (let i = chat.length - 1; i >= 0; i -= 1) {
     const m = chat[i];
     if (m.role !== 'user') {
       continue;
     }
-    const u = m.text.trim();
-    if (matches(u)) {
+    if (userMessagesEquivalent(m.text, t)) {
       return true;
     }
   }
@@ -541,7 +781,7 @@ export function dedupeConsecutiveUserMessages(chat: ChatMessage[]): ChatMessage[
   for (const m of chat) {
     if (m.role === 'user' && out.length > 0) {
       const prev = out[out.length - 1];
-      if (prev.role === 'user' && prev.text.trim() === m.text.trim()) {
+      if (prev.role === 'user' && userMessagesEquivalent(prev.text, m.text)) {
         if ((m.images?.length ?? 0) > 0 && (prev.images?.length ?? 0) === 0) {
           out[out.length - 1] = { ...prev, images: m.images };
         }
@@ -564,18 +804,7 @@ export function preserveUserMessageImages(
   if (prevWithImages.length === 0) {
     return loaded;
   }
-  const textMatches = (a: string, b: string) => {
-    const left = a.trim();
-    const right = b.trim();
-    if (!left || !right) {
-      return false;
-    }
-    return (
-      left === right
-      || left.startsWith(right)
-      || right.startsWith(left.slice(0, Math.min(left.length, 120)))
-    );
-  };
+  const textMatches = (a: string, b: string) => userMessagesEquivalent(a, b);
   return loaded.map((m) => {
     if (m.role !== 'user' || (m.images?.length ?? 0) > 0) {
       return m;

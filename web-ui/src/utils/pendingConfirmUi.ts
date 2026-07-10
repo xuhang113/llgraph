@@ -6,6 +6,7 @@ import { buildPlanConfirmPayload } from '../pages/console/planHelpers';
 import { extractMessageContent } from './messageText';
 import {
   enqueueConfirm,
+  hasPendingKind,
   peekConfirmHead,
   peekConfirmQueue,
   type PendingConfirmItem,
@@ -150,16 +151,18 @@ export async function restorePendingConfirmsFromHistory(opts: {
   }
 
   if (peekConfirmQueue(slug, threadId).length === 0 && messages && messages.length > 0) {
-    const raw = lastAssistantRawText(messages);
-    if (raw.trim()) {
-      try {
-        const { survey } = await api.resolveSurvey(slug, raw);
-        if (survey) {
-          const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
-          ingestSurveyConfirm(slug, threadId, survey, lastAssistant?.id);
+    if (!hasPendingKind(slug, threadId, 'survey')) {
+      const raw = lastAssistantRawText(messages);
+      if (raw.trim()) {
+        try {
+          const { survey } = await api.resolveSurvey(slug, raw);
+          if (survey) {
+            const lastAssistant = [...messages].reverse().find((m) => m.role === 'assistant');
+            ingestSurveyConfirm(slug, threadId, survey, lastAssistant?.id);
+          }
+        } catch {
+          /* resolve 失败则跳过 */
         }
-      } catch {
-        /* resolve 失败则跳过 */
       }
     }
   }

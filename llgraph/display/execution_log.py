@@ -192,7 +192,7 @@ def extract_usage_from_messages(messages: list[Any]) -> dict[str, Any]:
 def _compress_payload(report: CompressReport | None) -> dict[str, Any] | None:
     if report is None:
         return None
-    return {
+    payload: dict[str, Any] = {
         "ran": True,
         "before_count": report.before_count,
         "after_count": report.after_count,
@@ -202,6 +202,13 @@ def _compress_payload(report: CompressReport | None) -> dict[str, Any] | None:
         "archive_path": report.archive_path,
         "anchor_path": report.anchor_path,
     }
+    if report.elapsed_sec > 0:
+        payload["elapsed_sec"] = round(report.elapsed_sec, 3)
+    if report.llm_sec > 0:
+        payload["llm_sec"] = round(report.llm_sec, 3)
+    if report.trigger:
+        payload["trigger"] = report.trigger
+    return payload
 
 
 def _spill_payload(
@@ -243,6 +250,18 @@ def log_compress_event(
             "compress": _compress_payload(report),
         },
     )
+
+
+def log_react_phase_event(workspace: Path, record: dict[str, Any]) -> None:
+    """
+    将 react_phase 同步写入 execution.jsonl（若启用）。
+
+    @param workspace 工作区根
+    @param record run_log 同款字段
+    """
+    if not resolve_execution_log_enabled(workspace):
+        return
+    append_execution_event(workspace, dict(record))
 
 
 def log_index_event(

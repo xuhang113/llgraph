@@ -12,6 +12,10 @@ from langchain_core.messages import BaseMessage, ToolMessage
 from llgraph.context.context_compressor import estimate_tokens
 from llgraph.context.context_settings import ContextSettings, is_auto_compress_strategy, resolve_context_settings
 from llgraph.context.context_spill import mask_tool_message_content
+from llgraph.context.tool_prune_pressure import (
+    compute_tool_prune_pressure,
+    effective_tool_keep_count,
+)
 from llgraph.context.read_segment_dedupe import (
     extract_read_segments,
     format_superseded_read_pointer,
@@ -54,6 +58,8 @@ class ToolPruneReport:
     before_tokens: int
     after_tokens: int
     pruned_count: int
+    elapsed_sec: float = 0.0
+    trigger: str = "invoke"
 
     @property
     def saved_tokens(self) -> int:
@@ -95,10 +101,18 @@ def prune_stale_tool_messages(
     if not settings.incremental_tool_prune:
         return messages, 0
 
-    keep = settings.keep_recent_tool_messages
-    mask_chars = settings.compress_tool_mask_max_chars
     tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
     if not tool_indices:
+        return messages, 0
+
+    pressure = compute_tool_prune_pressure(messages, settings)
+    keep = effective_tool_keep_count(
+        len(tool_indices),
+        settings,
+        pressure,
+        min_keep=settings.keep_recent_tool_messages,
+    )
+    if keep >= len(tool_indices):
         return messages, 0
 
     keep_indices = set(tool_indices[-keep:]) if keep > 0 else set()
@@ -108,6 +122,12 @@ def prune_stale_tool_messages(
         if not isinstance(msg, ToolMessage) or idx in keep_indices:
             new_messages.append(msg)
             continue
+        tool_name = str(getattr(msg, "name", "") or "")
+        mask_chars = (
+            settings.read_tool_mask_max_chars
+            if tool_name in _READ_TOOL_NAMES
+            else settings.compress_tool_mask_max_chars
+        )
         masked = mask_tool_message_content(msg, workspace, max_chars=mask_chars)
         if masked.content != msg.content:
             pruned += 1
@@ -120,6 +140,8 @@ def apply_incremental_tool_prune_to_agent_state(
     *,
     thread_id: str,
     workspace: Path,
+    trigger: str = "invoke",
+    persist: bool | None = None,
 ) -> ToolPruneReport | None:
     """
     从 agent 状态读取消息、裁剪历史 tool 输出并写回。
@@ -127,6 +149,8 @@ def apply_incremental_tool_prune_to_agent_state(
     @param agent LangGraph agent
     @param thread_id 线程 ID
     @param workspace 工作区根
+    @param trigger invoke | react（react 默认仅写 checkpoint，避免步间全量 jsonl 阻塞）
+    @param persist 是否落盘 messages.jsonl；None 时 react 为 False、invoke 为 True
     @return 裁剪报告；无变化或未启用时返回 None
     """
     settings = resolve_context_settings(workspace)
@@ -148,19 +172,66 @@ def apply_incremental_tool_prune_to_agent_state(
         return None
 
     after_tokens = estimate_tokens(new_messages)
+    write_disk = persist if persist is not None else trigger != "react"
     try:
         agent.update_state(config, {"messages": new_messages})
-        from llgraph.session.session_file_store import save_session_messages
+        if write_disk:
+            from llgraph.session.session_file_store import save_agent_session_messages
 
-        save_session_messages(workspace, thread_id, new_messages)
-    except Exception:
+            save_agent_session_messages(workspace, thread_id, new_messages, sync_pool=True)
+    except Exception as exc:
+        from llgraph.session.session_run_log import log_react_phase
+
+        log_react_phase(
+            workspace,
+            thread_id,
+            phase="tool_prune_persist_error",
+            detail={"pruned_count": pruned_count, "trigger": trigger},
+            error=exc,
+        )
         return None
 
     return ToolPruneReport(
         before_tokens=before_tokens,
         after_tokens=after_tokens,
         pruned_count=pruned_count,
+        trigger=trigger,
     )
+
+
+def maybe_prune_tools_during_react(
+    agent: Any,
+    *,
+    thread_id: str,
+    workspace: Path,
+) -> ToolPruneReport | None:
+    """
+    ReAct 每步 tools 节点结束后：将较早 ToolMessage 掩码写回 checkpoint。
+
+    与 dispatch 出站裁剪互补：落盘会话不再只增不减，细节靠 search_session_history 等检索。
+
+    @param agent LangGraph agent
+    @param thread_id 线程 ID
+    @param workspace 工作区根
+    @return 裁剪报告；无变化或未启用时返回 None
+    """
+    import time
+
+    settings = resolve_context_settings(workspace)
+    if not settings.incremental_tool_prune:
+        return None
+
+    started = time.perf_counter()
+    report = apply_incremental_tool_prune_to_agent_state(
+        agent,
+        thread_id=thread_id,
+        workspace=workspace,
+        trigger="react",
+    )
+    if report is None:
+        return None
+    report.elapsed_sec = time.perf_counter() - started
+    return report
 
 
 def prune_tool_messages_for_dispatch(
@@ -181,13 +252,22 @@ def prune_tool_messages_for_dispatch(
     if not settings.dispatch_tool_chain_compress:
         return messages
 
-    keep = settings.dispatch_keep_full_tool_messages
-    mask_chars = settings.compress_tool_mask_max_chars
     tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
-    if not tool_indices or len(tool_indices) <= keep:
+    if not tool_indices:
         return messages
 
-    keep_indices = set(tool_indices[-keep:])
+    pressure = compute_tool_prune_pressure(messages, settings)
+    keep = effective_tool_keep_count(
+        len(tool_indices),
+        settings,
+        pressure,
+        min_keep=settings.dispatch_keep_full_tool_messages,
+    )
+    if keep >= len(tool_indices):
+        return messages
+
+    mask_chars = settings.compress_tool_mask_max_chars
+    keep_indices = set(tool_indices[-keep:]) if keep > 0 else set()
     new_messages: list[BaseMessage] = []
     for idx, msg in enumerate(messages):
         if not isinstance(msg, ToolMessage) or idx in keep_indices:

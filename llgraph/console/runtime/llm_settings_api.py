@@ -27,6 +27,18 @@ def build_llm_settings_payload(workspace: Path) -> dict[str, Any]:
     model_ids, models_source = list_available_models(workspace)
     catalog_by_id = {e.model_id: e for e in catalog}
 
+    def _supports_thinking(mid: str) -> bool:
+        entry = catalog_by_id.get(mid)
+        if entry is not None:
+            from llgraph.core.model_thinking import _parse_thinking_raw, _USE_DEFAULT
+
+            parsed = _parse_thinking_raw(getattr(entry, "thinking", None))
+            if parsed is None:
+                return False
+            if parsed is not _USE_DEFAULT:
+                return True
+        return model_supports_thinking(workspace, mid)
+
     models: list[dict[str, Any]] = []
     for mid in model_ids:
         entry = catalog_by_id.get(mid)
@@ -35,12 +47,12 @@ def build_llm_settings_payload(workspace: Path) -> dict[str, Any]:
                 "id": mid,
                 "hint": entry.hint if entry else "",
                 "rate": entry.rate if entry else None,
-                "supports_thinking": model_supports_thinking(workspace, mid),
+                "supports_thinking": _supports_thinking(mid),
                 "current": mid == current,
             }
         )
 
-    supports = model_supports_thinking(workspace, current)
+    supports = _supports_thinking(current) if current else model_supports_thinking(workspace, current)
     runtime_model = get_runtime_model()
     runtime_thinking = get_runtime_thinking()
 

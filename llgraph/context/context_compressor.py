@@ -1,8 +1,9 @@
-"""对话上下文压缩（P3）：Tier1 切分 + Tier2 锚点 + Tier3 检索。"""
+"""对话上下文压缩：Tier1 切分 + Tier2 锚点摘要。"""
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,16 +12,15 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from llgraph.context.context_message_split import split_messages_for_compress_strategy
 from llgraph.context.context_settings import is_auto_compress_strategy, resolve_context_settings
-from llgraph.context.context_spill import compact_tool_messages_for_compress
 from llgraph.context.conversation_anchor import (
-    build_conversation_anchor_system_message,
+    build_conversation_anchor_message,
     is_conversation_anchor_message,
     is_conversation_summary_message,
     load_session_from_manifest,
     run_anchor_update,
 )
 from llgraph.session.session_manifest import (
-    build_session_manifest_system_message,
+    build_session_manifest_message,
     is_session_manifest_message,
 )
 
@@ -35,6 +35,10 @@ class CompressReport:
     after_tokens: int
     archive_path: str | None = None
     anchor_path: str | None = None
+    elapsed_sec: float = 0.0
+    llm_sec: float = 0.0
+    trigger: str = "auto"
+    skipped_reason: str | None = None
 
     @property
     def saved_ratio(self) -> float:
@@ -87,6 +91,23 @@ def estimate_tokens(messages: list[Any]) -> int:
         if tool_calls:
             total += len(str(tool_calls))
     return max(1, total // 3)
+
+
+# 待压缩段低于此估算 token 时不调 LLM 摘要（避免 68K→63K 反复压、收益极低）
+_MIN_COMPRESS_SPAN_TOKENS = 20_000
+# 刚压完后的 token 回升在此比例内不再触发（防抖）
+_COMPRESS_RETRIGGER_RATIO = 1.05
+
+
+def _anchor_recently_updated(workspace: Path, thread_id: str) -> bool:
+    """@return 锚点文件是否存在（本会话曾成功压缩过）"""
+    from llgraph.session.session_manifest import conversation_anchor_json_path
+
+    return conversation_anchor_json_path(workspace, thread_id).is_file()
+
+
+def _compress_span_too_small(to_compress: list[BaseMessage]) -> bool:
+    return estimate_tokens(to_compress) < _MIN_COMPRESS_SPAN_TOKENS
 
 
 def _message_to_dict(msg: BaseMessage) -> dict[str, Any]:
@@ -161,7 +182,13 @@ class ContextCompressor:
 
         tokens = estimate_tokens(messages)
         threshold = resolve_auto_compress_threshold(self.settings)
-        return tokens >= threshold
+        if tokens < threshold:
+            return False
+        if _anchor_recently_updated(self.workspace, self.session_id):
+            # 防抖：刚压完略有回升时不立刻再压
+            if tokens < int(threshold * _COMPRESS_RETRIGGER_RATIO):
+                return False
+        return True
 
     def compress(
         self,
@@ -169,15 +196,17 @@ class ContextCompressor:
         *,
         force: bool = False,
         preserve_current_turn: bool | None = None,
+        trigger: str = "auto",
     ) -> tuple[list[BaseMessage], CompressReport | None]:
         """
-        压缩消息列表（Tier1~3）。
+        压缩消息列表（Tier1 + Tier2）。
 
         @param messages 原始消息
         @param force 强制压缩（忽略阈值）
         @param preserve_current_turn cursor 策略：True 保留当前 user 轮；False 换窗仅 manifest+anchor；None 按策略默认
         @return (新消息列表, 报告)；无需压缩时返回原列表与 None
         """
+        wall_start = time.perf_counter()
         before_tokens = estimate_tokens(messages)
         if not force and not self.should_auto_compress(messages):
             return messages, None
@@ -205,12 +234,8 @@ class ContextCompressor:
         if not to_compress:
             return messages, None
 
-        # Tier1：待压缩段内超长 tool 输出掩码
-        to_compress = compact_tool_messages_for_compress(
-            to_compress,
-            self.workspace,
-            max_chars=self.settings.compress_tool_mask_max_chars,
-        )
+        if not force and _compress_span_too_small(to_compress):
+            return messages, None
 
         archive_path = None
         if self.settings.session_archive_on_compress:
@@ -219,6 +244,7 @@ class ContextCompressor:
             )
 
         spill_dir = self.settings.spill_dir
+        llm_start = time.perf_counter()
         merged_sections, anchor_saved = run_anchor_update(
             self.workspace,
             self.session_id,
@@ -226,11 +252,10 @@ class ContextCompressor:
             archive_path=archive_path,
             spill_dir=spill_dir,
             compress_model=self.settings.compress_model,
-            retrieval_enabled=self.settings.compress_retrieval_enabled,
-            retrieval_top_k=self.settings.compress_retrieval_top_k,
             summary_chunk_chars=self.settings.compress_summary_chunk_chars,
         )
-        anchor_msg = build_conversation_anchor_system_message(
+        llm_sec = time.perf_counter() - llm_start
+        anchor_msg = build_conversation_anchor_message(
             self.workspace,
             self.session_id,
             merged_sections,
@@ -238,7 +263,7 @@ class ContextCompressor:
 
         session = load_session_from_manifest(self.workspace, self.session_id)
         if pinned_manifest is None:
-            pinned_manifest = build_session_manifest_system_message(
+            pinned_manifest = build_session_manifest_message(
                 self.workspace,
                 self.session_id,
                 session,
@@ -248,11 +273,11 @@ class ContextCompressor:
                 anchor_path=anchor_saved or None,
             )
 
-        new_messages: list[BaseMessage] = [
-            pinned_manifest,
-            anchor_msg,
-            *to_keep,
-        ]
+        from llgraph.context.message_normalize import reorder_pinned_session_messages
+
+        new_messages = reorder_pinned_session_messages(
+            [*to_keep, pinned_manifest, anchor_msg]
+        )
         after_tokens = estimate_tokens(new_messages)
         report = CompressReport(
             before_count=len(messages),
@@ -261,6 +286,9 @@ class ContextCompressor:
             after_tokens=after_tokens,
             archive_path=archive_path,
             anchor_path=anchor_saved,
+            elapsed_sec=time.perf_counter() - wall_start,
+            llm_sec=llm_sec,
+            trigger=trigger,
         )
         return new_messages, report
 
@@ -272,6 +300,7 @@ def apply_compress_to_agent_state(
     workspace: Path,
     force: bool = False,
     preserve_current_turn: bool | None = None,
+    trigger: str = "auto",
 ) -> CompressReport | None:
     """
     从 agent 状态读取、压缩并写回 messages.jsonl。
@@ -286,7 +315,16 @@ def apply_compress_to_agent_state(
     config = {"configurable": {"thread_id": thread_id}}
     try:
         state = agent.get_state(config)
-    except Exception:
+    except Exception as exc:
+        from llgraph.session.session_run_log import log_react_phase
+
+        log_react_phase(
+            workspace,
+            thread_id,
+            phase="compress_get_state_error",
+            detail={"trigger": trigger},
+            error=exc,
+        )
         return None
     messages = list((state.values or {}).get("messages") or [])
     if not messages:
@@ -300,14 +338,30 @@ def apply_compress_to_agent_state(
         messages,
         force=force,
         preserve_current_turn=preserve_current_turn,
+        trigger=trigger,
     )
     if report is None:
         return None
 
-    agent.update_state(config, {"messages": new_messages})
-    from llgraph.session.session_file_store import save_session_messages
+    from llgraph.session.session_run_log import log_react_phase
 
-    save_session_messages(workspace, thread_id, new_messages)
+    log_react_phase(
+        workspace,
+        thread_id,
+        phase="compress_applied",
+        detail={
+            "trigger": trigger,
+            "tokens_before": report.before_tokens,
+            "tokens_after": report.after_tokens,
+            "llm_sec": round(report.llm_sec, 3),
+            "elapsed_sec": round(report.elapsed_sec, 3),
+        },
+    )
+
+    agent.update_state(config, {"messages": new_messages})
+    from llgraph.session.session_file_store import save_agent_session_messages
+
+    save_agent_session_messages(workspace, thread_id, new_messages, sync_pool=True)
 
     from llgraph.session.session_manifest import sync_session_manifest_after_compress
 
@@ -346,6 +400,7 @@ def maybe_compress_during_react(
         workspace=workspace,
         force=False,
         preserve_current_turn=True,
+        trigger="react",
     )
 
 
@@ -361,8 +416,20 @@ def format_compress_report(report: CompressReport) -> str:
         f"已压缩: 消息 {report.before_count}→{report.after_count}, "
         f"估算 token {report.before_tokens}→{report.after_tokens}（约释放 {pct}%）"
     )
+    if report.elapsed_sec > 0:
+        msg += f"\n耗时: {_format_compress_duration(report.elapsed_sec)}"
+        if report.llm_sec > 0:
+            msg += f"（LLM 摘要 {_format_compress_duration(report.llm_sec)}）"
+    if report.trigger:
+        msg += f"\n触发: {report.trigger}"
     if report.archive_path:
         msg += f"\n归档: {report.archive_path}"
     if report.anchor_path:
         msg += f"\n锚点: {report.anchor_path}"
     return msg
+
+
+def _format_compress_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    return f"{seconds:.2f}s"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Annotated, Any
@@ -24,6 +25,7 @@ from langgraph.types import Checkpointer
 from typing_extensions import NotRequired, TypedDict
 
 from llgraph.adapters.inbound import normalize_ai_response
+from llgraph.core.agent_invoke_timing import AgentInvokeTiming, attach_invoke_timing
 from llgraph.core.agent_turn import (
     FALLBACK_INCOMPLETE_TURN,
     THINK_CONTINUE_NUDGE,
@@ -31,6 +33,11 @@ from llgraph.core.agent_turn import (
     think_continue_nudge_pending,
 )
 from llgraph.context.message_canonical import persist_ai_thinking_in_message
+from llgraph.core.react_invoke import (
+    _raise_if_cancelled,
+    ainvoke_agent_runnable_cancellable,
+    invoke_agent_runnable_cancellable,
+)
 
 
 class ReactAgentState(TypedDict):
@@ -141,6 +148,7 @@ def build_react_graph(
         ):
             bound_model = apply_prompt_cache_to_llm(bound_model, ws)
     agent_runnable = _prompt_runnable(prompt) | bound_model
+    prompt_runnable = _prompt_runnable(prompt)
 
     def _normalize_response(response: AIMessage) -> AIMessage:
         from llgraph.core.llm_settings import resolve_effective_model
@@ -148,12 +156,31 @@ def build_react_graph(
         model_id = resolve_effective_model(ws)
         return normalize_ai_response(response, ws, model_id)
 
+    def _run_agent_llm(state: ReactAgentState, config: RunnableConfig) -> AIMessage:
+        timing = AgentInvokeTiming()
+        _raise_if_cancelled()
+        prep_start = time.perf_counter()
+        prepared_messages = prompt_runnable.invoke(state, config)
+        timing.prepare_sec = time.perf_counter() - prep_start
+        if isinstance(prepared_messages, dict):
+            prepared_messages = prepared_messages.get("messages") or []
+        if not isinstance(prepared_messages, list):
+            prepared_messages = list(prepared_messages or [])
+        response = invoke_agent_runnable_cancellable(
+            bound_model,
+            prepared_messages,
+            config,
+            timing=timing,
+        )
+        norm_start = time.perf_counter()
+        normalized = _normalize_response(response)
+        timing.normalize_sec = time.perf_counter() - norm_start
+        return attach_invoke_timing(normalized, timing)
+
     def call_agent(state: ReactAgentState, config: RunnableConfig) -> dict[str, Any]:
         messages = list(state.get("messages") or [])
         _validate_chat_history(messages)
-        response = agent_runnable.invoke(state, config)
-        if not isinstance(response, AIMessage):
-            response = AIMessage(content=str(response))
+        response = _run_agent_llm(state, config)
 
         if _needs_step_limit_message(state, response):
             return {
@@ -165,15 +192,13 @@ def build_react_graph(
                 ]
             }
 
-        repaired = persist_ai_thinking_in_message(_normalize_response(response))[0]
+        repaired = persist_ai_thinking_in_message(response)[0]
         return {"messages": [repaired]}
 
     async def acall_agent(state: ReactAgentState, config: RunnableConfig) -> dict[str, Any]:
         messages = list(state.get("messages") or [])
         _validate_chat_history(messages)
-        response = await agent_runnable.ainvoke(state, config)
-        if not isinstance(response, AIMessage):
-            response = AIMessage(content=str(response))
+        response = await ainvoke_agent_runnable_cancellable(agent_runnable, state, config)
 
         if _needs_step_limit_message(state, response):
             return {
@@ -185,7 +210,10 @@ def build_react_graph(
                 ]
             }
 
-        repaired = persist_ai_thinking_in_message(_normalize_response(response))[0]
+        norm_start = time.perf_counter()
+        normalized = _normalize_response(response)
+        timing = AgentInvokeTiming(normalize_sec=time.perf_counter() - norm_start)
+        repaired = persist_ai_thinking_in_message(attach_invoke_timing(normalized, timing))[0]
         return {"messages": [repaired]}
 
     def think_nudge(state: ReactAgentState) -> dict[str, Any]:

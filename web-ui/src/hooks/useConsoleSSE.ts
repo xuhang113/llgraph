@@ -13,7 +13,9 @@ import {
   saveTracePanelCache,
 } from '../utils/tracePanelStore';
 import {
-  dedupeConsecutiveUserMessages,
+  appendAssistantReplyIfMissing,
+  reconcileHistoryAfterTurnDone,
+  enrichChatWithTraceReplies,
   extractMessageContent,
   formatAgentChatDisplayText,
   parseAgentHistoryMessages,
@@ -30,6 +32,7 @@ import {
   panelLinesFromTexts,
   parseTraceStep,
   parseTraceSteps,
+  extractReplyTextFromTraceStep,
   releaseTurnOpen,
   traceLineSeenInCurrentTurn,
 } from '../pages/console/traceUtils';
@@ -103,7 +106,6 @@ export type ConsoleSSEDeps = {
   panelTraceTurnsRef: MutableRefObject<import('../types/trace').TraceTurn[]>;
   traceLinesRef: MutableRefObject<TraceLine[]>;
   traceStepsRef: MutableRefObject<TraceStep[]>;
-  confirmAutoShownRef: MutableRefObject<string | null>;
   surveyDismissedRef: MutableRefObject<string | null>;
   taskStepDismissedRef: MutableRefObject<string | null>;
   traceTurnStartRef: MutableRefObject<number>;
@@ -112,6 +114,7 @@ export type ConsoleSSEDeps = {
   setBusy: Dispatch<SetStateAction<boolean>>;
   setThinkingText: Dispatch<SetStateAction<string>>;
   setTraceActivitySec: Dispatch<SetStateAction<number>>;
+  setCurrentTurnDurationSec: Dispatch<SetStateAction<number | null>>;
   setTraceLines: Dispatch<SetStateAction<TraceLine[]>>;
   setTraceSteps: Dispatch<SetStateAction<TraceStep[]>>;
   setPanelTraceLines: Dispatch<SetStateAction<TraceLine[]>>;
@@ -147,7 +150,6 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
     panelTraceTurnsRef,
     traceLinesRef,
     traceStepsRef,
-    confirmAutoShownRef,
     surveyDismissedRef,
     taskStepDismissedRef,
     traceTurnStartRef,
@@ -155,6 +157,7 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
     setBusy,
     setThinkingText,
     setTraceActivitySec,
+    setCurrentTurnDurationSec,
     setTraceLines,
     setTraceSteps,
     setPanelTraceLines,
@@ -382,7 +385,6 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
             workerPlanThread,
           );
           ingestPlanConfirmPayload(slug, planThread, payload);
-          confirmAutoShownRef.current = null;
           maybeApplyPending(planThread);
         } else if (payload?.type === 'task_step_confirm') {
           const planThread = resolvePlanThreadForEvent(
@@ -435,6 +437,7 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       setThinkingText('');
       traceTurnStartRef.current = Date.now();
       setTraceActivitySec(0);
+      setCurrentTurnDurationSec(null);
       if (claimTurnStart(eventThread, turnOpenRef.current)) {
         const turnNum = panelTraceTurnsRef.current.length + 1;
         pushCompletedTraceTurn(
@@ -502,7 +505,9 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       streamedRef.current = true;
       setStreamText((s) => s + String(event.text || ''));
     } else if (type === 'stream_end') {
-      setStreamText('');
+      if (!streamedRef.current) {
+        setStreamText('');
+      }
     } else if (type === 'trace_step') {
       const raw = event.step as Record<string, unknown> | undefined;
       if (raw) {
@@ -526,6 +531,18 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
         }
         if (slug && tracePanelThread) {
           appendTracePanelCacheStep(slug, tracePanelThread, step);
+        }
+        if (agentView && step.kind === 'reply') {
+          const replyPreview = formatAgentChatDisplayText(extractReplyTextFromTraceStep(step));
+          if (replyPreview.trim()) {
+            if (streamedRef.current) {
+              setMessages((prev) => appendAssistantReplyIfMissing(prev, replyPreview));
+              setStreamText('');
+            } else {
+              streamedRef.current = true;
+              setStreamText(replyPreview);
+            }
+          }
         }
       }
     } else if (type === 'turn_done' || type === 'survey') {
@@ -561,41 +578,46 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       }
       finalizeLiveTrace(tracePanelThread);
       releaseTurnOpen(eventThread, turnOpenRef.current);
+      const durationSec = Number(event.duration_sec);
+      if (Number.isFinite(durationSec) && durationSec > 0) {
+        setCurrentTurnDurationSec(durationSec);
+      }
+      runningThreadsRef.current.delete(eventThread);
+      streamAbortRef.current.delete(eventThread);
+      streamLastEventAtRef.current.delete(eventThread);
       const fallbackReply = formatAgentChatDisplayText(extractMessageContent(event.text));
       if (agentView) {
         setBusy(false);
-        setStreamText('');
         setThinkingText('');
         setTraceActivitySec(0);
+        if (fallbackReply.trim()) {
+          setMessages((prev) => appendAssistantReplyIfMissing(prev, fallbackReply));
+        }
         if (slug && sel?.kind === 'agent' && sel.thread_id === eventThread) {
           void api
             .messages(slug, eventThread)
             .then((data) => {
-              const parsed = dedupeConsecutiveUserMessages(
-                parseAgentHistoryMessages(data.messages || []),
+              const traceSteps = parseTraceSteps(event.trace_steps);
+              const parsed = enrichChatWithTraceReplies(
+                reconcileHistoryAfterTurnDone(
+                  parseAgentHistoryMessages(data.messages || []),
+                  fallbackReply,
+                ),
+                traceSteps,
               );
               setMessages(parsed);
+              setStreamText('');
             })
             .catch(() => {
-              if (fallbackReply.trim()) {
-                setMessages((prev) => [
-                  ...prev,
-                  { id: `done-${Date.now()}`, role: 'assistant', text: fallbackReply },
-                ]);
-              }
+              setStreamText('');
             });
-        } else if (fallbackReply.trim()) {
-          setMessages((prev) => [
-            ...prev,
-            { id: `done-${Date.now()}`, role: 'assistant', text: fallbackReply },
-          ]);
+        } else {
+          setStreamText('');
         }
       } else {
+        setStreamText('');
         if (fallbackReply.trim()) {
-          setMessages((prev) => [
-            ...prev,
-            { id: `done-${Date.now()}`, role: 'assistant', text: fallbackReply },
-          ]);
+          setMessages((prev) => appendAssistantReplyIfMissing(prev, fallbackReply));
         }
       }
       streamedRef.current = false;
@@ -719,7 +741,13 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       }
     } else if (type === 'end') {
       finalizeLiveTrace(tracePanelThread);
-      setBusy(false);
+      runningThreadsRef.current.delete(eventThread);
+      streamAbortRef.current.delete(eventThread);
+      streamLastEventAtRef.current.delete(eventThread);
+      // Plan busy 以 plan_job / detail.job.running 为准；仅 agent 的 end 清 busy
+      if (agentView && sel?.thread_id === eventThread) {
+        setBusy(false);
+      }
       setTraceActivitySec(0);
       traceTurnStartRef.current = 0;
       streamedRef.current = false;

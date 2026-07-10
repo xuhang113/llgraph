@@ -2,6 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import type { TreeNode, Workspace } from '../../api/client';
 import type { StoredWorkspaceMeta } from '../../utils/workspaceStorage';
 import { resolveSessionFullTitle } from '../../utils/sessionTitleEdit';
+import {
+  groupSessionsByDate,
+  SESSION_DATE_BUCKET_LABELS,
+  type SessionDateBucket,
+} from '../../pages/console/sidebarUtils';
 
 interface Props {
   slug: string;
@@ -270,6 +275,7 @@ function SessionGroup({
   const allSelected =
     nodes.length > 0 && nodes.every((n) => selectedSessionIds.has(n.thread_id));
   const selectedInGroup = nodes.filter((n) => selectedSessionIds.has(n.thread_id)).length;
+  const dateGroups = groupSessionsByDate(nodes);
 
   return (
     <details className="cursor-session-group" open>
@@ -304,10 +310,11 @@ function SessionGroup({
           {loading ? `正在加载 ${title} 会话…` : `暂无 ${title} 会话`}
         </div>
       ) : (
-        nodes.map((n) => (
-          <SessionRow
-            key={n.thread_id}
-            node={n}
+        dateGroups.map(({ bucket, nodes: bucketNodes }) => (
+          <SessionDateBucket
+            key={`${groupKind}-${bucket}`}
+            bucket={bucket}
+            nodes={bucketNodes}
             selectedId={selectedId}
             multiSelectMode={multiSelectMode}
             selectedSessionIds={selectedSessionIds}
@@ -319,6 +326,47 @@ function SessionGroup({
         ))
       )}
     </details>
+  );
+}
+
+function SessionDateBucket({
+  bucket,
+  nodes,
+  selectedId,
+  multiSelectMode,
+  selectedSessionIds,
+  onSelect,
+  onDelete,
+  onRename,
+  onToggleSessionSelect,
+}: {
+  bucket: SessionDateBucket;
+  nodes: TreeNode[];
+  selectedId: string | null;
+  multiSelectMode: boolean;
+  selectedSessionIds: ReadonlySet<string>;
+  onSelect: (node: TreeNode) => void;
+  onDelete: (node: TreeNode) => void;
+  onRename: (node: TreeNode, title: string) => Promise<void>;
+  onToggleSessionSelect: (threadId: string) => void;
+}) {
+  return (
+    <div className="cursor-session-date-bucket">
+      <div className="cursor-session-date-label">{SESSION_DATE_BUCKET_LABELS[bucket]}</div>
+      {nodes.map((n) => (
+        <SessionRow
+          key={n.thread_id}
+          node={n}
+          selectedId={selectedId}
+          multiSelectMode={multiSelectMode}
+          selectedSessionIds={selectedSessionIds}
+          onSelect={onSelect}
+          onDelete={onDelete}
+          onRename={onRename}
+          onToggleSessionSelect={onToggleSessionSelect}
+        />
+      ))}
+    </div>
   );
 }
 
