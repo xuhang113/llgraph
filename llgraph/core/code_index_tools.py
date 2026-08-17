@@ -72,6 +72,18 @@ def create_code_index_tools(workspace_root: Path) -> list:
         prior = get_tool_execution_messages()
         if count_tool_results_since_user(prior, "search_code_parallel") >= 1:
             return _DUPLICATE_PARALLEL_MSG
+        from llgraph.context.investigate_harness import (
+            last_real_user_text,
+            parallel_blocked_for_literals_message,
+            resolve_investigate_harness_settings,
+            user_has_directed_search_literals,
+        )
+
+        settings = resolve_investigate_harness_settings(root)
+        if settings.guard_parallel_when_literals:
+            user_text = last_real_user_text(prior)
+            if user_has_directed_search_literals(user_text):
+                return parallel_blocked_for_literals_message(user_text)
         return search_parallel(
             root,
             query,

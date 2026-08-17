@@ -1,17 +1,19 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, type Capabilities, type ContextDetail, type ContextUsage, type IndexStatus, type PlanDetail } from '../../api/client';
 import type { TraceStep } from '../../types/trace';
-import { partitionTraceMiscLines, filterTraceMiscWhenSteps, traceStepsFingerprint } from '../../types/trace';
+import { partitionTraceMiscLines, filterTraceMiscWhenSteps, filterTraceStepsForDisplay, traceStepsFingerprint } from '../../types/trace';
 import { useStickToBottomScroll } from '../../utils/useStickToBottomScroll';
 import WorkflowGraph from '../WorkflowGraph';
 import TraceStepList from './TraceStepList';
 import TraceTurnList from './TraceTurnList';
 import ContextDetailSections from './ContextDetailSections';
+import IndexSyncProgress from './IndexSyncProgress';
 import type { TraceTurn } from '../../types/trace';
-import { useAppDialog } from '../AppDialog';
+import { useAppDialog } from '../appDialogContext';
 import {
   formatContextTokens,
 } from '../../utils/contextDisplay';
+import { formatMcpToolDisplay, mcpServerZh } from '../../utils/mcpDisplay';
 
 interface TraceLine {
   id: string;
@@ -111,6 +113,7 @@ export default function CursorRightPanel({
   const [contextDetail, setContextDetail] = useState<ContextDetail | null>(null);
   const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
   const [contextBusy, setContextBusy] = useState(false);
+  const [compressing, setCompressing] = useState(false);
   const [indexBusy, setIndexBusy] = useState(false);
   const [contextMsg, setContextMsg] = useState('');
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -163,6 +166,9 @@ export default function CursorRightPanel({
       setContextDetail(detail);
       setContextUsage(detail.usage);
       setIndexStatus(idx);
+      if (idx.indexing || (idx.progress?.running && idx.progress.action !== 'watch')) {
+        setIndexBusy(true);
+      }
     } catch (err) {
       setContextMsg(err instanceof Error ? err.message : String(err));
     } finally {
@@ -206,6 +212,67 @@ export default function CursorRightPanel({
     }
   }, [busy, tab, refreshContextPanel]);
 
+  // 索引同步中快轮询；Watch 开启时慢轮询以捕获增量进度
+  useEffect(() => {
+    if (tab !== 'context' || !slug) {
+      return;
+    }
+    const fast =
+      indexBusy || !!indexStatus?.indexing || !!indexStatus?.progress?.running;
+    const slow = !!indexStatus?.watch_active;
+    if (!fast && !slow) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const idx = await api.indexStatus(slug);
+          setIndexStatus(idx);
+          if (idx.indexing || (idx.progress?.running && idx.progress.action !== 'watch')) {
+            setIndexBusy(true);
+            return;
+          }
+          setIndexBusy((was) => {
+            if (was) {
+              const p = idx.progress;
+              if (p?.action === 'watch') {
+                return false;
+              }
+              if (p?.ok === false && p.error) {
+                setContextMsg(`索引失败：${p.error}`);
+              } else {
+                const action =
+                  p?.action === 'incremental'
+                    ? '增量'
+                    : p?.action === 'full'
+                      ? '全量'
+                      : p?.action === 'rebuild'
+                        ? '重建'
+                        : '索引';
+                const detail =
+                  typeof p?.files_updated === 'number'
+                    ? ` · 更新 ${p.files_updated.toLocaleString()} 文件 / ${Number(p.chunks_written || 0).toLocaleString()} chunks`
+                    : '';
+                setContextMsg(`${action}完成${detail}`);
+              }
+            }
+            return false;
+          });
+        } catch {
+          /* ignore */
+        }
+      })();
+    }, fast ? 450 : 2500);
+    return () => window.clearInterval(timer);
+  }, [
+    tab,
+    slug,
+    indexBusy,
+    indexStatus?.indexing,
+    indexStatus?.progress?.running,
+    indexStatus?.watch_active,
+  ]);
+
   useEffect(() => {
     if (requestedTab) {
       setTab(requestedTab);
@@ -218,7 +285,10 @@ export default function CursorRightPanel({
   const fullLog = traceLines.map((l) => l.text).join('\n');
   const miscLines = partitionTraceMiscLines(fullLog.split('\n'));
   const displayMiscLines = filterTraceMiscWhenSteps(miscLines, traceSteps.length);
-  const hasStructuredSteps = traceSteps.length > 0 || traceTurns.some((turn) => turn.steps.length > 0);
+  const visibleStepCount =
+    filterTraceStepsForDisplay(traceSteps).length +
+    traceTurns.reduce((sum, turn) => sum + filterTraceStepsForDisplay(turn.steps).length, 0);
+  const hasStructuredSteps = visibleStepCount > 0;
   const hasLogLines = fullLog.trim().length > 0;
   const thinkingChars = liveThinking.trim().length;
   /** all：完整日志；steps：里程碑/用户消息 + 结构化步骤（与终端一致） */
@@ -342,6 +412,7 @@ export default function CursorRightPanel({
                       turns={traceTurns}
                       defaultOpenLast={busy}
                       expandBodies={traceMode === 'all'}
+                      slug={slug}
                     />
                   ) : (
                     <>
@@ -350,6 +421,7 @@ export default function CursorRightPanel({
                         steps={traceSteps}
                         defaultOpenLast={busy}
                         expandBodies={traceMode === 'all'}
+                        slug={slug}
                       />
                     </>
                   )}
@@ -395,21 +467,57 @@ export default function CursorRightPanel({
             <section>
               <h4>MCP ({toolsCaps.mcp_tools.length})</h4>
               <p className="small muted">{toolsCaps.mcp_summary}</p>
-              <ul className="cursor-catalog-list">
-                {toolsCaps.mcp_tools.map((t) => (
-                  <li key={t.name} className="cursor-catalog-item">
-                    <div className="cursor-catalog-item-name">{t.name}</div>
-                    {t.description?.trim() && (
+              {toolsCaps.mcp_loading && (
+                <p className="small muted">MCP 后台加载中…</p>
+              )}
+              {!!toolsCaps.mcp_servers?.length && (
+                <ul className="cursor-catalog-list">
+                  {toolsCaps.mcp_servers.map((s) => (
+                    <li key={s.name} className="cursor-catalog-item">
+                      <div className="cursor-catalog-item-name">
+                        {s.name}
+                        <span className="muted">
+                          {' '}
+                          ·{' '}
+                          {s.status === 'ok'
+                            ? `已连接 · ${s.tool_count ?? 0} 工具`
+                            : s.status === 'loading'
+                              ? '加载中'
+                              : s.status === 'error'
+                                ? '已跳过'
+                                : '未就绪'}
+                        </span>
+                      </div>
+                      <p className="cursor-catalog-item-desc">{mcpServerZh(s.name)}</p>
+                      {s.error && (
+                        <p className="cursor-catalog-item-desc" style={{ color: '#a94442' }}>
+                          {s.error}
+                        </p>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <h5 className="small muted" style={{ margin: '10px 0 6px' }}>
+                可用 MCP 工具
+              </h5>
+              {toolsCaps.mcp_tools.length === 0 ? (
+                <p className="muted small">暂无可用 MCP 工具（失败 Server 已跳过）</p>
+              ) : (
+                <ul className="cursor-catalog-list">
+                  {toolsCaps.mcp_tools.map((t) => (
+                    <li key={t.name} className="cursor-catalog-item">
+                      <div className="cursor-catalog-item-name">{t.name}</div>
                       <p
                         className="cursor-catalog-item-desc cursor-catalog-item-desc--clamp"
-                        title={t.description.trim()}
+                        title={formatMcpToolDisplay(t.name, t.description)}
                       >
-                        {t.description.trim()}
+                        {formatMcpToolDisplay(t.name, t.description)}
                       </p>
-                    )}
-                  </li>
-                ))}
-              </ul>
+                    </li>
+                  ))}
+                </ul>
+              )}
             </section>
             <section>
               <h4>Skills ({toolsCaps.skills.length})</h4>
@@ -482,26 +590,32 @@ export default function CursorRightPanel({
                     <p className="small muted">{contextUsage.budget_note}</p>
                   )}
                   {isAgent && contextUsage.has_session && (
-                    <button
-                      type="button"
-                      className="cursor-btn-ghost"
-                      disabled={busy || contextBusy}
-                      onClick={async () => {
-                        setContextBusy(true);
-                        setContextMsg('');
-                        try {
-                          const res = await api.compressContext(slug, threadId, allowWrite);
-                          setContextMsg(res.message);
-                          await refreshContextPanel();
-                        } catch (err) {
-                          setContextMsg(err instanceof Error ? err.message : String(err));
-                        } finally {
-                          setContextBusy(false);
-                        }
-                      }}
-                    >
-                      压缩历史
-                    </button>
+                    <>
+                      {compressing && (
+                        <p className="small muted">正在压缩历史，可能需要数十秒…</p>
+                      )}
+                      <button
+                        type="button"
+                        className="cursor-btn-ghost"
+                        disabled={busy || contextBusy || compressing}
+                        aria-busy={compressing}
+                        onClick={async () => {
+                          setCompressing(true);
+                          setContextMsg('');
+                          try {
+                            const res = await api.compressContext(slug, threadId, allowWrite);
+                            setContextMsg(res.message);
+                            await refreshContextPanel();
+                          } catch (err) {
+                            setContextMsg(err instanceof Error ? err.message : String(err));
+                          } finally {
+                            setCompressing(false);
+                          }
+                        }}
+                      >
+                        压缩历史
+                      </button>
+                    </>
                   )}
                   {isAgent && !contextUsage.has_session && (
                     <p className="small muted">选择 Agent 会话后可压缩历史</p>
@@ -524,10 +638,29 @@ export default function CursorRightPanel({
               </div>
               {indexStatus && (
                 <>
+                  {(indexBusy || indexStatus.indexing || indexStatus.progress?.running) &&
+                    indexStatus.progress && (
+                      <IndexSyncProgress progress={indexStatus.progress} />
+                    )}
+                  {(indexBusy || indexStatus.indexing) && !indexStatus.progress && (
+                    <IndexSyncProgress
+                      progress={{
+                        running: true,
+                        phase: 'prepare',
+                        action: 'full',
+                      }}
+                    />
+                  )}
                   <ul className="cursor-index-stats">
                     <li>
                       <span>状态</span>
-                      <span>{indexStatus.exists ? '已建立' : '未建立'}</span>
+                      <span>
+                        {indexBusy || indexStatus.indexing || indexStatus.progress?.running
+                          ? '同步中'
+                          : indexStatus.exists
+                            ? '已建立'
+                            : '未建立'}
+                      </span>
                     </li>
                     <li>
                       <span>Chunks</span>
@@ -552,11 +685,21 @@ export default function CursorRightPanel({
                     <li>
                       <span>Watch</span>
                       <span>
-                        {indexStatus.watch_enabled
-                          ? indexStatus.watch_with_agent
-                            ? '配置开启（Web 未监听）'
-                            : '配置开启'
-                          : '关闭'}
+                        {!indexStatus.watch_enabled
+                          ? '关闭'
+                          : indexStatus.watch_paused ||
+                              indexStatus.indexing ||
+                              indexStatus.progress?.running
+                            ? '索引中已暂停'
+                            : indexStatus.watch_active
+                              ? '监听中'
+                              : indexStatus.watch_active === false
+                                ? indexStatus.watch_with_agent
+                                  ? '配置开启（启动失败）'
+                                  : '配置开启（未随 Agent）'
+                                : indexStatus.watch_with_agent
+                                  ? '配置开启'
+                                  : '配置开启（未随 Agent）'}
                       </span>
                     </li>
                   </ul>
@@ -566,22 +709,17 @@ export default function CursorRightPanel({
                         key={action}
                         type="button"
                         className="cursor-btn-ghost"
-                        disabled={indexBusy}
+                        disabled={indexBusy || !!indexStatus.indexing}
                         onClick={async () => {
                           setIndexBusy(true);
-                          setContextMsg('');
+                          setContextMsg(
+                            `${action === 'incremental' ? '增量' : action === 'full' ? '全量' : '重建'}已启动…`,
+                          );
                           try {
-                            const res = await api.runIndex(slug, action);
-                            setContextMsg(
-                              res.ok
-                                ? `${action} 完成${res.log_path ? ` · 日志 ${res.log_path}` : ''}`
-                                : `${action} 失败（exit ${res.exit_code}）`,
-                            );
-                            await refreshContextPanel();
+                            await api.runIndex(slug, action);
                           } catch (err) {
-                            setContextMsg(err instanceof Error ? err.message : String(err));
-                          } finally {
                             setIndexBusy(false);
+                            setContextMsg(err instanceof Error ? err.message : String(err));
                           }
                         }}
                       >

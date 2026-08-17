@@ -1,5 +1,9 @@
 import type { TraceStep, TraceTurn } from '../../types/trace';
-import { filterTraceMiscWhenSteps, partitionTraceMiscLines } from '../../types/trace';
+import {
+  filterTraceMiscWhenSteps,
+  filterTraceStepsForDisplay,
+  partitionTraceMiscLines,
+} from '../../types/trace';
 import TraceStepList from './TraceStepList';
 import TraceTurnList from './TraceTurnList';
 
@@ -10,6 +14,10 @@ interface Props {
   liveThinking?: string;
   /** 进行中：默认展开 */
   live?: boolean;
+  /** 对话区 live：用户气泡已展示，隐藏日志里的「用户消息」行 */
+  omitUserMessageMisc?: boolean;
+  /** 拉 explore 子 Trace */
+  slug?: string;
 }
 
 const THINKING_PREVIEW_CHARS = 12_000;
@@ -30,12 +38,25 @@ function miscLineClass(line: string): string {
   return 'cursor-trace-misc';
 }
 
-export default function TraceFold({ text, steps = [], turns = [], liveThinking = '', live = false }: Props) {
+export default function TraceFold({
+  text,
+  steps = [],
+  turns = [],
+  liveThinking = '',
+  live = false,
+  omitUserMessageMisc = false,
+  slug,
+}: Props) {
   const miscLines = partitionTraceMiscLines(text.split('\n'));
-  const stepCount = steps.length;
+  const stepCount = filterTraceStepsForDisplay(steps).length;
   const turnCount = turns.length;
-  const turnStepCount = turns.reduce((sum, turn) => sum + turn.steps.length, 0);
-  const displayMisc = filterTraceMiscWhenSteps(miscLines, stepCount);
+  const turnStepCount = turns.reduce(
+    (sum, turn) => sum + filterTraceStepsForDisplay(turn.steps).length,
+    0,
+  );
+  const displayMisc = filterTraceMiscWhenSteps(miscLines, stepCount).filter(
+    (line) => !(omitUserMessageMisc && line.includes('用户消息')),
+  );
   const miscCount = displayMisc.length;
   const thinkingChars = liveThinking.trim().length;
   const totalSteps = turnCount > 0 ? turnStepCount : stepCount;
@@ -78,12 +99,12 @@ export default function TraceFold({ text, steps = [], turns = [], liveThinking =
           </div>
         )}
         {turnCount > 0 ? (
-          <TraceTurnList turns={turns} defaultOpenLast={live} />
+          <TraceTurnList turns={turns} defaultOpenLast={live} slug={slug} />
         ) : (
           stepCount > 0 && (
             <div className="cursor-trace-steps">
               <div className="cursor-trace-steps-label">步骤（可展开详情）</div>
-              <TraceStepList steps={steps} defaultOpenLast={live} />
+              <TraceStepList steps={steps} defaultOpenLast={live} slug={slug} />
             </div>
           )
         )}

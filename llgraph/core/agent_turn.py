@@ -21,7 +21,12 @@ THINK_CONTINUE_NUDGE = (
     "（Plan 模式须在正文输出 JSON 代码块）。勿再次 thinking-only 结束。"
 )
 
-RouteAfterAgent = Literal["tools", "think_nudge", "turn_fallback", "__end__"]
+RouteAfterAgent = Literal[
+    "tools",
+    "think_nudge",
+    "turn_fallback",
+    "__end__",
+]
 
 
 def ai_message_has_visible_text(msg: AIMessage) -> bool:
@@ -168,7 +173,10 @@ def make_route_after_agent_for_graph(
     """
 
     def router(state: dict) -> str:
-        result = route_after_agent(state, complete_on_thinking_if=complete_on_thinking_if)
+        result = route_after_agent(
+            state,
+            complete_on_thinking_if=complete_on_thinking_if,
+        )
         if result == "__end__":
             return END
         return result

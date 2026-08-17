@@ -18,6 +18,39 @@ from llgraph.session.user_storage import workspace_context_dir
 EXECUTION_LOG_FILENAME = "execution.jsonl"
 _DEFAULT_TAIL_LINES = 8
 
+# 写入「执行日志」面板的高信号阶段（其余仅会话 run_log.jsonl）
+_EXECUTION_LOG_REACT_PHASES = frozenset(
+    {
+        "stream_end",
+        "post_tools_error",
+        "agent_pool_miss",
+        "agent_pool_restore",
+        "agent_pool_evict",
+        "compress_llm_start",
+        "compress_llm_done",
+        "compress_ran",
+    }
+)
+
+_REACT_PHASE_LABELS: dict[str, str] = {
+    "stream_end": "回合结束",
+    "post_tools_error": "工具后处理失败",
+    "await_agent_llm": "等待模型",
+    "agent_pool_miss": "Agent 池未命中·重建",
+    "agent_pool_restore": "Agent 池恢复",
+    "agent_pool_evict": "Agent 池淘汰",
+    "compress_llm_start": "上下文压缩·开始",
+    "compress_llm_done": "上下文压缩·完成",
+    "compress_ran": "上下文已压缩",
+    "post_tools_start": "工具后处理",
+    "tool_prune_start": "工具结果裁剪",
+    "tool_prune_done": "工具结果裁剪完成",
+    "compress_check_start": "上下文检查",
+    "compress_skip": "上下文未压缩",
+    "compress_done": "上下文检查完成",
+    "post_tools_end": "工具后处理完成",
+}
+
 
 def execution_log_path(workspace: Path) -> Path:
     """
@@ -254,12 +287,18 @@ def log_compress_event(
 
 def log_react_phase_event(workspace: Path, record: dict[str, Any]) -> None:
     """
-    将 react_phase 同步写入 execution.jsonl（若启用）。
+    将高信号 react_phase 同步写入 execution.jsonl（若启用）。
+
+    琐碎步间阶段（tool_prune / compress_skip 等）仅留在会话 run_log.jsonl，
+    避免执行日志刷屏无法分析。
 
     @param workspace 工作区根
     @param record run_log 同款字段
     """
     if not resolve_execution_log_enabled(workspace):
+        return
+    phase = str(record.get("phase") or "").strip()
+    if phase not in _EXECUTION_LOG_REACT_PHASES:
         return
     append_execution_event(workspace, dict(record))
 
@@ -519,6 +558,11 @@ def log_turn_failure(
             **({"user_message_preview": _message_preview(user_message)} if user_message else {}),
         },
     )
+    # 供外层（如 Web run_agent_chat）避免重复写 turn_error
+    try:
+        setattr(error, "_llgraph_turn_error_logged", True)
+    except Exception:
+        pass
 
 
 def read_execution_tail(
@@ -632,6 +676,37 @@ def format_execution_record(record: dict[str, Any]) -> str:
             f"chunks={record.get('chunks_written')} "
             f"更新={record.get('files_updated')} {cache}"
         )
+    if event == "react_phase":
+        phase = str(record.get("phase") or "?").strip() or "?"
+        # 历史刷屏记录：琐碎阶段不展示（仍保留在文件里，面板过滤）
+        if phase not in _EXECUTION_LOG_REACT_PHASES and phase not in (
+            "post_tools_error",
+            "stream_end",
+        ):
+            return ""
+        label = _REACT_PHASE_LABELS.get(phase, phase)
+        tid = str(record.get("thread_id") or "?")
+        tid_short = tid if len(tid) <= 28 else f"…{tid[-24:]}"
+        parts = [f"{ts} {label} [{tid_short}]"]
+        dur = record.get("duration_sec")
+        if dur is not None:
+            parts.append(f"{dur}s")
+        reason = record.get("reason")
+        if reason:
+            parts.append(f"reason={reason}")
+        last_node = record.get("last_node")
+        if last_node:
+            parts.append(f"node={last_node}")
+        step_count = record.get("step_count")
+        if step_count is not None:
+            parts.append(f"steps={step_count}")
+        err = record.get("error") or record.get("error_message")
+        if err:
+            err_s = str(err).replace("\n", " ")
+            if len(err_s) > 100:
+                err_s = err_s[:97] + "..."
+            parts.append(f"err={err_s}")
+        return " ".join(parts)
     return f"{ts} {event}"
 
 
@@ -648,7 +723,7 @@ def format_execution_tail(workspace: Path, *, limit: int = _DEFAULT_TAIL_LINES) 
     if not records:
         return f"执行日志为空\n路径: {path}"
     lines = [f"执行日志（最近 {len(records)} 条）: {path}", ""]
-    lines.extend(format_execution_record(r) for r in records)
+    lines.extend(ln for r in records if (ln := format_execution_record(r)).strip())
     return "\n".join(lines)
 
 

@@ -9,19 +9,9 @@ from typing import Any
 
 from llgraph.session.user_storage import session_thread_dir
 
-LAST_WEB_TRACE_FILENAME = "last_web_trace.json"
 WEB_TRACE_HISTORY_FILENAME = "web_trace_history.json"
 LIVE_WEB_TRACE_FILENAME = "live_web_trace.json"
 _MAX_TURNS = 80
-
-
-def last_web_trace_path(workspace: Path, thread_id: str) -> Path:
-    """
-    @param workspace 工作区根
-    @param thread_id 会话 thread
-    @return last_web_trace.json 路径（兼容旧读）
-    """
-    return session_thread_dir(workspace, thread_id) / LAST_WEB_TRACE_FILENAME
 
 
 def web_trace_history_path(workspace: Path, thread_id: str) -> Path:
@@ -44,6 +34,32 @@ def live_web_trace_path(workspace: Path, thread_id: str) -> Path:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _dedupe_steps_by_id(steps: list[Any]) -> list[dict[str, Any]]:
+    """
+    同 step_id 只保留最后一次（Think 回填会重复推送同一 id）。
+
+    @param steps 原始步骤列表
+    @return 按首次出现顺序去重后的步骤
+    """
+    if not steps:
+        return []
+    order: list[int] = []
+    by_id: dict[int, dict[str, Any]] = {}
+    extras: list[dict[str, Any]] = []
+    for raw in steps:
+        if not isinstance(raw, dict):
+            continue
+        step = dict(raw)
+        sid = int(step.get("step_id") or 0)
+        if sid <= 0:
+            extras.append(step)
+            continue
+        if sid not in by_id:
+            order.append(sid)
+        by_id[sid] = step
+    return [by_id[sid] for sid in order] + extras
 
 
 def _format_turn_separator_label(ts: str, idx: int) -> str:
@@ -83,7 +99,7 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_last_web_trace(
+def append_web_trace_turn(
     workspace: Path,
     thread_id: str,
     *,
@@ -94,7 +110,7 @@ def save_last_web_trace(
     outcome: str | None = None,
 ) -> None:
     """
-    追加一轮 Web trace（并更新 last_web_trace 兼容字段）。
+    追加一轮已完成 Web trace 到 web_trace_history.json，并清除 live 增量文件。
 
     @param workspace 工作区根
     @param thread_id 会话 thread
@@ -131,12 +147,6 @@ def save_last_web_trace(
     if len(turns) > _MAX_TURNS:
         turns = turns[-_MAX_TURNS:]
     _write_json(history_path, {"turns": turns})
-
-    # 兼容旧 API / 单轮读取
-    _write_json(
-        last_web_trace_path(workspace, thread_id),
-        {"log_lines": clean_lines, "steps": steps},
-    )
     clear_live_web_trace(workspace, thread_id)
 
 
@@ -148,7 +158,7 @@ def update_live_web_trace(
     steps: list[dict[str, Any]],
 ) -> None:
     """
-    执行中增量落盘 trace（切换会话后可从 last-trace API 恢复）。
+    执行中增量落盘 trace（切换会话后可从 /trace API 恢复）。
 
     @param workspace 工作区根
     @param thread_id 会话 thread
@@ -158,11 +168,12 @@ def update_live_web_trace(
     if not thread_id.strip():
         return
     clean_lines = [line for line in log_lines if str(line).strip()]
-    if not clean_lines and not steps:
+    clean_steps = _dedupe_steps_by_id(steps)
+    if not clean_lines and not clean_steps:
         return
     _write_json(
         live_web_trace_path(workspace, thread_id),
-        {"log_lines": clean_lines, "steps": steps, "ts": _utc_now_iso()},
+        {"log_lines": clean_lines, "steps": clean_steps, "ts": _utc_now_iso()},
     )
 
 
@@ -174,6 +185,24 @@ def clear_live_web_trace(workspace: Path, thread_id: str) -> None:
             path.unlink()
         except OSError:
             pass
+
+
+def touch_live_web_trace(workspace: Path, thread_id: str) -> None:
+    """
+    刷新 live_web_trace 修改时间（长工具阻塞时心跳调用，避免僵死误判）。
+
+    @param workspace 工作区根
+    @param thread_id 会话 thread
+    """
+    if not thread_id.strip():
+        return
+    path = live_web_trace_path(workspace, thread_id)
+    if not path.is_file():
+        return
+    try:
+        path.touch()
+    except OSError:
+        pass
 
 
 def _merge_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
@@ -246,13 +275,17 @@ def _append_live_to_base(
     if clean_live and len(out_lines) >= len(clean_live) and out_lines[-len(clean_live) :] == clean_live:
         out_steps = list(base_steps)
         if isinstance(live_steps, list):
-            for raw in live_steps:
-                if not isinstance(raw, dict):
-                    continue
+            for raw in _dedupe_steps_by_id(live_steps):
                 step = dict(raw)
                 sid = step_offset + int(step.get("step_id") or 0)
-                if not any(int(s.get("step_id") or 0) == sid for s in out_steps):
-                    step["step_id"] = sid
+                step["step_id"] = sid
+                replaced = False
+                for i, existing in enumerate(out_steps):
+                    if int(existing.get("step_id") or 0) == sid:
+                        out_steps[i] = step
+                        replaced = True
+                        break
+                if not replaced:
                     out_steps.append(step)
         return {"log_lines": out_lines, "steps": out_steps}
 
@@ -264,13 +297,18 @@ def _append_live_to_base(
 
     out_steps = list(base_steps)
     if isinstance(live_steps, list):
-        for raw in live_steps:
-            if not isinstance(raw, dict):
-                continue
+        for raw in _dedupe_steps_by_id(live_steps):
             step = dict(raw)
             local_id = int(step.get("step_id") or 0)
-            step["step_id"] = step_offset + local_id
-            if not any(int(s.get("step_id") or 0) == step["step_id"] for s in out_steps):
+            sid = step_offset + local_id
+            step["step_id"] = sid
+            replaced = False
+            for i, existing in enumerate(out_steps):
+                if int(existing.get("step_id") or 0) == sid:
+                    out_steps[i] = step
+                    replaced = True
+                    break
+            if not replaced:
                 out_steps.append(step)
 
     return {"log_lines": out_lines, "steps": out_steps}
@@ -322,7 +360,7 @@ def load_web_trace_turns(workspace: Path, thread_id: str) -> list[dict[str, Any]
                     "turn_index": idx + 1,
                     "label": f"第 {idx + 1} 轮 · {time_label}",
                     "ts": ts,
-                    "steps": live_steps,
+                    "steps": _dedupe_steps_by_id(live_steps),
                     "log_lines": live_lines,
                     "live": True,
                 }
@@ -330,29 +368,12 @@ def load_web_trace_turns(workspace: Path, thread_id: str) -> list[dict[str, Any]
 
     if turns_out:
         return turns_out
-
-    legacy = _read_json(last_web_trace_path(workspace, thread_id))
-    if not legacy:
-        return []
-    log_lines = legacy.get("log_lines") if isinstance(legacy.get("log_lines"), list) else []
-    steps = legacy.get("steps") if isinstance(legacy.get("steps"), list) else []
-    if not log_lines and not steps:
-        return []
-    return [
-        {
-            "turn_index": 1,
-            "label": "第 1 轮",
-            "ts": "",
-            "steps": steps,
-            "log_lines": log_lines,
-            "live": False,
-        }
-    ]
+    return []
 
 
-def load_last_web_trace(workspace: Path, thread_id: str) -> dict[str, Any] | None:
+def load_web_trace_view(workspace: Path, thread_id: str) -> dict[str, Any] | None:
     """
-    读取 Web trace（优先多轮累积，回退 last_web_trace.json）。
+    读取 Web trace 合并视图（history 各轮 + 可选 live），供 Trace 面板与对话补全。
 
     @param workspace 工作区根
     @param thread_id 会话 thread
@@ -366,16 +387,6 @@ def load_last_web_trace(workspace: Path, thread_id: str) -> dict[str, Any] | Non
         if merged["log_lines"] or merged["steps"]:
             base = merged
 
-    if base is None:
-        legacy = _read_json(last_web_trace_path(workspace, thread_id))
-        if legacy:
-            log_lines = legacy.get("log_lines")
-            steps = legacy.get("steps")
-            base = {
-                "log_lines": log_lines if isinstance(log_lines, list) else [],
-                "steps": steps if isinstance(steps, list) else [],
-            }
-
     live = _read_json(live_web_trace_path(workspace, thread_id))
     live_ts = ""
     if isinstance(live, dict):
@@ -384,7 +395,10 @@ def load_last_web_trace(workspace: Path, thread_id: str) -> dict[str, Any] | Non
         live_steps = live.get("steps") if isinstance(live.get("steps"), list) else []
         if live_lines or live_steps:
             if base is None:
-                out = {"log_lines": live_lines, "steps": live_steps}
+                out = {
+                    "log_lines": live_lines,
+                    "steps": _dedupe_steps_by_id(live_steps),
+                }
                 if live_ts:
                     out["live_ts"] = live_ts
                 return out

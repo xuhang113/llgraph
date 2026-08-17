@@ -42,9 +42,22 @@ def _parse_bool(value: object, default: bool) -> bool:
     return bool(value)
 
 
-def _expand_env(value: str) -> str:
-    """展开 ${VAR} 环境变量占位。"""
-    return os.path.expandvars(value)
+def _expand_placeholders(value: str, workspace: Path) -> str:
+    """
+    展开 ${WORKSPACE_ROOT} / ${LLGRAPH_WORKSPACE} 与系统环境变量。
+
+    @param value 原始字符串
+    @param workspace 工作区根
+    @return 展开后字符串
+    """
+    root = str(workspace.expanduser().resolve())
+    out = (
+        value.replace("${WORKSPACE_ROOT}", root)
+        .replace("$WORKSPACE_ROOT", root)
+        .replace("${LLGRAPH_WORKSPACE}", root)
+        .replace("$LLGRAPH_WORKSPACE", root)
+    )
+    return os.path.expandvars(out)
 
 
 def _load_json(path: Path) -> dict:
@@ -55,7 +68,9 @@ def _load_json(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _servers_from_llgraph_format(raw: dict) -> tuple[McpServerConfig, ...]:
+def _servers_from_llgraph_format(
+    raw: dict, workspace: Path
+) -> tuple[McpServerConfig, ...]:
     """从 .llgraph/mcp.json 的 servers 段解析。"""
     servers_raw = raw.get("servers")
     if not isinstance(servers_raw, dict):
@@ -76,15 +91,25 @@ def _servers_from_llgraph_format(raw: dict) -> tuple[McpServerConfig, ...]:
         if not isinstance(args, list):
             args = []
         env_raw = cfg.get("env") or {}
-        env = {str(k): _expand_env(str(v)) for k, v in env_raw.items()} if isinstance(env_raw, dict) else {}
+        env = (
+            {
+                str(k): _expand_placeholders(str(v), workspace)
+                for k, v in env_raw.items()
+            }
+            if isinstance(env_raw, dict)
+            else {}
+        )
+        # 子进程可读取工作区根
+        env.setdefault("WORKSPACE_ROOT", str(workspace.expanduser().resolve()))
+        env.setdefault("LLGRAPH_WORKSPACE", str(workspace.expanduser().resolve()))
         cwd = cfg.get("cwd")
-        cwd_str = _expand_env(str(cwd)) if cwd else None
+        cwd_str = _expand_placeholders(str(cwd), workspace) if cwd else None
         enabled = _parse_bool(cfg.get("enabled"), True) and name not in disabled_set
         servers.append(
             McpServerConfig(
                 name=name,
-                command=command,
-                args=[str(a) for a in args],
+                command=_expand_placeholders(command, workspace),
+                args=[_expand_placeholders(str(a), workspace) for a in args],
                 env=env,
                 cwd=cwd_str,
                 enabled=enabled,
@@ -101,6 +126,7 @@ def resolve_mcp_settings(workspace: Path, *, allow_write: bool = False) -> McpSe
     @param allow_write Agent 是否 -w 模式
     @return McpSettings
     """
+    workspace = workspace.expanduser().resolve()
     llgraph_path = workspace / ".llgraph" / LLGRAPH_MCP_FILENAME
 
     defaults_timeout = 60.0
@@ -116,7 +142,7 @@ def resolve_mcp_settings(workspace: Path, *, allow_write: bool = False) -> McpSe
         except (TypeError, ValueError):
             pass
         allow_write_tools = _parse_bool(defaults.get("allow_write_tools"), False)
-        servers = _servers_from_llgraph_format(raw)
+        servers = _servers_from_llgraph_format(raw, workspace)
         source = str(llgraph_path)
 
     if not allow_write:

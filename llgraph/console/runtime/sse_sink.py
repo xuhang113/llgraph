@@ -118,7 +118,15 @@ class PersistingSseTraceSink:
 
     def step_added(self, step: Any) -> None:
         self._inner.step_added(step)
-        self._step_payloads.append(_step_to_dict(step))
+        payload = _step_to_dict(step)
+        sid = int(payload.get("step_id") or 0)
+        if sid > 0:
+            for i, existing in enumerate(self._step_payloads):
+                if int(existing.get("step_id") or 0) == sid:
+                    self._step_payloads[i] = payload
+                    self._flush_live()
+                    return
+        self._step_payloads.append(payload)
         self._flush_live()
 
     def step_selected(self, step_id: int) -> None:

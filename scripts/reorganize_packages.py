@@ -38,7 +38,6 @@ PACKAGE_MAP: dict[str, str] = {
     "context_settings": "context",
     "context_builder": "context",
     "context_compressor": "context",
-    "context_dispatch_window": "context",
     "context_message_split": "context",
     "context_spill": "context",
     "context_stats": "context",

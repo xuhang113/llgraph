@@ -68,24 +68,32 @@ def build_cached_system_message(
     cache_control: dict[str, str],
 ) -> SystemMessage:
     """
-    构建带断点的 SystemMessage：仅稳定 Agent 规范可缓存。
+    构建带断点的 SystemMessage。
 
-    @param stable_text Agent 系统规范（build_system_prompt）
+    动静边界之前为可缓存静态前缀；之后为动态段（不打 cache_control，
+    避免环境/路由变化击穿静态缓存）。
+
+    @param stable_text Agent 系统规范（build_system_prompt，可含边界标记）
     @param cache_control 断点参数
     @return SystemMessage
     """
-    stable = stable_text.strip()
-    if not stable:
+    from llgraph.core.prompt_boundary import split_system_prompt_at_boundary
+
+    static, dynamic = split_system_prompt_at_boundary(stable_text)
+    if not static and not dynamic:
         return SystemMessage(content="")
-    return SystemMessage(
-        content=[
+    blocks: list[dict[str, Any]] = []
+    if static:
+        blocks.append(
             {
                 "type": "text",
-                "text": stable,
+                "text": static,
                 "cache_control": dict(cache_control),
             }
-        ]
-    )
+        )
+    if dynamic:
+        blocks.append({"type": "text", "text": dynamic})
+    return SystemMessage(content=blocks)
 
 
 def apply_prompt_cache_to_llm(llm: Any, workspace: Path | None) -> Any:
@@ -135,10 +143,15 @@ def prepare_system_message_for_dispatch(
     if not stable:
         return None, non_system
 
+    from llgraph.core.prompt_boundary import split_system_prompt_at_boundary
+
+    static, dynamic = split_system_prompt_at_boundary(stable)
     settings = resolve_prompt_cache_settings(workspace)
     use_cache = prompt_cache_enabled_for_model(workspace, model_id) and settings.enabled
     if not use_cache:
-        return SystemMessage(content=stable), non_system
+        # 不向模型暴露边界标记本身
+        merged = "\n\n".join(p for p in (static, dynamic) if p)
+        return SystemMessage(content=merged), non_system
 
     cache_control = build_cache_control(settings)
     return (

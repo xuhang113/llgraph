@@ -266,14 +266,56 @@ def merge_payload_thinking(
     合并已有 payload.thinking 与期望配置（Kimi 保留 keep=all）。
 
     @param existing 当前 payload.thinking
-    @param desired resolve_model_thinking_payload 结果
+    @param desired thinking 字段（不含 effort）
     @param model_id 模型 id
     @return 合并后的 thinking
     """
+    base = {k: v for k, v in dict(desired).items() if k != "effort"}
     if not isinstance(existing, dict):
-        return dict(desired)
-    merged = {**desired, **existing}
+        return base
+    merged = {**base, **{k: v for k, v in existing.items() if k != "effort"}}
     mid = (model_id or "").lower()
-    if ("kimi" in mid or "k2.5" in mid or "k2.6" in mid) and desired.get("keep"):
-        merged["keep"] = desired["keep"]
+    if ("kimi" in mid or "k2.5" in mid or "k2.6" in mid) and base.get("keep"):
+        merged["keep"] = base["keep"]
+    merged.pop("effort", None)
     return merged
+
+
+def split_thinking_payload(
+    payload: dict[str, Any] | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """
+    拆分 thinking 请求体与 effort（effort 必须放 output_config，不能塞进 thinking）。
+
+    adaptive 默认 effort=high，避免网关/Bedrock 弱化思考。
+
+    @param payload resolve_model_thinking_payload 结果
+    @return (thinking 字段, effort 或 None)
+    """
+    if not payload:
+        return None, None
+    body = {k: v for k, v in payload.items() if k != "effort"}
+    effort_raw = payload.get("effort")
+    effort: str | None = None
+    if isinstance(effort_raw, str) and effort_raw.strip():
+        effort = effort_raw.strip().lower()
+    kind = str(body.get("type", "")).strip().lower()
+    if kind == "adaptive" and not effort:
+        effort = "high"
+    if kind == "disabled":
+        effort = None
+    return (body if body else None), effort
+
+
+def resolve_thinking_request(
+    workspace: Path | None,
+    model_id: str | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """
+    解析发往网关的 thinking + effort。
+
+    @param workspace 工作区根
+    @param model_id 模型 id
+    @return (thinking 字段, effort)
+    """
+    return split_thinking_payload(resolve_model_thinking_payload(workspace, model_id))

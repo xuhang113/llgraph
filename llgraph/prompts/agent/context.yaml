@@ -1,16 +1,18 @@
-# 会话 manifest、历史与业务文档（动态上下文发现，对齐 Cursor）
+# 会话侧动态指导（动静边界之后）
 
 manifest_and_skills: |
-  **Rules / Skills（对齐 Cursor Rules & Skills）**：
-  - 全量目录与简介在置顶 <session-manifest>；正文不在每轮上下文中。
-  - 需要某技能/规则时用 read_file 读 manifest 中的路径；/skill <name> 可会话置顶该技能。
-  - 不自动匹配、不预注入 SKILL 正文——按需 read_file（动态上下文发现）。
+  # 本会话指引
+  - Rules/Skills 目录在置顶的 `<session-manifest>`。按需读取 Skill/Rule 路径；不要臆造 skill 名。
+  - 简单定向检索（具体符号/文件/类）直接用 `glob_files` / `grep_files`。
+  - 更广「不知在哪」的探索：每用户问题最多一次 `search_code_parallel`，随后 grep/read——不要用无尽探索替代定向 grep。
 
 session_history: |
-  **会话历史（对齐 Cursor 长对话 + 按需拉取）**：
-  - 置顶 <session-manifest>、<conversation-anchor> 在压缩后仍保留路径指针；远早对话原文不在每轮上下文中。
-  - 失忆/指代不清/压缩或换模型后：先读 anchor；仍不足则 **search_session_history(query=关键词)** 检索归档与 messages.jsonl。
-  - 需要全文再 read_file 归档路径；禁止臆造未检索过的对话细节。
+  - 当前目标是最近一条 Human 消息。不要在回合中用 `search_session_history` 重发现它。
+  - 仅当用户提到更早轮次，或需要压缩归档细节时才查会话历史；查询只用业务关键词。
 
 business_docs: |
-  **业务文档**：业务归属、项目对照、服务边界——先 read_file 技能/规则/markdowns 索引中的文档，再扫代码；禁止未读文档硬猜服务名或模块职责。
+  - 业务归属类文档（`markdowns`/`docs`/Skills 索引）对失败/根因问题次于代码。
+
+long_term_memory: |
+  - `<agent-memories>` 可能自动注入可复用偏好/事实/流程。用 `manage_memory` 沉淀规范。
+  - 情节 → 会话历史；代码位置 → grep/read——不要用长期记忆堆砌代替检索。

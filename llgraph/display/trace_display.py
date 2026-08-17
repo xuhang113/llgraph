@@ -334,15 +334,26 @@ class TraceStepRecord:
     usage: StepUsage | None = None
     invoke_timing: dict[str, Any] | None = None
     elapsed_kind: str = "wall"
+    """explore 等子会话：点开可拉子 Trace。"""
+    sub_thread: str | None = None
 
 
 def _resolve_elapsed_kind(kind: str) -> str:
     """步骤耗时语义：model=仅模型 / tool=工具等待 / preprocess=预处理 / wall=墙钟。"""
     if kind in ("plan", "thinking", "reply"):
         return "model"
-    if kind == "tool":
+    if kind in ("tool", "explore"):
         return "tool"
-    if kind in ("compress", "tool_prune", "preprocess", "search_params", "tools"):
+    if kind in (
+        "compress",
+        "tool_prune",
+        "preprocess",
+        "search_params",
+        "tools",
+        "memory_recall",
+        "memory_write",
+        "memory_consolidate",
+    ):
         return "preprocess"
     return "wall"
 
@@ -524,7 +535,7 @@ def print_invoke_prelude(trace_session: TraceSession | None) -> None:
         return
     emit_trace_milestone(
         trace,
-        "准备中…  invoke 前预处理（详见 trace 步骤）",
+        "准备中…",
     )
 
 
@@ -659,6 +670,17 @@ class TurnRunResult:
         return self.content.to_payload()
 
 
+def _user_visible_reply_text(text: str) -> str:
+    """@param text 助手 raw 正文 @return 用户可见正文；占位符/空则 \"\" """
+    from llgraph.context.chat_history_repair import is_dispatch_placeholder_text
+    from llgraph.context.message_normalize import format_agent_chat_display_text
+
+    cleaned = format_agent_chat_display_text(text or "").strip()
+    if not cleaned or is_dispatch_placeholder_text(cleaned):
+        return ""
+    return cleaned
+
+
 class TurnTracePrinter:
     """按 TraceMode 打印单轮追踪。"""
 
@@ -716,6 +738,7 @@ class TurnTracePrinter:
         usage: StepUsage | None = None,
         invoke_timing: dict[str, Any] | None = None,
         elapsed_kind: str | None = None,
+        sub_thread: str | None = None,
     ) -> int:
         self._step_index += 1
         lines = body_lines if body_lines is not None else (body.splitlines() if body else [])
@@ -731,6 +754,7 @@ class TurnTracePrinter:
                 usage=usage,
                 invoke_timing=invoke_timing,
                 elapsed_kind=resolved_kind,
+                sub_thread=(sub_thread or "").strip() or None,
             )
         )
         return self._step_index
@@ -738,32 +762,38 @@ class TurnTracePrinter:
     def mark_agent_step_start(self) -> None:
         """工具执行 / 中途压缩结束后，重置「模型决策」计时起点。"""
         self._step_start = time.perf_counter()
+        # 下一轮 agent 调用需要新的 Think 步骤，勿继续回填上一轮
+        self._reset_thinking_capture(keep_finalized=False)
 
     def on_thinking_chunk(self, text: str) -> None:
         """
         流式 thinking 更新：Web SSE 实时推送；终端 steps/all 打摘要行。
 
-        @param text 截至当前的完整 thinking 文本
+        @param text 累计全文或单次增量（网关两种都有）；内部合并为完整缓冲
         """
         cleaned = text.strip()
         if not cleaned:
             return
-        if len(cleaned) < len(self._last_thinking_text):
+        merged = _merge_thinking_capture(self._last_thinking_text, cleaned)
+        if merged == self._last_thinking_text:
             return
-        self._last_thinking_text = cleaned
-        if not _thinking_worth_trace_step(cleaned):
+        self._last_thinking_text = merged
+        if self._thinking_finalized:
+            self._refresh_thinking_step_body(merged)
+            return
+        if not _thinking_worth_trace_step(merged):
             return
         sink = self._session.trace_sink
         now = time.perf_counter()
         should_emit = (
             self._thinking_emit_len == 0
-            or len(cleaned) - self._thinking_emit_len >= 300
+            or len(merged) - self._thinking_emit_len >= 300
             or now - self._thinking_emit_at >= 0.35
         )
         if sink is not None and hasattr(sink, "thinking_update") and should_emit:
             self._thinking_emit_at = now
-            self._thinking_emit_len = len(cleaned)
-            sink.thinking_update(cleaned)
+            self._thinking_emit_len = len(merged)
+            sink.thinking_update(merged)
         if self._session.shows_process() and not self._thinking_header_printed:
             self._thinking_header_printed = True
             self._line(
@@ -780,9 +810,50 @@ class TurnTracePrinter:
         self._thinking_emit_at = 0.0
         self._thinking_header_printed = False
 
+    def _refresh_thinking_step_body(self, text: str) -> None:
+        """已落 Think 步骤后若又收到更长全文，回填 body（避免只剩尾句）。"""
+        cleaned = text.strip()
+        if not cleaned or not _thinking_worth_trace_step(cleaned):
+            return
+        for step in reversed(self._steps):
+            if step.kind != "thinking":
+                continue
+            prev = "\n".join(step.body_lines)
+            if len(cleaned) <= len(prev):
+                return
+            step.body_lines = cleaned.splitlines()
+            step.summary = f"{len(cleaned)} 字"
+            sink = self._session.trace_sink
+            if sink is not None and hasattr(sink, "thinking_update"):
+                sink.thinking_update(cleaned)
+            if sink is not None and hasattr(sink, "step_added"):
+                sink.step_added(step)
+            return
+
+    def _absorb_thinking_from_ai_message(self, msg: Any) -> None:
+        """用最终 AIMessage 上的 thinking 补全流式缓冲（常比 chunk 更完整）。"""
+        candidates = [self._last_thinking_text.strip()]
+        extracted = _extract_thinking_from_message_chunk(msg)
+        if extracted:
+            candidates.append(extracted)
+        try:
+            from llgraph.core.llm_response import llm_thinking_text
+
+            full = llm_thinking_text(msg).strip()
+            if full:
+                candidates.append(full)
+        except Exception:
+            pass
+        best = max(candidates, key=len)
+        if best:
+            self._last_thinking_text = best
+
     def _finalize_thinking_step(self, *, reset_after: bool = False) -> None:
         """将本轮 thinking 落为可展开 trace 步骤。"""
         if self._thinking_finalized:
+            self._refresh_thinking_step_body(self._last_thinking_text)
+            if reset_after:
+                self._reset_thinking_capture(keep_finalized=True)
             return
         text = self._last_thinking_text.strip()
         self._thinking_finalized = True
@@ -1073,6 +1144,7 @@ class TurnTracePrinter:
         if not isinstance(last, AIMessage):
             return
 
+        self._absorb_thinking_from_ai_message(last)
         self._finalize_thinking_step(reset_after=True)
         elapsed = time.perf_counter() - self._step_start
         tool_calls = getattr(last, "tool_calls", None) or []
@@ -1157,10 +1229,15 @@ class TurnTracePrinter:
                         emit_trace_milestone(self._session, f"执行 {label}…")
             self._streamed_reply = False
         elif text:
-            if not self._streamed_reply:
-                self._final_text = text
-            if self._session.shows_process() and not self._session.is_verbose():
-                self._emit_final_reply_block(self._final_text or text)
+            visible = _user_visible_reply_text(text)
+            if visible:
+                if not self._streamed_reply:
+                    self._final_text = visible
+                if self._session.shows_process() and not self._session.is_verbose():
+                    self._emit_final_reply_block(self._final_text or visible)
+            else:
+                self._final_text = ""
+                self._stream_end()
 
         self._step_start = time.perf_counter()
 
@@ -1190,6 +1267,10 @@ class TurnTracePrinter:
         args_by_id = _tool_call_args_by_id(messages)
         for msg in tool_msgs:
             name = msg.name or "tool"
+            # spawn_subagent 已由 emit_explore_trace_step 登记 kind=explore；
+            # 再记「执行 spawn_subagent」会与 explore 同墙钟重复（如各 413s）。
+            if name == "spawn_subagent":
+                continue
             tool_elapsed = read_tool_message_elapsed(msg)
             step_elapsed = tool_elapsed if tool_elapsed is not None else elapsed
             tool_args = args_by_id.get(getattr(msg, "tool_call_id", "") or "", {})
@@ -1234,10 +1315,12 @@ class TurnTracePrinter:
         """
         from llgraph.context.message_normalize import format_agent_chat_display_text
 
-        cleaned = format_agent_chat_display_text(text)
-        if not cleaned.strip():
+        visible = _user_visible_reply_text(text)
+        if not visible:
             self._stream_end()
+            self._final_text = ""
             return
+        cleaned = visible
         elapsed = time.perf_counter() - self._step_start
         self._printed_final_header = True
         self._streamed_reply = True
@@ -1349,6 +1432,8 @@ class TurnTracePrinter:
             self._final_text += chunk_text
             visible = self._survey_filter.feed(chunk_text)
             if visible and web_stream:
+                if not _user_visible_reply_text(visible):
+                    return
                 self._streamed_reply = True
                 self._stream(visible)
             return
@@ -1371,6 +1456,8 @@ class TurnTracePrinter:
         self._final_text += chunk_text
         visible = self._survey_filter.feed(chunk_text)
         if visible:
+            if not _user_visible_reply_text(visible):
+                return
             self._stream(visible)
 
     def on_turn_end(self, *, last_step_body: str = "") -> tuple[str, str]:
@@ -1391,9 +1478,7 @@ class TurnTracePrinter:
                     self._print_reply_body(tail)
                 self._stream_end()
             if not self._reply_body_printed and self._final_text.strip():
-                from llgraph.context.message_normalize import format_agent_chat_display_text
-
-                body = format_agent_chat_display_text(self._final_text)
+                body = _user_visible_reply_text(self._final_text)
                 if body:
                     self._print_reply_body(body)
             total = time.perf_counter() - self._turn_start
@@ -1610,6 +1695,29 @@ def _extract_text_from_message_chunk(chunk: Any) -> str:
 _MIN_THINKING_TRACE_CHARS = 16
 
 
+def _merge_thinking_capture(previous: str, incoming: str) -> str:
+    """
+    合并 thinking 流式片段：支持累计全文或纯增量。
+
+    @param previous 已缓冲文本
+    @param incoming 本 chunk 文本
+    @return 合并后全文
+    """
+    prev = previous.strip()
+    cleaned = incoming.strip()
+    if not cleaned:
+        return prev
+    if not prev:
+        return cleaned
+    if cleaned == prev:
+        return prev
+    if cleaned.startswith(prev) or prev in cleaned:
+        return cleaned
+    if prev.startswith(cleaned) or cleaned in prev:
+        return prev
+    return prev + cleaned
+
+
 def _thinking_worth_trace_step(text: str) -> bool:
     """
     thinking 是否值得落为 trace 步骤 / Web 流式展示。
@@ -1635,6 +1743,8 @@ def _extract_thinking_from_message_chunk(chunk: Any) -> str:
         stored = meta.get("thinking_text")
         if isinstance(stored, str) and stored.strip():
             return stored.strip()
+        if meta.get("thinking_redacted"):
+            return "（模型已思考，但当前网关未返回思考明文，仅保留签名块供多轮回传。）"
     if isinstance(content, list):
         parts: list[str] = []
         for block in content:
@@ -1643,14 +1753,15 @@ def _extract_thinking_from_message_chunk(chunk: Any) -> str:
             kind = str(block.get("type", "")).lower()
             if kind not in ("thinking", "reasoning", "reasoning_text", "redacted_thinking"):
                 continue
+            if kind == "redacted_thinking":
+                continue
             text = (
                 block.get("thinking")
                 or block.get("reasoning")
                 or block.get("text")
-                or block.get("data")
             )
-            if text:
-                parts.append(str(text))
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
         return "\n".join(parts).strip()
     return ""
 
@@ -1848,23 +1959,26 @@ def _react_post_tools_maintenance(
     """
     import time
 
-    from llgraph.context.context_compressor import maybe_compress_during_react
+    from llgraph.context.context_compressor import (
+        maybe_compress_during_react,
+        peek_react_compress_needed,
+    )
     from llgraph.context.incremental_context import maybe_prune_tools_during_react
     from llgraph.display.trace_emit import emit_compress_trace_step, emit_tool_prune_trace_step
     from llgraph.session.session_run_log import UserCancelledError, log_react_phase
 
     wall_start = time.perf_counter()
 
-    def _milestone(text: str, phase: str) -> None:
+    def _milestone(text: str, phase: str, *, visible: bool = True) -> None:
         _set_react_phase(session, phase)
-        if session.shows_process():
+        if visible and session.shows_process():
             emit_trace_milestone(session, text)
         log_react_phase(workspace, thread_id, phase=phase)
 
     _milestone("整理工具结果…", "post_tools_start")
     try:
         t0 = time.perf_counter()
-        _milestone("工具结果裁剪…", "tool_prune_start")
+        _milestone("检查工具结果…", "tool_prune_start", visible=False)
         react_prune = maybe_prune_tools_during_react(
             agent,
             thread_id=thread_id,
@@ -1879,6 +1993,8 @@ def _react_post_tools_maintenance(
                     "tokens_after": react_prune.after_tokens,
                 }
             )
+            if session.shows_process():
+                emit_trace_milestone(session, "工具结果裁剪…")
             emit_tool_prune_trace_step(
                 react_prune,
                 thread_id=thread_id,
@@ -1896,8 +2012,24 @@ def _react_post_tools_maintenance(
             raise UserCancelledError("用户停止当前生成")
 
         t1 = time.perf_counter()
-        _milestone("检查上下文压缩…", "compress_check_start")
-        _milestone("压缩摘要 LLM 调用中…（大会话可能 1～3 分钟）", "compress_llm_start")
+        _milestone("检查上下文压缩…", "compress_check_start", visible=False)
+        will_compress = peek_react_compress_needed(
+            agent,
+            thread_id=thread_id,
+            workspace=workspace,
+        )
+        if will_compress:
+            _milestone(
+                "压缩摘要 LLM 调用中…（大会话可能 1～3 分钟）",
+                "compress_llm_start",
+            )
+        else:
+            log_react_phase(
+                workspace,
+                thread_id,
+                phase="compress_skip",
+                detail={"reason": "below_threshold"},
+            )
         react_compress = maybe_compress_during_react(
             agent,
             thread_id=thread_id,

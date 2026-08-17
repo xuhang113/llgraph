@@ -5,7 +5,7 @@ import {
   type FileChangesSummary,
   type PlanFileChangesSummary,
 } from '../../api/client';
-import { useAppDialog } from '../AppDialog';
+import { useAppDialog } from '../appDialogContext';
 
 export type FileChangesMode = 'agent' | 'plan' | 'worker';
 

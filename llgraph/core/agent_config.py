@@ -4,12 +4,34 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 
 LLGRAPH_DIR = ".llgraph"
 USER_ONLY_AGENT_SECTIONS = frozenset({"web_search"})
 AGENT_CONFIG_FILENAME = "agent.json"
-USER_LLGRAPH_HOME = Path.home() / ".llgraph"
+
+
+def user_llgraph_home() -> Path:
+    """
+    用户级 llgraph 主目录。
+
+    优先读环境变量 ``LLGRAPH_HOME``（测试隔离用）；未设置时为 ``~/.llgraph``。
+    须在调用时解析，勿在 import 期缓存，以便单测通过 ``monkeypatch.setenv`` 生效。
+
+    @return 用户主目录绝对路径
+    """
+    raw = (os.environ.get("LLGRAPH_HOME") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path.home() / ".llgraph"
+
+
+def __getattr__(name: str):
+    """兼容旧代码 ``from ... import USER_LLGRAPH_HOME``（每次取最新 home）。"""
+    if name == "USER_LLGRAPH_HOME":
+        return user_llgraph_home()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def user_agent_config_path() -> Path:
@@ -18,7 +40,7 @@ def user_agent_config_path() -> Path:
 
     @return ~/.llgraph/agent.json
     """
-    return USER_LLGRAPH_HOME / AGENT_CONFIG_FILENAME
+    return user_llgraph_home() / AGENT_CONFIG_FILENAME
 
 
 def workspace_agent_config_path(workspace: Path) -> Path:

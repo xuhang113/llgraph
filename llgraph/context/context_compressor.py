@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from llgraph.context.context_message_split import split_messages_for_compress_strategy
 from llgraph.context.context_settings import is_auto_compress_strategy, resolve_context_settings
@@ -23,7 +24,6 @@ from llgraph.session.session_manifest import (
     build_session_manifest_message,
     is_session_manifest_message,
 )
-
 
 @dataclass
 class CompressReport:
@@ -110,6 +110,20 @@ def _compress_span_too_small(to_compress: list[BaseMessage]) -> bool:
     return estimate_tokens(to_compress) < _MIN_COMPRESS_SPAN_TOKENS
 
 
+def replace_agent_messages(agent: Any, config: dict[str, Any], messages: list[BaseMessage]) -> None:
+    """
+    用新列表整体替换 agent 内存中的 messages（add_messages 默认会追加）。
+
+    @param agent LangGraph agent
+    @param config configurable thread 配置
+    @param messages 替换后的完整消息链
+    """
+    agent.update_state(
+        config,
+        {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *messages]},
+    )
+
+
 def _message_to_dict(msg: BaseMessage) -> dict[str, Any]:
     role = "unknown"
     if isinstance(msg, HumanMessage):
@@ -173,7 +187,7 @@ class ContextCompressor:
 
     def should_auto_compress(self, messages: list[BaseMessage]) -> bool:
         """
-        是否应自动压缩。
+        是否应自动压缩（整窗占用达到 auto_compress_ratio）。
 
         @param messages 当前消息
         @return 是否超过阈值
@@ -190,6 +204,27 @@ class ContextCompressor:
                 return False
         return True
 
+    def resolve_compress_trigger(
+        self,
+        messages: list[BaseMessage],
+        *,
+        force: bool = False,
+        trigger: str = "auto",
+    ) -> str | None:
+        """
+        决定本次是否压缩及有效触发名（仅满窗阈值 / force）。
+
+        @param messages 当前消息
+        @param force 强制压缩
+        @param trigger 调用方传入的触发名（invoke/react/auto/…）
+        @return 有效 trigger；不压缩返回 None
+        """
+        if force:
+            return trigger or "force"
+        if self.should_auto_compress(messages):
+            return trigger if trigger and trigger != "auto" else "threshold"
+        return None
+
     def compress(
         self,
         messages: list[BaseMessage],
@@ -201,6 +236,8 @@ class ContextCompressor:
         """
         压缩消息列表（Tier1 + Tier2）。
 
+        触发：force 或整窗占用达到 auto_compress_ratio（默认约 85%）。
+
         @param messages 原始消息
         @param force 强制压缩（忽略阈值）
         @param preserve_current_turn cursor 策略：True 保留当前 user 轮；False 换窗仅 manifest+anchor；None 按策略默认
@@ -208,7 +245,12 @@ class ContextCompressor:
         """
         wall_start = time.perf_counter()
         before_tokens = estimate_tokens(messages)
-        if not force and not self.should_auto_compress(messages):
+        effective_trigger = self.resolve_compress_trigger(
+            messages,
+            force=force,
+            trigger=trigger,
+        )
+        if effective_trigger is None:
             return messages, None
 
         manifest_msgs = [m for m in messages if is_session_manifest_message(m)]
@@ -234,7 +276,7 @@ class ContextCompressor:
         if not to_compress:
             return messages, None
 
-        if not force and _compress_span_too_small(to_compress):
+        if not force and estimate_tokens(to_compress) < _MIN_COMPRESS_SPAN_TOKENS:
             return messages, None
 
         archive_path = None
@@ -288,7 +330,7 @@ class ContextCompressor:
             anchor_path=anchor_saved,
             elapsed_sec=time.perf_counter() - wall_start,
             llm_sec=llm_sec,
-            trigger=trigger,
+            trigger=effective_trigger,
         )
         return new_messages, report
 
@@ -358,7 +400,7 @@ def apply_compress_to_agent_state(
         },
     )
 
-    agent.update_state(config, {"messages": new_messages})
+    replace_agent_messages(agent, config, new_messages)
     from llgraph.session.session_file_store import save_agent_session_messages
 
     save_agent_session_messages(workspace, thread_id, new_messages, sync_pool=True)
@@ -375,6 +417,57 @@ def apply_compress_to_agent_state(
         anchor_path=report.anchor_path,
     )
     return report
+
+
+def peek_react_compress_needed(
+    agent: Any,
+    *,
+    thread_id: str,
+    workspace: Path,
+) -> bool:
+    """
+    预判 ReAct 中途是否将触发压缩（不调 LLM、不写状态）。
+
+    用于 UI：仅在真正需要摘要时展示「压缩摘要 LLM 调用中」。
+
+    @param agent LangGraph agent
+    @param thread_id 线程 ID
+    @param workspace 工作区根
+    @return 是否将压缩
+    """
+    settings = resolve_context_settings(workspace)
+    if not settings.compress_during_react:
+        return False
+    config = {"configurable": {"thread_id": thread_id}}
+    try:
+        state = agent.get_state(config)
+    except Exception:
+        return False
+    messages = list((state.values or {}).get("messages") or [])
+    if not messages:
+        return False
+    compressor = ContextCompressor(workspace, session_id=thread_id)
+    if compressor.resolve_compress_trigger(messages, trigger="react") is None:
+        return False
+    # 阈值路径：确认切分后有足够可压段
+    if compressor.should_auto_compress(messages):
+        preserve_current_turn = True
+        unpinned = _strip_ephemeral_system_messages(messages)
+        unpinned = [m for m in unpinned if not is_session_manifest_message(m)]
+        token_budget = int(
+            compressor.settings.max_tokens_estimate * compressor.settings.keep_recent_token_ratio
+        )
+        to_compress, _to_keep = split_messages_for_compress_strategy(
+            unpinned,
+            strategy=compressor.settings.compress_strategy,
+            preserve_current_turn=preserve_current_turn,
+            token_budget=token_budget,
+            min_user_turns=compressor.settings.keep_recent_turns,
+            estimate_tokens=estimate_tokens,
+        )
+        if not to_compress or _compress_span_too_small(to_compress):
+            return False
+    return True
 
 
 def maybe_compress_during_react(

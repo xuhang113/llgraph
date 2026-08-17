@@ -148,6 +148,7 @@ def _strip_user_injected_context(text: str) -> str:
 
     out = text
     out = re.sub(r"<workspace-context>[\s\S]*?</workspace-context>\s*", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"</?user_query>\s*", "", out, flags=re.IGNORECASE)
     out = re.sub(r"<session-manifest>[\s\S]*?</session-manifest>\s*", "", out, flags=re.IGNORECASE)
     out = re.sub(r"<custom-command[\s\S]*?</custom-command>\s*", "", out, flags=re.IGNORECASE)
     return out.strip()
@@ -223,9 +224,27 @@ def simplify_message(
     if "human" in msg_type.lower():
         display_text = _strip_user_injected_context(display_text)
         from llgraph.core.agent_turn import THINK_CONTINUE_NUDGE
+        from llgraph.context.conversation_anchor import (
+            is_conversation_anchor_message,
+            is_conversation_summary_message,
+        )
+        from langchain_core.messages import HumanMessage
+
+        from llgraph.session.session_manifest import is_session_manifest_message
 
         if display_text.strip() == THINK_CONTINUE_NUDGE.strip():
             kind = "think_nudge"
+        else:
+            try:
+                probe = HumanMessage(content=content if isinstance(content, str) else display_text)
+                if is_session_manifest_message(probe):
+                    kind = "manifest"
+                elif is_conversation_anchor_message(probe):
+                    kind = "anchor"
+                elif is_conversation_summary_message(probe):
+                    kind = "summary"
+            except Exception:
+                pass
     elif "ai" in msg_type.lower() or "assistant" in msg_type.lower():
         from llgraph.context.chat_history_repair import is_dispatch_placeholder_text
         from llgraph.context.message_normalize import format_agent_chat_display_text
@@ -523,9 +542,32 @@ def touch_workspace_opened(slug: str) -> None:
     get_control_gateway().touch_workspace_opened(slug)
 
 
+def _agent_subagent_children(workspace: Path, thread_id: str) -> list[dict[str, Any]]:
+    """Agent 会话下已登记的 explore/subagent 子节点。"""
+    from llgraph.subagent.registry import load_subagent_children
+
+    children: list[dict[str, Any]] = []
+    for row in load_subagent_children(workspace, thread_id):
+        sub_thread = str(row.get("sub_thread") or "").strip()
+        if not sub_thread:
+            continue
+        children.append(
+            {
+                "kind": "subagent",
+                "thread_id": sub_thread,
+                "sub_id": str(row.get("sub_id") or ""),
+                "title": str(row.get("title") or row.get("kind") or "Subagent"),
+                "status": str(row.get("status") or ""),
+                "subgraph_kind": str(row.get("kind") or "explore"),
+                "children": [],
+            }
+        )
+    return children
+
+
 def build_session_tree(workspace: Path) -> dict[str, Any]:
     """
-    构建工作区会话树（Agent + Plan + Worker 子节点）。
+    构建工作区会话树（Agent + Plan + Worker / Subagent 子节点）。
 
     @param workspace 工作区根
     @return 树形结构
@@ -539,7 +581,7 @@ def build_session_tree(workspace: Path) -> dict[str, Any]:
             "title": s.title,
             "title_full": s.title_full,
             "updated_at": s.updated_at,
-            "children": [],
+            "children": _agent_subagent_children(workspace, s.thread_id),
         }
         for s in agents
     ]

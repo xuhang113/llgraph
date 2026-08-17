@@ -1,16 +1,19 @@
 import type { TraceTurn } from '../../types/trace';
+import { filterTraceStepsForDisplay } from '../../types/trace';
 import TraceStepList from './TraceStepList';
 
 interface Props {
   turns: TraceTurn[];
   defaultOpenLast?: boolean;
   expandBodies?: boolean;
+  slug?: string;
 }
 
 export default function TraceTurnList({
   turns,
   defaultOpenLast = true,
   expandBodies = false,
+  slug,
 }: Props) {
   if (turns.length === 0) {
     return null;
@@ -19,7 +22,8 @@ export default function TraceTurnList({
   return (
     <div className="cursor-trace-turn-list">
       {turns.map((turn, turnIndex) => {
-        if (turn.steps.length === 0) {
+        const visibleSteps = filterTraceStepsForDisplay(turn.steps);
+        if (visibleSteps.length === 0) {
           return null;
         }
         const openLast =
@@ -34,12 +38,13 @@ export default function TraceTurnList({
           >
             <header className="cursor-trace-turn-header">
               <span className="cursor-trace-turn-label">{turn.label}</span>
-              <span className="cursor-trace-turn-meta">{turn.steps.length} 步</span>
+              <span className="cursor-trace-turn-meta">{visibleSteps.length} 步</span>
             </header>
             <TraceStepList
               steps={turn.steps}
               defaultOpenLast={openLast}
               expandBodies={expandBodies}
+              slug={slug}
             />
           </section>
         );

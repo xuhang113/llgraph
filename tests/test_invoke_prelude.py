@@ -20,4 +20,3 @@ def test_print_invoke_prelude_uses_trace_sink():
     print_invoke_prelude(trace)
     assert len(sink.lines) == 1
     assert "准备中" in sink.lines[0]
-    assert "invoke 前预处理" in sink.lines[0]

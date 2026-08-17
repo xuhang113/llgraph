@@ -88,10 +88,24 @@ export function bumpSidebarSession(
   }
 }
 
-/** 新建 Agent 尚未落盘时，保留侧栏 optimistic 条目。 */
+/** 新建 Agent 尚未出现在 tree API 时，保留侧栏 optimistic 条目。 */
 export function prependAgentSession(
   setAgents: Dispatch<SetStateAction<TreeNode[]>>,
   node: TreeNode,
 ): void {
-  setAgents((prev) => [node, ...prev.filter((item) => item.thread_id !== node.thread_id)]);
+  setAgents((prev) => [
+    { ...node, _optimistic: true },
+    ...prev.filter((item) => item.thread_id !== node.thread_id),
+  ]);
+}
+
+/** 删除会话后即时从侧栏移除（不必等 tree 刷新）。 */
+export function removeSessionsFromTree(
+  threadIds: Iterable<string>,
+  setAgents: Dispatch<SetStateAction<TreeNode[]>>,
+  setPlans: Dispatch<SetStateAction<TreeNode[]>>,
+): void {
+  const idSet = new Set(threadIds);
+  setAgents((prev) => prev.filter((n) => !idSet.has(n.thread_id)));
+  setPlans((prev) => prev.filter((n) => !idSet.has(n.thread_id)));
 }

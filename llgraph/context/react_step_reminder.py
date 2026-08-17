@@ -1,58 +1,42 @@
-"""ReAct 步间批量工具提醒：工具返回后、下一轮 LLM 前注入（仅 dispatch，不落盘）。"""
+"""ReAct 步间提醒：工具返回后、下一轮 LLM 前注入（仅 dispatch，不落盘）。
+
+只提醒批量工具与往返预算；不按意图分流决策。
+"""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from llgraph.context.chat_history_repair import ai_message_tool_calls
-
-REACT_STEP_BATCH_REMINDER = (
-    "[系统·ReAct 步间提醒] 你刚从工具返回。若还要继续调查："
-    "仍需 ≥2 次 grep/read/glob/list → **同一条 assistant 消息内**一次发出多个 tool_call；"
-    "多词检索 → 一条 `grep_files(pattern=\"a|b|c\", path=\".\")`；"
-    "多 path → `read_files(paths=[...])`。"
-    "证据已够 → **停 tool**，直接输出用户可见正文。"
-)
-
-REACT_STEP_SINGLE_TOOL_NUDGE = (
-    "[系统·ReAct 步间提醒] 上一轮仅 **1 个** tool_call。"
-    "若 thinking 里还有未执行的检索/读取目标，本轮必须合并为同消息多 tool_call "
-    "或 `grep_files(pattern=\"a|b|c\")`；禁止再拆成下一轮单 grep/read。"
-    "证据够则停 tool 直接答。"
+from llgraph.context.investigate_harness import (
+    count_tool_rounds_since_user,
+    is_ephemeral_harness_human,
+    last_real_user_text,
 )
 
 _NUDGE_MARKERS = (
+    "<system-reminder>",
     "[系统·ReAct 步间提醒]",
+    "[系统·探索预算]",
+    "[系统·强制结案]",
+    "[系统·防偏航收口]",
     "[系统] 你上一轮仅在 thinking",
 )
 
 
 def _is_ephemeral_nudge(msg: BaseMessage) -> bool:
-    if not isinstance(msg, HumanMessage):
-        return False
-    text = str(getattr(msg, "content", "") or "").strip()
-    return any(text.startswith(m) for m in _NUDGE_MARKERS)
-
-
-def _last_real_human_index(messages: list[BaseMessage]) -> int:
-    """末条真实用户消息下标（跳过步间 nudge）。"""
-    for idx in range(len(messages) - 1, -1, -1):
-        msg = messages[idx]
-        if isinstance(msg, HumanMessage) and not _is_ephemeral_nudge(msg):
-            return idx
-    return -1
+    return is_ephemeral_harness_human(msg) or (
+        isinstance(msg, HumanMessage)
+        and any(
+            str(getattr(msg, "content", "") or "").strip().startswith(m) for m in _NUDGE_MARKERS
+        )
+    )
 
 
 def _tool_rounds_since_last_user(messages: list[BaseMessage]) -> int:
-    """自末条用户消息以来，含 tool_calls 的 assistant 轮数。"""
-    start = _last_real_human_index(messages)
-    if start < 0:
-        start = 0
-    rounds = 0
-    for msg in messages[start + 1 :]:
-        if isinstance(msg, AIMessage) and ai_message_tool_calls(msg):
-            rounds += 1
-    return rounds
+    return count_tool_rounds_since_user(messages)
 
 
 def _last_ai_tool_call_count(messages: list[BaseMessage]) -> int:
@@ -78,35 +62,70 @@ def should_inject_react_step_reminder(messages: list[BaseMessage]) -> bool:
     if _tool_rounds_since_last_user(messages) < 1:
         return False
     for msg in reversed(messages[-3:]):
-        if isinstance(msg, HumanMessage) and str(getattr(msg, "content", "") or "").startswith(
-            "[系统·ReAct 步间提醒]"
-        ):
+        if not isinstance(msg, HumanMessage):
+            continue
+        body = str(getattr(msg, "content", "") or "").strip()
+        if body.startswith("<system-reminder>") or body.startswith("[系统·ReAct"):
             return False
     return True
 
 
-def react_step_reminder_content(messages: list[BaseMessage]) -> str:
+def react_step_reminder_content(
+    messages: list[BaseMessage],
+    *,
+    workspace: Path | None = None,
+) -> str:
     """
-    按上一轮 tool_call 数量选择提醒强度。
+    批量工具与预算提醒（不按意图分流）。
 
     @param messages 规范化前或后的消息列表
+    @param workspace 工作区根（预算上限）
     @return 提醒正文
     """
-    if _last_ai_tool_call_count(messages) == 1:
-        return REACT_STEP_SINGLE_TOOL_NUDGE
-    return REACT_STEP_BATCH_REMINDER
+    from llgraph.core.react_limits import format_tool_round_budget_line
+
+    excerpt = last_real_user_text(messages)
+    if len(excerpt) > 180:
+        excerpt = excerpt[:179] + "…"
+    single = _last_ai_tool_call_count(messages) == 1
+    if single:
+        body = (
+            "上一轮 assistant 仅 1 个 tool_call。若未完成，请并行多个独立工具，"
+            "或一条多词 grep_files。\n"
+        )
+    else:
+        body = "刚收到工具结果。未完成目标可批量补工具；证据够则写终答。\n"
+    budget = format_tool_round_budget_line(messages, workspace=workspace)
+    query_line = f'钉住 <user_query>："{excerpt}"\n' if excerpt else ""
+    return f"<system-reminder>\n{query_line}{budget}\n{body}</system-reminder>"
 
 
 def append_react_step_reminder_for_dispatch(
     messages: list[BaseMessage],
+    *,
+    workspace: Path | None = None,
 ) -> list[BaseMessage]:
     """
-    工具返回后的 ephemeral 提醒（不写 checkpoint）。
+    工具返回后的 ephemeral 提醒（不写 checkpoint）；始终带工具往返剩余次数。
 
     @param messages 即将发往模型的消息
+    @param workspace 工作区根
     @return 可能追加 HumanMessage 的副本
     """
-    if not should_inject_react_step_reminder(messages):
+    if should_inject_react_step_reminder(messages):
+        content = react_step_reminder_content(messages, workspace=workspace)
+        return [*messages, HumanMessage(content=content)]
+    from llgraph.core.react_limits import format_tool_round_budget_line
+
+    if not messages:
         return messages
-    content = react_step_reminder_content(messages)
-    return [*messages, HumanMessage(content=content)]
+    last = messages[-1]
+    if isinstance(last, HumanMessage):
+        body = str(getattr(last, "content", "") or "")
+        if "工具往返预算：" in body:
+            return messages
+    budget = format_tool_round_budget_line(messages, workspace=workspace)
+    return [
+        *messages,
+        HumanMessage(content=f"<system-reminder>\n{budget}\n</system-reminder>"),
+    ]

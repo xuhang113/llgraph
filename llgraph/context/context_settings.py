@@ -33,10 +33,6 @@ class ContextSettings:
     compress_trigger_max_tokens: int | None
     session_history_search_enabled: bool
     session_history_search_top_k: int
-    dispatch_keep_user_turns: int
-    dispatch_min_user_turns: int
-    dispatch_max_user_turns: int
-    dispatch_window_token_ratio: float
     compress_strategy: str
     compress_during_react: bool
     compress_summary_chunk_chars: int
@@ -47,11 +43,12 @@ class ContextSettings:
     read_file_max_lines: int
     tool_result_preview_head_lines: int
     dispatch_dedupe_read_paths: bool
-    dispatch_min_tool_rounds: int
     grep_context_lines: int
     grep_max_inline_chars: int
     spill_hit_context_lines: int
     tool_prune_token_ratio: float
+    protect_cited_tool_messages: bool
+    max_protected_cited_tool_messages: int
 
 
 def is_auto_compress_strategy(strategy: str) -> bool:
@@ -85,21 +82,11 @@ def normalize_compress_strategy(raw: object) -> str:
 # agent.json → context._docs 与 /context 展示用（_docs 键不参与运行）
 CONTEXT_CONFIG_DOCS: dict[str, str] = {
     "compress_strategy": (
-        "压缩与出站策略。可选值：\n"
+        "压缩策略。可选值：\n"
         "  auto（默认）— 接近满窗时用 LLM 将远早对话摘要为 <conversation-anchor>；"
-        "出站 user 轮按 token 自动扩展（见 dispatch_*）。\n"
+        "出站不裁 user 轮，超长工具结果用指针/预览。\n"
         "  legacy — 不滚动 LLM 摘要，按 keep_recent_turns / token 比例保留最近对话尾段。\n"
         "  cursor — 已废弃别名，等同 auto。"
-    ),
-    "dispatch_keep_user_turns": (
-        "发往模型前保留的 user 轮数。0=自动（在 dispatch_min～max 与 token 预算内尽量多留）；"
-        ">0=固定只保留最近 N 个 user 轮（含其间 assistant/tool 链）。"
-    ),
-    "dispatch_min_user_turns": "自动出站时至少保留的 user 轮数（默认 2）。",
-    "dispatch_max_user_turns": "自动出站时最多保留的 user 轮数（默认 8）。",
-    "dispatch_window_token_ratio": (
-        "自动出站时，历史对话可用上下文上限 = max_tokens_estimate × 本比例（默认 0.35）。"
-        "最近轮次 token 少时可多留 3～4 轮；轮次很长时可能只留 2 轮。"
     ),
     "compress_during_react": (
         "ReAct 单轮内工具链过长时是否中途压缩（auto 默认 true，legacy 默认 false）。"
@@ -136,8 +123,12 @@ CONTEXT_CONFIG_DOCS: dict[str, str] = {
         "超过后压缩为带 head/tail 预览的指针，避免仅一行路径导致误判。"
     ),
     "dispatch_dedupe_read_paths": "出站时同路径旧 read 替换为短指针，仅保留最新一次全文（auto 默认 true）。",
-    "dispatch_min_tool_rounds": (
-        "单 user 长 ReAct 时，出站至少保留的 tool 段数；超 token 预算后裁剪更早段（auto 默认 12）。"
+    "protect_cited_tool_messages": (
+        "被后续 AI 结论/推理以 path:line 或文件名引用过的历史 ToolMessage，"
+        "优先保留全文、延后裁剪（非满窗压力时生效；默认 true）。"
+    ),
+    "max_protected_cited_tool_messages": (
+        "protect_cited_tool_messages 时，超出 recency 窗口额外保护的被引用条数上限（默认 8）。"
     ),
     "grep_context_lines": "grep_files / ripgrep 每条命中上下附加上下文行数（auto 默认 5）。",
     "grep_max_inline_chars": (
@@ -166,15 +157,13 @@ def format_context_config_help(workspace: Path | None = None) -> str:
     ]
     order = (
         "compress_strategy",
-        "dispatch_keep_user_turns",
-        "dispatch_min_user_turns",
-        "dispatch_max_user_turns",
-        "dispatch_window_token_ratio",
         "compress_during_react",
         "auto_compress_ratio",
         "keep_recent_turns",
         "incremental_tool_prune",
         "keep_recent_tool_messages",
+        "dispatch_tool_chain_compress",
+        "dispatch_keep_full_tool_messages",
     )
     for key in order:
         doc = CONTEXT_CONFIG_DOCS.get(key, "")
@@ -186,21 +175,14 @@ def format_context_config_help(workspace: Path | None = None) -> str:
 
     if workspace is not None:
         settings = resolve_context_settings(workspace)
-        dispatch_mode = (
-            f"固定 {settings.dispatch_keep_user_turns} 轮"
-            if settings.dispatch_keep_user_turns > 0
-            else (
-                f"自动 {settings.dispatch_min_user_turns}～{settings.dispatch_max_user_turns} 轮 "
-                f"(预算 {int(settings.dispatch_window_token_ratio * 100)}%)"
-            )
-        )
         lines.extend(
             [
                 "当前生效值:",
                 f"  compress_strategy: {settings.compress_strategy}",
-                f"  出站窗口: {dispatch_mode}",
                 f"  compress_during_react: {settings.compress_during_react}",
                 f"  auto_compress_ratio: {settings.auto_compress_ratio}",
+                f"  dispatch_tool_chain_compress: {settings.dispatch_tool_chain_compress}",
+                f"  dispatch_keep_full_tool_messages: {settings.dispatch_keep_full_tool_messages}",
             ]
         )
     return "\n".join(lines).strip()
@@ -420,13 +402,6 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     else:
         dispatch_dedupe_read_paths = bool(dedupe_reads)
 
-    default_min_tool_rounds = 12 if is_auto_compress_strategy(compress_strategy) else 24
-    min_tool_rounds_raw = ctx.get("dispatch_min_tool_rounds", default_min_tool_rounds)
-    try:
-        dispatch_min_tool_rounds = max(4, int(min_tool_rounds_raw))
-    except (TypeError, ValueError):
-        dispatch_min_tool_rounds = default_min_tool_rounds
-
     grep_ctx_raw = ctx.get("grep_context_lines", 5)
     try:
         grep_context_lines = max(0, min(20, int(grep_ctx_raw)))
@@ -451,6 +426,18 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     except (TypeError, ValueError):
         tool_prune_token_ratio = 0.7
 
+    protect_cited_raw = ctx.get("protect_cited_tool_messages", True)
+    if isinstance(protect_cited_raw, str):
+        protect_cited_tool_messages = protect_cited_raw.strip().lower() not in ("0", "false", "no")
+    else:
+        protect_cited_tool_messages = bool(protect_cited_raw)
+
+    max_protected_cited_raw = ctx.get("max_protected_cited_tool_messages", 8)
+    try:
+        max_protected_cited_tool_messages = max(0, min(64, int(max_protected_cited_raw)))
+    except (TypeError, ValueError):
+        max_protected_cited_tool_messages = 8
+
     trigger_cap: int | None = None
     trigger_raw = ctx.get("compress_trigger_max_tokens")
     if trigger_raw is not None:
@@ -468,33 +455,6 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         history_top_k = max(1, min(20, int(history_top_k)))
     except (TypeError, ValueError):
         history_top_k = 8
-
-    # 0 = 按 token 自动扩展保留轮数；>0 = 固定 N 轮
-    default_dispatch_keep = 0 if is_auto_compress_strategy(compress_strategy) else 4
-    dispatch_keep = ctx.get("dispatch_keep_user_turns", default_dispatch_keep)
-    try:
-        dispatch_keep = max(0, min(32, int(dispatch_keep)))
-    except (TypeError, ValueError):
-        dispatch_keep = default_dispatch_keep
-
-    default_dispatch_min = 1 if is_auto_compress_strategy(compress_strategy) else 2
-    dispatch_min = ctx.get("dispatch_min_user_turns", default_dispatch_min)
-    try:
-        dispatch_min = max(1, min(16, int(dispatch_min)))
-    except (TypeError, ValueError):
-        dispatch_min = default_dispatch_min
-
-    dispatch_max = ctx.get("dispatch_max_user_turns", 8)
-    try:
-        dispatch_max = max(dispatch_min, min(32, int(dispatch_max)))
-    except (TypeError, ValueError):
-        dispatch_max = 8
-
-    dispatch_ratio = ctx.get("dispatch_window_token_ratio", 0.35)
-    try:
-        dispatch_ratio = min(0.6, max(0.1, float(dispatch_ratio)))
-    except (TypeError, ValueError):
-        dispatch_ratio = 0.35
 
     during_react = ctx.get("compress_during_react", is_auto_compress_strategy(compress_strategy))
     if isinstance(during_react, str):
@@ -534,21 +494,18 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         compress_trigger_max_tokens=trigger_cap,
         session_history_search_enabled=bool(history_search_on),
         session_history_search_top_k=history_top_k,
-        dispatch_keep_user_turns=dispatch_keep,
-        dispatch_min_user_turns=dispatch_min,
-        dispatch_max_user_turns=dispatch_max,
-        dispatch_window_token_ratio=dispatch_ratio,
         compress_strategy=compress_strategy,
         compress_during_react=compress_during_react,
         compress_summary_chunk_chars=compress_summary_chunk_chars,
         dispatch_tool_chain_compress=bool(dispatch_chain_compress),
         dispatch_keep_full_tool_messages=dispatch_keep_tools,
         dispatch_dedupe_read_paths=dispatch_dedupe_read_paths,
-        dispatch_min_tool_rounds=dispatch_min_tool_rounds,
         grep_context_lines=grep_context_lines,
         grep_max_inline_chars=grep_max_inline_chars,
         spill_hit_context_lines=spill_hit_context_lines,
         tool_prune_token_ratio=tool_prune_token_ratio,
+        protect_cited_tool_messages=protect_cited_tool_messages,
+        max_protected_cited_tool_messages=max_protected_cited_tool_messages,
     )
 
 

@@ -127,6 +127,7 @@ _BUILTIN_META_COMMAND_NAMES = frozenset({
     "changes",
     "undo",
     "diff",
+    "memory",
 })
 
 
@@ -1159,6 +1160,9 @@ def handle_meta_command(
     if lower in ("/compress", "compress") or lower.startswith("/compress "):
         return _handle_compress(workspace, agent_session)
 
+    if lower == "/memory" or lower.startswith("/memory "):
+        return _handle_memory_command(stripped, workspace)
+
     if lower in ("/context", "context"):
         from llgraph.context.context_stats import print_context_usage
 
@@ -1400,6 +1404,58 @@ def handle_meta_command(
         return True
 
     return False
+
+
+def _handle_memory_command(line: str, workspace: Path) -> bool:
+    """处理 /memory list|delete|consolidate。"""
+    import shlex
+
+    try:
+        parts = shlex.split(line.strip())
+    except ValueError as exc:
+        emit(f"无法解析 /memory 参数: {exc}", colorize=True)
+        return True
+    tokens = parts[1:] if parts and parts[0].lower() in ("/memory", "memory") else parts
+    if not tokens or tokens[0].lower() in ("help", "?"):
+        emit(
+            "用法: /memory list | /memory delete <id> | /memory consolidate",
+            colorize=True,
+        )
+        return True
+    sub = tokens[0].lower()
+    from llgraph.memory.write import delete_memory, format_memory_list
+
+    if sub == "list":
+        emit_report(format_memory_list(workspace))
+        return True
+    if sub == "consolidate":
+        from llgraph.memory.consolidate import consolidate_workspace_memory
+        from llgraph.memory.trace_emit import emit_memory_consolidate_trace_step
+
+        report = consolidate_workspace_memory(workspace)
+        emit_report(
+            f"整理完成: merged={report.merged} replaced={report.replaced} "
+            f"pruned_ttl={report.pruned_ttl} pruned_cap={report.pruned_cap} "
+            f"elapsed={report.elapsed_sec:.2f}s"
+        )
+        emit_memory_consolidate_trace_step(
+            merged=report.merged,
+            replaced=report.replaced,
+            pruned_ttl=report.pruned_ttl,
+            pruned_cap=report.pruned_cap,
+            elapsed_sec=report.elapsed_sec,
+        )
+        return True
+    if sub in ("delete", "reject"):
+        if len(tokens) < 2:
+            emit("/memory delete 需要 memory_id。", colorize=True)
+            return True
+        mid = tokens[1].strip()
+        delete_memory(workspace, mid)
+        emit_report(f"已删除 memory id={mid}")
+        return True
+    emit("未知子命令。用法: /memory list|delete|consolidate", colorize=True)
+    return True
 
 
 def _handle_compress(workspace: Path, agent_session: AgentSessionContext | None) -> bool:

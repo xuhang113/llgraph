@@ -1,4 +1,5 @@
 import type { Capabilities } from '../../api/client';
+import { formatMcpToolDisplay, mcpServerZh } from '../../utils/mcpDisplay';
 
 interface Props {
   caps: Capabilities | null;
@@ -43,10 +44,32 @@ export default function CapabilitiesPanel({ caps, onTraceMode }: Props) {
       <section>
         <h3>MCP ({caps.mcp_tools.length})</h3>
         <p className="muted small">{caps.mcp_summary}</p>
+        {caps.mcp_loading && <p className="muted small">MCP 后台加载中…</p>}
+        {!!caps.mcp_servers?.length && (
+          <ul className="caps-list">
+            {caps.mcp_servers.map((s) => (
+              <li key={s.name}>
+                <strong>{s.name}</strong>
+                <span className="muted">
+                  {' '}
+                  · {mcpServerZh(s.name)} ·{' '}
+                  {s.status === 'ok'
+                    ? `已连接 · ${s.tool_count ?? 0} 工具`
+                    : s.status === 'loading'
+                      ? '加载中'
+                      : s.status === 'error'
+                        ? `已跳过${s.error ? `：${s.error}` : ''}`
+                        : '未就绪'}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
         <ul className="caps-list">
           {caps.mcp_tools.map((t) => (
             <li key={t.name}>
               <strong>{t.name}</strong>
+              <div className="small muted">{formatMcpToolDisplay(t.name, t.description)}</div>
             </li>
           ))}
         </ul>

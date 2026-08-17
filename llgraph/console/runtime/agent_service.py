@@ -69,9 +69,9 @@ def _persist_web_trace_turn(
     log_lines, step_payloads = _collect_web_trace_payload(trace)
     if not step_payloads and not log_lines:
         return
-    from llgraph.session.web_trace_store import save_last_web_trace
+    from llgraph.session.web_trace_store import append_web_trace_turn
 
-    save_last_web_trace(
+    append_web_trace_turn(
         req.workspace,
         req.thread_id,
         log_lines=log_lines,
@@ -98,6 +98,8 @@ def _start_web_trace_heartbeat(
     emit: Callable[[dict[str, Any]], None],
     stop: threading.Event,
     turn_start: float,
+    workspace: Path | None = None,
+    thread_id: str | None = None,
 ) -> threading.Thread:
     """
     Web 长耗时阶段心跳：工具/LLM 阻塞时仍推送 trace_activity，避免 UI 看似卡死。
@@ -106,6 +108,8 @@ def _start_web_trace_heartbeat(
     @param emit SSE 回调
     @param stop 停止事件
     @param turn_start 轮次开始 monotonic 时间
+    @param workspace 工作区（用于刷新 live_web_trace mtime）
+    @param thread_id 会话 thread
     @return 心跳线程
     """
 
@@ -129,6 +133,13 @@ def _start_web_trace_heartbeat(
                     "phase": phase,
                 }
             )
+            if workspace is not None and thread_id:
+                try:
+                    from llgraph.session.web_trace_store import touch_live_web_trace
+
+                    touch_live_web_trace(workspace, thread_id)
+                except Exception:
+                    pass
 
     thread = threading.Thread(target=run, daemon=True, name="web-trace-heartbeat")
     thread.start()
@@ -166,7 +177,10 @@ def reconcile_stale_agent_chat(
     max_trace_idle_sec: float = _STALE_TRACE_IDLE_SEC,
 ) -> bool:
     """
-    若 Web trace 长时间无更新但会话仍标记 running，则强制释放占用。
+    若 Web 会话登记为 running、但工作线程已死且 live_web_trace 长时间无更新，则强制释放占用。
+
+    注意：spawn_subagent 等长工具阻塞时父会话可能数分钟无新步骤，只要工作线程仍存活就不得误杀，
+    否则 sessionMeta.running=false，前端切回标签会以为 ReAct 已终止。
 
     @param workspace 工作区根
     @param thread_id 会话 ID
@@ -174,6 +188,10 @@ def reconcile_stale_agent_chat(
     @return 是否执行了强制释放
     """
     if not is_agent_chat_running(thread_id):
+        return False
+    with _ACTIVE_AGENT_CHATS_LOCK:
+        worker = _ACTIVE_AGENT_CHAT_THREADS.get(thread_id)
+    if worker is not None and worker.is_alive():
         return False
     from llgraph.session.web_trace_store import live_web_trace_path
 
@@ -279,6 +297,7 @@ def create_agent_session(workspace: Path, *, title: str = "") -> str:
             "title": title or "",
             "allow_write": True,
         },
+        touch_activity=True,
     )
     return thread_id
 
@@ -320,6 +339,9 @@ class AgentChatRequest:
     message: str
     allow_write: bool = False
     images: list | None = None
+    """本轮已落盘的图片引用；有则不再二次 save，且可跳过 pending append。"""
+    image_refs: list | None = None
+    skip_pending_user_append: bool = False
 
 
 def run_agent_chat(
@@ -371,6 +393,8 @@ def run_agent_chat(
         return
 
     rt = RUNTIME_MANAGER.get(req.workspace, allow_write=req.allow_write)
+    # MCP 后台加载；短等即可。失败/超时不阻塞对话，未就绪则本轮无 MCP 工具。
+    RUNTIME_MANAGER.wait_mcp_ready(req.workspace, timeout=2.0)
     trace = TraceSession(mode=rt.trace_session.mode)
     from llgraph.console.runtime.sse_sink import PersistingSseTraceSink, SseTraceSink
 
@@ -398,17 +422,21 @@ def run_agent_chat(
         allow_write=req.allow_write,
         mcp_tools=rt.mcp_tools,
         mcp_registry=rt.mcp_registry,
-        watch_service=None,
+        watch_service=rt.watch_service,
         web_search_enabled=rt.web_search_enabled,
         sandbox_policy=rt.sandbox_policy,
         sandbox_cli_enabled=rt.sandbox_cli_enabled,
         no_spill=False,
         memory_kind="memory",
         mcp_summary=rt.mcp_summary,
-        watch_active=False,
+        watch_active=bool(
+            rt.watch_service is not None and getattr(rt.watch_service, "active", False)
+        ),
     )
 
     turn_end_emitted = False
+    turn_start = time.monotonic()
+    agent_ctx = None
 
     try:
         emit({"type": "turn_start", "thread_id": req.thread_id})
@@ -420,16 +448,26 @@ def run_agent_chat(
         context_spill = ContextSpill.create(req.workspace, session_id=req.thread_id, disabled=False)
 
         hb_stop = threading.Event()
-        turn_start = time.monotonic()
         _start_web_trace_heartbeat(
             trace,
             emit=emit,
             stop=hb_stop,
             turn_start=turn_start,
+            workspace=req.workspace,
+            thread_id=req.thread_id,
         )
         try:
             def cancel_check() -> bool:
                 return is_agent_cancel_requested(req.thread_id)
+
+            slot = getattr(agent_ctx, "subagent_parent_slot", None)
+            if slot is not None:
+                agent_ctx.sse_emit = emit
+                slot.bind_from_session(
+                    agent_ctx,
+                    sse_emit=emit,
+                    cancel_check=cancel_check,
+                )
 
             text = invoke_agent(
                 agent_ctx.agent,
@@ -445,6 +483,8 @@ def run_agent_chat(
                 cancel_check=cancel_check,
                 run_source="web",
                 images=req.images,
+                image_refs=req.image_refs,
+                skip_pending_user_append=req.skip_pending_user_append,
             )
         finally:
             hb_stop.set()
@@ -488,9 +528,9 @@ def run_agent_chat(
                 payload["trace_steps"] = step_payloads
             log_lines, _ = _collect_web_trace_payload(trace)
             if step_payloads or log_lines:
-                from llgraph.session.web_trace_store import save_last_web_trace
+                from llgraph.session.web_trace_store import append_web_trace_turn
 
-                save_last_web_trace(
+                append_web_trace_turn(
                     req.workspace,
                     req.thread_id,
                     log_lines=log_lines,
@@ -508,11 +548,46 @@ def run_agent_chat(
                 payload["survey"] = survey
                 payload["type"] = "survey"
             emit(payload)
+            from llgraph.session.session_title_llm import schedule_session_title_llm_refresh
+
+            schedule_session_title_llm_refresh(
+                req.workspace,
+                req.thread_id,
+                user_message=req.message,
+                assistant_reply=display_text,
+                on_updated=lambda title: emit({
+                    "type": "title_updated",
+                    "title": title,
+                    "thread_id": req.thread_id,
+                }),
+            )
     except Exception as exc:
         force_release_agent_chat(req.thread_id)
         emit({"type": "error", "message": str(exc)})
         emit({"type": "end"})
         turn_end_emitted = True
+        # 准备阶段/未进入 stream 的异常不会走 invoke 内 log_turn_failure；写入执行日志便于 Log 面板排查
+        if not getattr(exc, "_llgraph_turn_error_logged", False):
+            try:
+                from llgraph.display.execution_log import log_turn_failure
+                from llgraph.session.session_run_log import trace_run_context
+
+                agent_for_log = None
+                if agent_ctx is not None:
+                    agent_for_log = getattr(agent_ctx, "agent", None)
+                log_turn_failure(
+                    req.workspace,
+                    thread_id=req.thread_id,
+                    with_memory=True,
+                    agent=agent_for_log or object(),
+                    duration_sec=time.monotonic() - turn_start,
+                    error=exc,
+                    outcome="error",
+                    trace_context=trace_run_context(trace),
+                    user_message=req.message,
+                )
+            except Exception:
+                pass
         try:
             _persist_web_trace_turn(
                 req,

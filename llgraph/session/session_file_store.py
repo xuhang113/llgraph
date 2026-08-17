@@ -274,8 +274,12 @@ def persist_agent_session(
     if not messages:
         return None
     from llgraph.context.message_canonical import to_canonical_v2_messages
+    from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
+    from llgraph.context.investigate_harness import strip_ephemeral_harness_messages
     from llgraph.session.session_image_store import canonicalize_messages_image_refs
 
+    # 先去掉 think_nudge 等 ephemeral，再写 image_ref，避免认错「最后一条 Human」
+    messages = strip_ephemeral_harness_messages(messages)
     if turn_image_refs:
         messages = canonicalize_messages_image_refs(
             messages,
@@ -288,9 +292,8 @@ def persist_agent_session(
 
     cleaned, _report = to_canonical_v2_messages(messages)
     cleaned, stripped = strip_inline_images_from_messages(cleaned)
-    from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
-
     cleaned = ensure_messages_include_conversation_anchor(workspace, thread_id, cleaned)
+    cleaned = strip_ephemeral_harness_messages(cleaned)
     if stripped or turn_image_refs:
         try:
             agent.update_state(config, {"messages": cleaned})
@@ -342,4 +345,4 @@ def _write_session_meta(workspace: Path, thread_id: str, message_count: int) -> 
         patch["title"] = existing["title"]
     if existing.get("title_source"):
         patch["title_source"] = existing["title_source"]
-    save_session_meta(workspace, thread_id, patch)
+    save_session_meta(workspace, thread_id, patch, touch_activity=True)

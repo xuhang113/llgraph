@@ -75,14 +75,22 @@ def llm_thinking_text(response: Any) -> str:
     合并 content 内 thinking/reasoning 块与 llgraph.thinking_text。
 
     @param response AIMessage 或兼容对象
-    @return thinking 全文
+    @return thinking 全文；网关仅回 signature 时返回占位说明
     """
     content = getattr(response, "content", response)
     visible = llm_content_text(content, fallback_thinking=False).strip()
     from_blocks = llm_content_text(content, fallback_thinking=True).strip()
     block_thinking = from_blocks if from_blocks and from_blocks != visible else ""
     meta = llgraph_meta_thinking(response)
-    return meta or block_thinking
+    if meta or block_thinking:
+        return meta or block_thinking
+    # Opus/Bedrock：仅 signature、无明文
+    extra = getattr(response, "additional_kwargs", None) or {}
+    if isinstance(extra, dict):
+        llg = extra.get("llgraph")
+        if isinstance(llg, dict) and llg.get("thinking_redacted"):
+            return "（模型已思考，但当前网关未返回思考明文，仅保留签名块供多轮回传。）"
+    return ""
 
 
 def llm_response_text(response: Any, *, fallback_thinking: bool = False) -> str:

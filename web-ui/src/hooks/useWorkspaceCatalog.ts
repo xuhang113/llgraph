@@ -113,7 +113,9 @@ export function useWorkspaceCatalog({
         setAgents((prev) => {
           const loaded = t.agents ?? [];
           const loadedIds = new Set(loaded.map((n) => n.thread_id));
-          const pending = prev.filter((n) => !loadedIds.has(n.thread_id));
+          const pending = prev.filter(
+            (n) => n._optimistic && !loadedIds.has(n.thread_id),
+          );
           return [...pending, ...loaded];
         });
         setPlans(t.plans ?? []);

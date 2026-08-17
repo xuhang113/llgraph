@@ -33,8 +33,15 @@ _SKIP_AUTO_TITLE_MESSAGES = frozenset({
 
 _INJECTED_USER_BLOCK_PATTERNS: tuple[tuple[str, int], ...] = (
     (r"<workspace-context>[\s\S]*?</workspace-context>\s*", re.IGNORECASE),
+    (r"</?user_query>\s*", re.IGNORECASE),
     (r"<session-manifest>[\s\S]*?</session-manifest>\s*", re.IGNORECASE),
     (r"<custom-command[\s\S]*?</custom-command>\s*", re.IGNORECASE),
+)
+
+_STRUCTURED_KEY_LINE = re.compile(r"^[a-z0-9_.-]+:\s*$", re.IGNORECASE)
+_CODE_TITLE_PREFIX = re.compile(
+    r"^(package|import|class|def|public|private|#include|using|namespace)\b",
+    re.IGNORECASE,
 )
 
 
@@ -71,6 +78,8 @@ def save_session_meta(
     workspace: Path,
     thread_id: str,
     patch: dict[str, Any],
+    *,
+    touch_activity: bool = False,
 ) -> None:
     """
     合并写入 meta.json（保留已有 title 等字段）。
@@ -78,12 +87,18 @@ def save_session_meta(
     @param workspace 工作区根
     @param thread_id 线程 ID
     @param patch 待合并字段
+    @param touch_activity 为 True 时刷新 updated_at（对话活动）；标题补全等应 False
     """
     path = session_meta_json_path(workspace, thread_id)
     merged = load_session_meta(workspace, thread_id)
+    had_activity = bool(str(merged.get("updated_at") or "").strip())
     merged.update(patch)
     merged["thread_id"] = thread_id
-    merged["updated_at"] = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    if touch_activity:
+        merged["updated_at"] = now
+    elif not had_activity and not str(merged.get("updated_at") or "").strip():
+        merged["updated_at"] = now
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -104,7 +119,7 @@ def touch_session_activity(workspace: Path, thread_id: str, **extra: Any) -> Non
     """
     if not thread_id.strip():
         return
-    save_session_meta(workspace, thread_id, dict(extra))
+    save_session_meta(workspace, thread_id, dict(extra), touch_activity=True)
 
 
 def strip_injected_context_from_user_message(text: str) -> str:
@@ -120,6 +135,97 @@ def strip_injected_context_from_user_message(text: str) -> str:
     for pattern, flags in _INJECTED_USER_BLOCK_PATTERNS:
         out = re.sub(pattern, "", out, flags=flags)
     return out.strip()
+
+
+def _extract_structured_key_body(text: str) -> str:
+    """
+    解析「键:\\n值」多段结构（无 inline 值），取信息量最大的正文段。
+
+    @param text 去注入后的用户消息
+    @return 正文；非结构化返回空串
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    lines = raw.splitlines()
+    if not lines or not _STRUCTURED_KEY_LINE.match(lines[0].strip()):
+        return ""
+
+    sections: list[str] = []
+    idx = 0
+    while idx < len(lines):
+        if not _STRUCTURED_KEY_LINE.match(lines[idx].strip()):
+            idx += 1
+            continue
+        idx += 1
+        chunk: list[str] = []
+        while idx < len(lines) and not _STRUCTURED_KEY_LINE.match(lines[idx].strip()):
+            part = lines[idx].strip()
+            if part:
+                chunk.append(part)
+            idx += 1
+        if chunk:
+            sections.append("\n".join(chunk))
+    if not sections:
+        return ""
+    return max(sections, key=_structured_body_section_score)
+
+
+def _structured_body_section_score(text: str) -> float:
+    """
+    键值块正文段的标题候选评分（偏自然语言/长描述，降权单标识符）。
+
+    @param text 段正文
+    @return 分数越高越适合作为标题来源
+    """
+    t = str(text or "").strip()
+    if not t:
+        return 0.0
+    score = float(len(t))
+    if re.search(r"[\u4e00-\u9fff]", t):
+        score += 20.0
+    if re.search(r"[\s，。！？,.!?;；]", t):
+        score += 10.0
+    if re.match(r"^[a-z0-9_.-]+$", t, flags=re.IGNORECASE) and len(t) <= 48:
+        score -= 15.0
+    return score
+
+
+def extract_user_body_for_title(text: str) -> str:
+    """
+    提取可用于标题生成的用户正文（去注入块与键值块结构）。
+
+    @param text 原始用户消息
+    @return 用户意图正文
+    """
+    visible = strip_injected_context_from_user_message(text)
+    structured = _extract_structured_key_body(visible)
+    if structured:
+        return structured
+    return visible.strip()
+
+
+def is_weak_auto_session_title(title: str) -> bool:
+    """
+    判断自动标题是否过短或像结构化字段/代码残片。
+
+    @param title 当前标题
+    @return 是否应尝试 LLM 重写
+    """
+    t = str(title or "").strip()
+    if not t:
+        return True
+    if len(t) < 4:
+        return True
+    if t.endswith(":") or t.endswith("："):
+        return True
+    if _STRUCTURED_KEY_LINE.match(t):
+        return True
+    if _CODE_TITLE_PREFIX.match(t):
+        return True
+    if _looks_like_injected_title_fragment(t):
+        return True
+    return False
 
 
 def _looks_like_injected_title_fragment(text: str) -> bool:
@@ -184,7 +290,7 @@ def extract_title_candidate(text: str) -> str:
     raw = str(text or "").strip()
     if not raw:
         return ""
-    cleaned = strip_injected_context_from_user_message(raw)
+    cleaned = extract_user_body_for_title(raw)
     if not cleaned:
         return ""
     cleaned = re.sub(r"```[\s\S]*?```", " ", cleaned)
@@ -258,7 +364,7 @@ def should_use_message_for_auto_title(text: str) -> bool:
     @param text 用户消息
     @return 是否采用
     """
-    stripped = strip_injected_context_from_user_message(text)
+    stripped = extract_user_body_for_title(text)
     if not stripped:
         return False
     from llgraph.terminal.keys import is_exit_command
@@ -284,8 +390,8 @@ def suggest_full_title_from_text(text: str) -> str:
     """
     if not should_use_message_for_auto_title(text):
         return ""
-    visible = strip_injected_context_from_user_message(text)
-    candidate = extract_title_candidate(visible or text)
+    visible = extract_user_body_for_title(text)
+    candidate = extract_title_candidate(text)
     if candidate and _looks_like_injected_title_fragment(candidate):
         candidate = ""
     return normalize_session_title(
@@ -647,6 +753,8 @@ def ensure_session_title_auto(
         return None
     suggested = suggest_full_title_from_text(user_message)
     if not suggested:
+        return None
+    if is_weak_auto_session_title(suggested):
         return None
     set_session_title(workspace, thread_id, suggested, source="auto")
     _sync_plan_json_title_after_auto(workspace, thread_id, suggested)

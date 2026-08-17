@@ -321,17 +321,39 @@ def dispatch_index(
 
     index_lock = IndexLock(workspace)
     if not index_lock.try_acquire():
-        print(
-            "错误: 索引锁被占用（可能 llgraph Agent 的 index-watch 正在运行）",
-            file=sys.stderr,
+        msg = "索引锁被占用（可能 llgraph Agent 的 index-watch 正在运行）"
+        print(f"错误: {msg}", file=sys.stderr)
+        from llgraph.code_index.index_progress import write_live_progress
+
+        write_live_progress(
+            workspace,
+            {
+                "running": False,
+                "action": mode,
+                "phase": "done",
+                "ok": False,
+                "error": msg,
+                "files_scanned": 0,
+                "files_skipped": 0,
+                "files_updated": 0,
+                "chunks_written": 0,
+                "percent": None,
+                "elapsed_sec": 0.0,
+            },
         )
         return IndexDispatchResult(exit_code=1)
 
-    progress: IndexProgressDisplay | None = None
+    settings = resolve_index_settings(workspace)
+    soft_total = settings.max_files or len(load_manifest(workspace)) or None
+    # 始终落盘进度（Web 轮询）；TTY 时额外画终端条
+    progress = IndexProgressDisplay(
+        enabled=resolve_show_progress(workspace, quiet=args.quiet),
+        workspace=workspace,
+        action=mode,
+        files_total=soft_total,
+    )
+    result = None
     try:
-        if resolve_show_progress(workspace, quiet=args.quiet):
-            progress = IndexProgressDisplay()
-
         result = run_index(
             workspace,
             incremental=args.incremental,
@@ -341,36 +363,34 @@ def dispatch_index(
             dry_run=args.dry_run,
             clear_embedding_cache=args.clear_embed_cache,
             progress=progress,
-            on_progress=(
-                None
-                if progress is not None
-                else (lambda msg: print(msg, flush=True))
-            ),
+            on_progress=None,
         )
     except RuntimeError as exc:
         print(f"错误: {exc}", file=sys.stderr)
         print(f"日志文件: {log_path}", file=sys.stderr)
+        progress.finish(
+            files_scanned=0,
+            files_updated=0,
+            files_skipped=0,
+            chunks_written=0,
+            ok=False,
+            error=str(exc),
+        )
         index_lock.release()
         return IndexDispatchResult(exit_code=1, log_path=log_path)
     finally:
         index_lock.release()
 
+    assert result is not None
     print(f"\n日志文件: {log_path}", flush=True)
-    if progress is not None:
-        progress.finish(
-            files_scanned=result.files_scanned,
-            files_updated=result.files_updated,
-            files_skipped=result.files_skipped,
-            chunks_written=result.chunks_written,
-            ok=not result.errors,
-        )
-    else:
-        print(
-            f"完成: 扫描 {result.files_scanned} 文件, "
-            f"更新 {result.files_updated}, 跳过 {result.files_skipped}, "
-            f"写入 {result.chunks_written} chunks",
-            flush=True,
-        )
+    progress.finish(
+        files_scanned=result.files_scanned,
+        files_updated=result.files_updated,
+        files_skipped=result.files_skipped,
+        chunks_written=result.chunks_written,
+        ok=not result.errors,
+        error="; ".join(result.errors[:3]) if result.errors else None,
+    )
     if result.errors:
         print(f"错误 {len(result.errors)} 个（完整列表见日志）", file=sys.stderr)
         for err in result.errors[:5]:

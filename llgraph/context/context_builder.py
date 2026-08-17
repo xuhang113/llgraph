@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,6 +45,72 @@ def _format_manual_skill_pin_hint(workspace: Path, session: ContextSession) -> s
     return "\n".join(lines).strip()
 
 
+# 用户在追问「压缩前 / 更早轮次」的细节、结论、对比时的口吻
+_HISTORY_RECALL_RE = re.compile(
+    r"(之前|先前|早些|早前|前面|前文|上一轮|上次|上回|刚才|刚刚|前几轮|更早|历史里|压缩前|"
+    r"你(说过|讲过|提到过|分析过|查过|得出)|当时(说|的结论)|earlier|previously|before you)",
+)
+
+# 广搜/摸底类：近端强调 spawn（与针点并行搜读区分）
+_SPAWN_RESEARCH_RE = re.compile(
+    r"(整理|梳理|摸底|调研|全貌|概览|链路|流程|业务|架构|调用链|数据流|端到端|"
+    r"怎么串|如何串|模块.*关系|仓库.*结构|代码库.*结构|"
+    r"overview|map\b|explore|end-?to-?end|call\s*chain|architecture)",
+    re.IGNORECASE,
+)
+
+
+def format_spawn_research_hint(user_message: str) -> str:
+    """
+    广搜/业务链路类任务的近端调研路由（注入 workspace-context）。
+
+    @param user_message 当前用户消息
+    @return Markdown；非广搜口吻时返回空串
+    """
+    text = (user_message or "").strip()
+    if not text or not _SPAWN_RESEARCH_RE.search(text):
+        return ""
+    return (
+        "## 调研路由（本轮优先）\n"
+        "该问偏**广搜/摸底/链路整理**：**先**调用 `spawn_subagent`"
+        "（`kind=\"explore\"`，`prompt` 写清范围与要回答的问题）。\n"
+        "主会话本回合**不要**自己连开 `search_code_parallel` + 大批量 `read_files` 摸底；"
+        "等子 Agent 摘要返回后再精读或作答。\n"
+        "针点查询（已知文件/符号）才用主会话并行 grep/read。"
+    )
+
+
+def format_history_recall_hint(
+    user_message: str,
+    recent_messages: list[BaseMessage] | None,
+) -> str:
+    """
+    压缩后追问压缩前细节时的回捞提示（不加轮、不重跑，只提醒先检索）。
+
+    仅当上下文里已存在会话锚点（说明发生过压缩），且用户在追问更早轮次的
+    细节/结论时才注入，避免模型凭锚点摘要或指针预览臆答。
+
+    @param user_message 当前用户消息
+    @param recent_messages 当前会话历史消息
+    @return Markdown 提示；不满足条件时空串
+    """
+    if not user_message or not recent_messages:
+        return ""
+    if not _HISTORY_RECALL_RE.search(user_message):
+        return ""
+    from llgraph.context.conversation_anchor import is_conversation_anchor_message
+
+    if not any(is_conversation_anchor_message(m) for m in recent_messages):
+        return ""
+    return (
+        "## 压缩历史回捞\n"
+        "本会话较早内容已被压缩为锚点/指针，细节可能不全。"
+        "用户在追问更早轮次的结论/证据/对比时，**先** `search_session_history` "
+        "或按指针 `read_file` 归档，再作答；**禁止**仅凭锚点摘要或预览臆断。"
+        "确认锚点未覆盖该细节前，不要说「之前没有/未提及」。"
+    )
+
+
 def build_workspace_context_block(
     workspace: Path,
     session: ContextSession,
@@ -72,10 +139,29 @@ def build_workspace_context_block(
     sections: list[str] = [format_file_access_workspace_context(allow_write)]
 
     sections.append(
-        "## 工具批量（ReAct 默认）\n"
-        "同一步若需 ≥2 次 grep/read/list/glob → **一条 assistant 消息多个 tool_call**；"
-        "grep 多词用 `pattern=\"a|b|c\"`；禁止拆成多轮单 grep/read。"
+        "## 本轮目标\n"
+        "只服务下方 `<user_query>`。"
+        "意图与排查/归因策略由你自行判断；框架不替你分流。"
+        "正确性优先：顺着调用/数据上下文核证，禁止断章取义；"
+        "有证据后结论或动作先行；因果断言须有源码依据，勿只靠注释。"
     )
+
+    spawn_hint = format_spawn_research_hint(user_message)
+    if spawn_hint:
+        sections.append(spawn_hint)
+
+    sections.append(
+        "## 工具并行（针点任务）\n"
+        "已知范围、无需广搜摸底时："
+        "无依赖的 grep/read/list/glob 必须在**同一条** assistant 消息里并行发出；"
+        "先在思考里列齐「要凑齐答案还缺什么」，再一次性发出工具调用。"
+        "多词 → 一条 `grep_files(pattern=\"a|b|c\")`；已有字面量时**不要**先 `search_code_parallel`。\n"
+        "广搜/多模块/业务链路整理 → 用上文 `spawn_subagent`，不要用主会话并行搜读代替。"
+    )
+
+    from llgraph.core.react_limits import format_tool_round_budget_line
+
+    sections.append(format_tool_round_budget_line(recent_messages or [], workspace=workspace))
 
     from llgraph.context.context_continuity import build_continuity_context_hint
 
@@ -86,6 +172,10 @@ def build_workspace_context_block(
     )
     if continuity:
         sections.append(continuity)
+
+    recall_hint = format_history_recall_hint(user_message, recent_messages)
+    if recall_hint:
+        sections.append(recall_hint)
 
     manual_hint = _format_manual_skill_pin_hint(workspace, session)
     if manual_hint:
@@ -106,20 +196,18 @@ def build_workspace_context_block(
 
 def wrap_user_message_with_context(user_message: str, context_block: str) -> str:
     """
-    将上下文块与用户消息合并。
+    将上下文块与用户消息合并；用户正文放入 `<user_query>`，便于全程钉目标。
 
     @param user_message 原始用户输入
     @param context_block build_workspace_context_block 返回值
     @return 发给模型的完整用户消息
     """
-    if not context_block.strip():
-        return user_message
-    return (
-        "<workspace-context>\n"
-        f"{context_block.strip()}\n"
-        "</workspace-context>\n\n"
-        f"{user_message}"
-    )
+    query = (user_message or "").strip()
+    query_block = f"<user_query>\n{query}\n</user_query>" if query else (user_message or "")
+    ctx = (context_block or "").strip()
+    if not ctx:
+        return query_block
+    return f"<workspace-context>\n{ctx}\n</workspace-context>\n\n{query_block}"
 
 
 def format_rules_list(workspace: Path, session: ContextSession, user_message: str) -> str:

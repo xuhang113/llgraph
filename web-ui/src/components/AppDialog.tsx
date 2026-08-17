@@ -1,43 +1,17 @@
 import {
-  createContext,
   useCallback,
-  useContext,
   useEffect,
   useId,
   useRef,
   useState,
   type ReactNode,
 } from 'react';
-
-export interface AppDialogAlertOptions {
-  title?: string;
-  message: string;
-  okLabel?: string;
-}
-
-export interface AppDialogConfirmOptions {
-  title?: string;
-  message: string;
-  confirmLabel?: string;
-  cancelLabel?: string;
-  danger?: boolean;
-}
-
-export interface AppDialogPromptOptions {
-  title?: string;
-  message?: string;
-  placeholder?: string;
-  defaultValue?: string;
-  confirmLabel?: string;
-  cancelLabel?: string;
-  multiline?: boolean;
-}
-
-interface AppDialogApi {
-  alert: (options: AppDialogAlertOptions | string) => Promise<void>;
-  confirm: (options: AppDialogConfirmOptions | string) => Promise<boolean>;
-  prompt: (options: AppDialogPromptOptions | string) => Promise<string | null>;
-}
+import {
+  AppDialogContext,
+  type AppDialogAlertOptions,
+  type AppDialogConfirmOptions,
+  type AppDialogPromptOptions,
+} from './appDialogContext';
 
 type DialogRequest =
   | {
@@ -55,8 +29,6 @@ type DialogRequest =
       options: AppDialogPromptOptions;
       resolve: (value: string | null) => void;
     };
-
-const AppDialogContext = createContext<AppDialogApi | null>(null);
 
 function normalizeAlert(options: AppDialogAlertOptions | string): AppDialogAlertOptions {
   return typeof options === 'string' ? { message: options } : options;
@@ -277,7 +249,7 @@ export function AppDialogProvider({ children }: { children: ReactNode }) {
     [enqueue],
   );
 
-  const api: AppDialogApi = { alert, confirm, prompt };
+  const api = { alert, confirm, prompt };
 
   return (
     <AppDialogContext.Provider value={api}>
@@ -285,12 +257,4 @@ export function AppDialogProvider({ children }: { children: ReactNode }) {
       {active && <AppDialogView request={active} onClose={dequeue} />}
     </AppDialogContext.Provider>
   );
-}
-
-export function useAppDialog(): AppDialogApi {
-  const ctx = useContext(AppDialogContext);
-  if (!ctx) {
-    throw new Error('useAppDialog 须在 AppDialogProvider 内使用');
-  }
-  return ctx;
 }

@@ -32,6 +32,7 @@ interface Props {
   onRename: (node: TreeNode, title: string) => Promise<void>;
   onCatalogOpen: (kind: 'skills' | 'rules' | 'tools') => void;
   onCodeSearch?: () => void;
+  onMemorySearch?: () => void;
   onEnterMultiSelect: () => void;
   onExitMultiSelect: () => void;
   onToggleSessionSelect: (threadId: string) => void;
@@ -393,6 +394,7 @@ export default function CursorSidebar({
   onRename,
   onCatalogOpen,
   onCodeSearch,
+  onMemorySearch,
   onEnterMultiSelect,
   onExitMultiSelect,
   onToggleSessionSelect,
@@ -451,40 +453,52 @@ export default function CursorSidebar({
         </div>
       </div>
 
-      <nav className="cursor-catalog-nav">
-        <button
-          type="button"
-          className={`cursor-catalog-nav-btn${catalogOpen === 'skills' ? ' is-active' : ''}`}
-          onClick={() => onCatalogOpen('skills')}
-          disabled={!slug}
-        >
-          Skills
-        </button>
-        <button
-          type="button"
-          className={`cursor-catalog-nav-btn${catalogOpen === 'rules' ? ' is-active' : ''}`}
-          onClick={() => onCatalogOpen('rules')}
-          disabled={!slug}
-        >
-          Rules
-        </button>
-        <button
-          type="button"
-          className={`cursor-catalog-nav-btn${catalogOpen === 'tools' ? ' is-active' : ''}`}
-          onClick={() => onCatalogOpen('tools')}
-          disabled={!slug}
-        >
-          工具
-        </button>
-        <button
-          type="button"
-          className="cursor-catalog-nav-btn"
-          onClick={() => onCodeSearch?.()}
-          disabled={!slug}
-        >
-          搜代码
-        </button>
-      </nav>
+      <div className="cursor-sidebar-tools">
+        <div className="cursor-sidebar-tools-row">
+          <button
+            type="button"
+            className={`cursor-catalog-nav-btn${catalogOpen === 'skills' ? ' is-active' : ''}`}
+            onClick={() => onCatalogOpen('skills')}
+            disabled={!slug}
+          >
+            Skills
+          </button>
+          <button
+            type="button"
+            className={`cursor-catalog-nav-btn${catalogOpen === 'rules' ? ' is-active' : ''}`}
+            onClick={() => onCatalogOpen('rules')}
+            disabled={!slug}
+          >
+            Rules
+          </button>
+          <button
+            type="button"
+            className={`cursor-catalog-nav-btn${catalogOpen === 'tools' ? ' is-active' : ''}`}
+            onClick={() => onCatalogOpen('tools')}
+            disabled={!slug}
+          >
+            工具
+          </button>
+        </div>
+        <div className="cursor-sidebar-tools-row">
+          <button
+            type="button"
+            className="cursor-catalog-nav-btn"
+            onClick={() => onCodeSearch?.()}
+            disabled={!slug}
+          >
+            搜代码
+          </button>
+          <button
+            type="button"
+            className="cursor-catalog-nav-btn"
+            onClick={() => onMemorySearch?.()}
+            disabled={!slug}
+          >
+            搜记忆
+          </button>
+        </div>
+      </div>
 
       <div className="cursor-ws-section">
         <button

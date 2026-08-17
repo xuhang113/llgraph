@@ -8,6 +8,8 @@ from typing import Any
 
 import yaml
 
+from llgraph.core.prompt_boundary import SYSTEM_PROMPT_DYNAMIC_BOUNDARY
+
 _PROMPTS_ROOT = Path(__file__).resolve().parent.parent / "prompts"
 
 
@@ -71,15 +73,19 @@ def compose_agent_system_prompt(
     survey_interactive_enabled: bool,
 ) -> str:
     """
-    组装 Agent 主 system prompt（静态块来自 YAML，动态段由调用方注入）。
+    组装 Agent 主 system prompt。
 
-    @return 完整 system 文本
+    静态前缀：Intro → System → Doing tasks → Actions → Using tools → Tone/Efficiency；
+    其后经动静边界接 Session / Environment / 检索路由 / 记忆等动态段。
+
+    @return 完整 system 文本（含动静边界标记）
     """
     identity = load_prompt_module("agent", "identity")
     display = load_prompt_module("agent", "display")
     context = load_prompt_module("agent", "context")
     shell = load_prompt_module("agent", "shell")
     tools = load_prompt_module("agent", "tools")
+    workflow = load_prompt_module("agent", "workflow")
 
     vars_base = {
         "model_id": model_id,
@@ -91,24 +97,27 @@ def compose_agent_system_prompt(
         "search_order_hint": search_order_hint,
     }
 
-    parts: list[str] = [
+    # 静态可缓存前缀
+    static_parts: list[str] = [
         render_prompt(str(identity.get("intro", "")), **vars_base),
         render_prompt(str(identity.get("model_identity_rule", "")), **vars_base),
+        render_prompt(str(display.get("terminal_display", "")), **vars_base),
+        render_prompt(str(workflow.get("react_loop", "")), **vars_base),
+        render_prompt(str(workflow.get("investigation_depth", "")), **vars_base),
+        render_prompt(str(workflow.get("investigation", "")), **vars_base),
+        render_prompt(str(workflow.get("code_quality", "")), **vars_base),
+        render_prompt(str(workflow.get("actions", "")), **vars_base),
+        render_prompt(str(tools.get("tool_selection_summary", "")), **vars_base),
+        render_prompt(str(tools.get("edit_hint", "")), **vars_base) if edit_hint else "",
+        render_prompt(str(workflow.get("batch_tool_calls", "")), **vars_base),
+        render_prompt(str(tools.get("parallel_invoke", "")), **vars_base),
+        render_prompt(str(shell.get("run_shell", "")), **vars_base),
+        render_prompt(str(identity.get("response_style", "")), **vars_base),
     ]
-
-    workflow = load_prompt_module("agent", "workflow")
-    parts.extend(
-        [
-            render_prompt(str(workflow.get("react_loop", "")), **vars_base),
-            render_prompt(str(workflow.get("investigation_depth", "")), **vars_base),
-            render_prompt(str(workflow.get("investigation", "")), **vars_base),
-            render_prompt(str(workflow.get("code_quality", "")), **vars_base),
-        ]
-    )
 
     if thinking_payload is not None:
         thinking = load_prompt_module("agent", "thinking")
-        parts.append(
+        static_parts.append(
             render_prompt(
                 str(thinking.get("constraints", "")),
                 thinking_payload=thinking_payload,
@@ -116,41 +125,33 @@ def compose_agent_system_prompt(
             )
         )
 
-    parts.extend(
-        [
-            render_prompt(str(identity.get("workspace", "")), **vars_base),
-            render_prompt(str(tools.get("edit_hint", "")), **vars_base) if edit_hint else "",
-            render_prompt(str(tools.get("tool_selection_summary", "")), **vars_base),
-            render_prompt(str(display.get("terminal_display", "")), **vars_base),
-            render_prompt(str(context.get("manifest_and_skills", "")), **vars_base),
-            render_prompt(str(context.get("session_history", "")), **vars_base),
-            render_prompt(str(context.get("business_docs", "")), **vars_base),
-            search_order_hint,
-            render_prompt(str(shell.get("run_shell", "")), **vars_base),
-            render_prompt(str(shell.get("paths_and_spill", "")), **vars_base),
-        ]
-    )
+    static = "\n\n".join(p for p in static_parts if p and p.strip())
 
+    # 动态段（会话 / 环境 / 检索）
+    dynamic_parts: list[str] = [
+        render_prompt(str(context.get("manifest_and_skills", "")), **vars_base),
+        render_prompt(str(context.get("session_history", "")), **vars_base),
+        render_prompt(str(context.get("business_docs", "")), **vars_base),
+        render_prompt(str(context.get("long_term_memory", "")), **vars_base),
+        render_prompt(str(identity.get("workspace", "")), **vars_base),
+        search_order_hint,
+        render_prompt(str(shell.get("paths_and_spill", "")), **vars_base),
+    ]
     if web_search_enabled:
-        parts.append(render_prompt(str(tools.get("web_search_hint", "")), **vars_base))
-
-    # 批量规则放在 system 末尾（recency），多轮 ReAct 后仍易被模型注意到
-    parts.append(render_prompt(str(workflow.get("batch_tool_calls", "")), **vars_base))
-    parts.append(render_prompt(str(tools.get("batch_tool_calls", "")), **vars_base))
-    parts.append(render_prompt(str(tools.get("parallel_invoke", "")), **vars_base))
-
-    parts.append(render_prompt(str(identity.get("response_style", "")), **vars_base))
-
-    base = "\n".join(p for p in parts if p and p.strip())
+        dynamic_parts.append(render_prompt(str(tools.get("web_search_hint", "")), **vars_base))
 
     if allow_write and survey_interactive_enabled:
         survey = load_prompt_module("agent", "survey")
-        base = base + "\n\n" + render_prompt(str(survey.get("interactive", "")), **vars_base)
+        dynamic_parts.append(render_prompt(str(survey.get("interactive", "")), **vars_base))
     elif allow_write:
         survey = load_prompt_module("agent", "survey")
-        base = base + "\n\n" + render_prompt(str(survey.get("disabled", "")), **vars_base)
+        dynamic_parts.append(render_prompt(str(survey.get("disabled", "")), **vars_base))
 
-    return base
+    dynamic = "\n\n".join(p for p in dynamic_parts if p and p.strip())
+
+    if dynamic:
+        return f"{static}\n\n{SYSTEM_PROMPT_DYNAMIC_BOUNDARY}\n\n{dynamic}"
+    return static
 
 
 def compose_search_order_hint(*, index_ready: bool) -> tuple[str, str]:
@@ -162,33 +163,37 @@ def compose_search_order_hint(*, index_ready: bool) -> tuple[str, str]:
     search = load_prompt_module("agent", "search")
     tools = load_prompt_module("agent", "tools")
 
-    path_scope = str(search.get("path_scope", ""))
-    tool_routing = str(search.get("tool_routing", ""))
-    anti_patterns = str(search.get("anti_patterns", ""))
-    tool_invoke = str(search.get("tool_invoke_params", ""))
-    code_search = str(search.get("code_search", ""))
-    batch_read = str(search.get("batch_read", ""))
-    batch_search = str(search.get("batch_search", ""))
+    chunks = [
+        str(search.get("tool_routing", "")),
+        str(search.get("anti_patterns", "")),
+        str(search.get("path_scope", "")),
+        str(search.get("tool_invoke_params", "")),
+        str(search.get("code_search", "")),
+        str(search.get("batch_read", "")),
+        str(search.get("batch_search", "")),
+    ]
 
     if index_ready:
         tools_read = str(tools.get("tools_read_indexed", ""))
         body = str(search.get("search_index_ready", ""))
         tail = str(search.get("glob_grep_miss_tail", ""))
-        hint = (
-            body
-            + tool_routing
-            + anti_patterns
-            + path_scope
-            + tool_invoke
-            + code_search
-            + batch_read
-            + batch_search
-            + tail
-        )
+        hint = "\n\n".join(p.strip() for p in [body, *chunks, tail] if p and p.strip())
     else:
         tools_read = str(tools.get("tools_read_no_index", ""))
         body = str(search.get("search_no_index", ""))
-        hint = body + tool_routing + anti_patterns + path_scope + tool_invoke + batch_read + batch_search
+        hint = "\n\n".join(
+            p.strip()
+            for p in [
+                body,
+                str(search.get("tool_routing", "")),
+                str(search.get("anti_patterns", "")),
+                str(search.get("path_scope", "")),
+                str(search.get("tool_invoke_params", "")),
+                str(search.get("batch_read", "")),
+                str(search.get("batch_search", "")),
+            ]
+            if p and p.strip()
+        )
 
     return tools_read.strip(), hint.strip()
 

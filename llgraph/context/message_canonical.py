@@ -48,6 +48,64 @@ class CanonicalV2Report:
         )
 
 
+_THINKING_BLOCK_KINDS = (
+    "thinking",
+    "reasoning",
+    "reasoning_text",
+    "redacted_thinking",
+)
+
+
+def _thinking_block_plaintext(block: dict[str, Any]) -> str:
+    """从 thinking/reasoning 块提取可读明文（忽略 null）。"""
+    for key in ("thinking", "reasoning", "text", "data"):
+        raw = block.get(key)
+        if isinstance(raw, str) and raw.strip():
+            # redacted_thinking.data 多为密文，不当作展示明文
+            if str(block.get("type", "")).lower() == "redacted_thinking" and key == "data":
+                continue
+            return raw.strip()
+    return ""
+
+
+def _extract_native_thinking_blocks(content: Any) -> list[dict[str, Any]]:
+    """
+    提取可回传的 native thinking 块（含 Opus/Bedrock 仅 signature 的空明文块）。
+
+    @param content AIMessage.content
+    @return 规范化块列表
+    """
+    if not isinstance(content, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        kind = str(block.get("type", "")).lower()
+        if kind not in _THINKING_BLOCK_KINDS:
+            continue
+        if kind == "redacted_thinking":
+            kept: dict[str, Any] = {"type": "redacted_thinking"}
+            if block.get("data") is not None:
+                kept["data"] = block.get("data")
+            if isinstance(block.get("signature"), str) and block["signature"]:
+                kept["signature"] = block["signature"]
+            out.append(kept)
+            continue
+        kept = {"type": "thinking"}
+        text = _thinking_block_plaintext(block)
+        # 明文可空：东买/Bedrock 上 Opus 常只回 signature
+        kept["thinking"] = text
+        sig = block.get("signature")
+        if isinstance(sig, str) and sig.strip():
+            kept["signature"] = sig.strip()
+        # 无明文且无签名则无回传价值
+        if not kept["thinking"] and "signature" not in kept:
+            continue
+        out.append(kept)
+    return out
+
+
 def _extract_thinking_for_meta(msg: AIMessage) -> str:
     extra = getattr(msg, "additional_kwargs", None) or {}
     raw = extra.get("reasoning_content")
@@ -60,20 +118,10 @@ def _extract_thinking_for_meta(msg: AIMessage) -> str:
     for block in content:
         if isinstance(block, dict):
             kind = str(block.get("type", "")).lower()
-            if kind in (
-                "thinking",
-                "reasoning",
-                "reasoning_text",
-                "redacted_thinking",
-            ):
-                text = (
-                    block.get("thinking")
-                    or block.get("reasoning")
-                    or block.get("text")
-                    or block.get("data")
-                )
+            if kind in _THINKING_BLOCK_KINDS:
+                text = _thinking_block_plaintext(block)
                 if text:
-                    parts.append(str(text))
+                    parts.append(text)
     return "\n".join(parts).strip()
 
 
@@ -93,11 +141,15 @@ def _flatten_ai_for_storage(msg: AIMessage) -> tuple[AIMessage, bool]:
     """
     将 AI 多段 content 收成纯文本；thinking 写入 additional_kwargs.llgraph。
 
+    同时保留 thinking_blocks（含 signature），供 Claude 多轮回传；
+    东买/Bedrock 上 Opus 常无明文，仍须保住签名块。
+
     @param msg assistant 消息
     @return (消息, 是否改写)
     """
     thinking = _extract_thinking_for_meta(msg)
     content = getattr(msg, "content", "")
+    native_blocks = _extract_native_thinking_blocks(content)
     texts: list[str] = []
     changed = False
     if isinstance(content, str):
@@ -111,6 +163,7 @@ def _flatten_ai_for_storage(msg: AIMessage) -> tuple[AIMessage, bool]:
                     "thinking",
                     "reasoning",
                     "reasoning_text",
+                    "redacted_thinking",
                     "tool_use",
                     "tool_calls",
                     "input_json_delta",
@@ -128,6 +181,14 @@ def _flatten_ai_for_storage(msg: AIMessage) -> tuple[AIMessage, bool]:
     if thinking:
         meta["thinking_text"] = thinking
         changed = True
+    if native_blocks:
+        meta["thinking_blocks"] = native_blocks
+        changed = True
+        # 网关未回明文时仍标记曾开启 thinking，便于 UI/排查
+        if not thinking and any(
+            isinstance(b.get("signature"), str) and b.get("signature") for b in native_blocks
+        ):
+            meta["thinking_redacted"] = True
     if meta:
         extra[_LLGRAPH_META_KEY] = meta
     extra.pop("reasoning_content", None)

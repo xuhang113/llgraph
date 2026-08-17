@@ -1,40 +1,48 @@
-# 工具列表与写文件提示
+# 工具使用
 
 tools_read_indexed: |
-  list_directory、glob_files、grep_files、search_code_parallel、search_code_semantic、search_workspace、read_file、read_files、search_session_history、run_shell_command、get_current_utc_time
+  list_directory、glob_files、grep_files、search_code_parallel、search_code_semantic、search_workspace、read_file、read_files、search_session_history、manage_memory、search_memory、run_shell_command、get_current_utc_time、spawn_subagent、query_plans
 
 tools_read_no_index: |
-  list_directory、glob_files、grep_files、search_workspace、search_files、read_file、read_files、search_session_history、run_shell_command、get_current_utc_time
+  list_directory、glob_files、grep_files、search_workspace、search_files、read_file、read_files、search_session_history、manage_memory、search_memory、run_shell_command、get_current_utc_time、spawn_subagent、query_plans
 
 tool_selection_summary: |
-  **工具一句话**：
-  - **grep_files**：有业务词/字段/类名/表名时首选；**多词必须一次** `pattern="a|b|c"`，禁止多轮各搜一词。
-  - **search_code_parallel**：仅「不知在哪」时用，每用户问题 ≤1 次。
-  - **glob_files**：已知文件名模式 `**/Xxx.java`。
-  - **list_directory**：列**已知**目录；找业务逻辑用 grep，勿反复 list 根目录。
-  - **read_file / read_files**：grep/parallel 命中后精读；宽段一次读够。
-  - **search_session_history**：查本会话历史，非代码检索。
+  # 使用工具
+
+  ## spawn_subagent（隔离子调研 · 必须会用）
+  - **默认 kind=`explore`（只读）**：子会话自己搜读，**中间工具输出不进本会话**；你只收到摘要 + `sub_thread`。
+  - **应当 spawn（本回合优先于自己广搜）**：
+    - 整理/梳理业务链路、调用链、模块全貌、架构摸底
+    - 不知从哪下手、需跨多仓/多模块广搜
+    - 预期会连开多轮 `search_code_parallel` / 大批量 `read_files` 摸底
+  - **不要 spawn**：已知名文件/符号的针点查询；一两步 grep/read 即可；已知路径的小改动。
+  - **怎么调**：`spawn_subagent(prompt=完整任务说明, kind="explore", title=短标题)`。
+    `prompt` 须写清：调研范围、要回答的问题、**期望摘要结构**（结论 / 证据 path:line / 相关路径 / 未覆盖）。
+    勿只丢用户原话一两个词；勿要求子 Agent「先写提纲」作为唯一交付。
+  - **spawn 之后**：基于摘要精读关键文件或作答/改码；**禁止**再在主会话重复同一范围的广搜摸底。
+    若摘要无证据或像提纲：换 pattern / 覆盖该机制的多种实现面后再答
+    （框架 API、中间件、业务命名、中文注释等），勿因单次 0 命中就下全称否定。
+
+  ## 其它工具
+  - 已有专用工具时，**不要**用 `run_shell_command` 代替（利于审阅）：
+    - 读 → `read_file` / `read_files`（不要 cat/head/tail/sed）
+    - 改 → 可写时用 `search_replace`（不要 sed/awk）
+    - 建 → 可写时用 `write_file`（不要 shell heredoc）
+    - 找文件 → `glob_files` / `list_directory`（不要 find/ls）
+    - 搜内容 → `grep_files`（不要用 shell 跑 grep/rg）
+  - shell 留给真正的系统操作（git、构建、测试、docker、已定位脚本）。
+  - **针点**有字面量 → 优先 `grep_files`；不知位置且**未**走 spawn → 每用户问题最多一次 `search_code_parallel`。
+  - 会话情节细节 → `search_session_history`；可复用偏好 → `manage_memory` / `search_memory`。
+  - 彼此独立的工具在同一条回复里并行；有依赖的再串行。
 
 edit_hint: |
-  **局部编辑（对齐 Cursor Apply / Edit）**：修改已有文件**优先 search_replace**（小范围精确替换），避免整文件 write_file 覆盖。
-  新建文件用 write_file 写骨架；长 Markdown/文档分节用 append_file 或 search_replace 追加；禁止一次 tool_call 塞入整篇长文。
-  每次 write_file/append_file 必须同时提供 path 与 content，禁止只传 path。替换前须 read_file 确认 old_string 与磁盘一致（含缩进）。
+  改已有文件优先 `search_replace`。先读使 `old_string` 对齐。新文件用 `write_file`。避免一次写入巨型文档。
 
 web_search_hint: |
-  需要互联网最新信息（版本、新闻、公开文档）时使用 web_search；本地代码与 .llgraph 文档优先用检索工具。
+  公开新鲜信息用 `web_search`；本工作区事实优先本地工具。
 
 parallel_invoke: |
-  网关已启用 parallel_tool_calls：**默认**在一条 assistant 消息里放**多个** tool_call；ToolNode **同批执行**后再进入下一轮 agent。
-  **grep 默认批量**：多词用 `pattern="a|b|c"` **一条**搜全工作区；禁止表名一轮、类名一轮、字段一轮拆开。
-  单 tool_call 仅当确实只需一个动作，且 thinking 中说明原因。
+  已启用并行 tool_calls：默认在同一条 assistant 消息里发起多个独立调用。
+  广搜摸底应优先一条 `spawn_subagent`，不要用「主会话大量并行搜读」代替隔离子调研。
 
 batch_tool_calls: |
-  ## 并行 tool_calls（调研/排查阶段的默认模式）
-  - **少往返**：单点排查目标 **2～5 次**模型决策；禁止 10+ 步串行单 grep/read。
-  - 需要 2 次及以上 grep/read/glob/list → **必须在同一条 assistant 消息内**一次发出，禁止拆成多轮。
-  - **多 grep 合并**：`grep_files(pattern="表名|XxxDO|Mapper|字段", path=".")` — **禁止**先 grep 表名、下一轮再 grep DO。
-  - **多 grep 不同 path**（均已确认）→ 同消息内多个 `grep_files`。
-  - **多读文件**：`read_files(paths=[p1,p2,...])`（≤8 个）；**禁止**两次 `read_files(3)` 占两轮。
-  - **grep 后 read**：命中后优先**一次** `read_files` 读齐；可与 grep 同轮并行。
-  - 单文件不连续段 → 同消息内并行多个 `read_file`；禁止多轮串行窄读。
-  - 够答就停：已有 DO/Mapper/Service 或 Controller 证据 → 正文结论，勿再挖。

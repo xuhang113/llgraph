@@ -670,7 +670,9 @@ def _assistant_dispatch_text(msg: AIMessage) -> str:
 
 def rehydrate_native_thinking_block(msg: AIMessage) -> tuple[AIMessage, bool]:
     """
-    将 llgraph.thinking_text 还原为 content 内 thinking 块（Claude native 协议）。
+    将 llgraph.thinking_blocks / thinking_text 还原为 content 内 thinking 块（Claude native 协议）。
+
+    优先使用带 signature 的 thinking_blocks（Opus/Bedrock 多轮必需）。
 
     @param msg assistant 消息
     @return (消息, 是否改写)
@@ -678,9 +680,6 @@ def rehydrate_native_thinking_block(msg: AIMessage) -> tuple[AIMessage, bool]:
     extra = dict(getattr(msg, "additional_kwargs", None) or {})
     meta = extra.get("llgraph")
     if not isinstance(meta, dict):
-        return msg, False
-    thinking = meta.get("thinking_text")
-    if not isinstance(thinking, str) or not thinking.strip():
         return msg, False
 
     content = getattr(msg, "content", "")
@@ -707,9 +706,38 @@ def rehydrate_native_thinking_block(msg: AIMessage) -> tuple[AIMessage, bool]:
     else:
         return msg, False
 
-    blocks: list[dict[str, str]] = [
-        {"type": "thinking", "thinking": thinking.strip()},
-    ]
+    blocks: list[dict[str, Any]] = []
+    native = meta.get("thinking_blocks")
+    if isinstance(native, list):
+        for raw in native:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("type", "thinking")).lower()
+            if kind == "redacted_thinking":
+                kept: dict[str, Any] = {"type": "redacted_thinking"}
+                if raw.get("data") is not None:
+                    kept["data"] = raw.get("data")
+                if isinstance(raw.get("signature"), str) and raw["signature"]:
+                    kept["signature"] = raw["signature"]
+                blocks.append(kept)
+                continue
+            kept = {"type": "thinking"}
+            text = raw.get("thinking")
+            if isinstance(text, str):
+                kept["thinking"] = text
+            else:
+                kept["thinking"] = ""
+            if isinstance(raw.get("signature"), str) and raw["signature"]:
+                kept["signature"] = raw["signature"]
+            if kept["thinking"] or "signature" in kept:
+                blocks.append(kept)
+
+    if not blocks:
+        thinking = meta.get("thinking_text")
+        if not isinstance(thinking, str) or not thinking.strip():
+            return msg, False
+        blocks = [{"type": "thinking", "thinking": thinking.strip()}]
+
     merged_text = "\n\n".join(text_parts).strip()
     if merged_text and merged_text != _EMPTY_ASSISTANT_PLACEHOLDER.strip():
         blocks.append({"type": "text", "text": merged_text})

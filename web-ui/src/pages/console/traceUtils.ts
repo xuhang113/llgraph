@@ -1,11 +1,12 @@
 import type { TraceStep, TraceTurn } from '../../types/trace';
-import { mergeTraceStepsUnique, stepsToPanelLogLines, parseTraceTurnsFromRemote, buildDisplayTraceTurns, resolveElapsedKind } from '../../types/trace';
+import { mergeTraceStepsUnique, dedupeTraceStepsById, stepsToPanelLogLines, parseTraceTurnsFromRemote, buildDisplayTraceTurns, resolveElapsedKind } from '../../types/trace';
 import { loadTracePanelCache } from '../../utils/tracePanelStore';
 import type { ChatMessage } from '../../components/console/ChatThread';
 import type { TraceLine } from './types';
 
 export function parseTraceStep(raw: Record<string, unknown>): TraceStep {
   const kind = String(raw.kind ?? '');
+  const subRaw = raw.sub_thread;
   return {
     step_id: Number(raw.step_id ?? 0),
     kind,
@@ -16,6 +17,7 @@ export function parseTraceStep(raw: Record<string, unknown>): TraceStep {
     body_lines: Array.isArray(raw.body_lines) ? raw.body_lines.map(String) : [],
     usage: (raw.usage as TraceStep['usage']) ?? null,
     invoke_timing: (raw.invoke_timing as TraceStep['invoke_timing']) ?? null,
+    sub_thread: subRaw != null && String(subRaw).trim() ? String(subRaw) : undefined,
   };
 }
 
@@ -31,9 +33,11 @@ export function parseTraceSteps(raw: unknown): TraceStep[] {
   if (!Array.isArray(raw)) {
     return [];
   }
-  return raw
-    .filter((item): item is Record<string, unknown> => item != null && typeof item === 'object')
-    .map(parseTraceStep);
+  return dedupeTraceStepsById(
+    raw
+      .filter((item): item is Record<string, unknown> => item != null && typeof item === 'object')
+      .map(parseTraceStep),
+  );
 }
 
 export function restorePanelTraceFromMessages(msgs: ChatMessage[]): {

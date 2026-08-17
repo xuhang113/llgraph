@@ -72,7 +72,18 @@ async def _app_lifespan(_app: FastAPI):
     from llgraph.console.runtime import llm_settings_api  # noqa: F401
 
     _ = llm_settings_api
+    from llgraph.memory.scheduler import (
+        attach_memory_scheduler_shutdown,
+        start_memory_consolidate_scheduler,
+    )
+
+    start_memory_consolidate_scheduler()
+    attach_memory_scheduler_shutdown()
     yield
+    from llgraph.memory.scheduler import stop_memory_consolidate_scheduler
+
+    stop_memory_consolidate_scheduler()
+    RUNTIME_MANAGER.shutdown_all()
     HUB.close_all()
 
 
@@ -252,6 +263,15 @@ class CodeSearchBody(BaseModel):
     path_prefix: str = "."
 
 
+class MemorySearchBody(BaseModel):
+    """长期记忆向量库检索（Web 排查）。"""
+
+    query: str = ""
+    top_k: int = 20
+    min_score: float = 0.0
+    kind: str | None = None
+
+
 def _ensure_web_default_sandbox(workspace: Path, *, allow_write: bool) -> None:
     """
     Web Console 首次访问工作区时默认启用 OS 沙箱（若后端可用）。
@@ -335,6 +355,7 @@ def _resolve_session_kind(workspace: Path, thread_id: str) -> str | None:
 def _agent_runtime_bundle(workspace: Path, *, allow_write: bool) -> AgentRuntimeBundle:
     """构造 Agent 运行时 bundle（Web 热路径共享）。"""
     rt = RUNTIME_MANAGER.get(workspace, allow_write=allow_write)
+    watch = rt.watch_service
     return AgentRuntimeBundle(
         workspace=workspace,
         trace_session=rt.trace_session,
@@ -342,14 +363,14 @@ def _agent_runtime_bundle(workspace: Path, *, allow_write: bool) -> AgentRuntime
         allow_write=allow_write,
         mcp_tools=rt.mcp_tools,
         mcp_registry=rt.mcp_registry,
-        watch_service=None,
+        watch_service=watch,
         web_search_enabled=rt.web_search_enabled,
         sandbox_policy=rt.sandbox_policy,
         sandbox_cli_enabled=rt.sandbox_cli_enabled,
         no_spill=False,
         memory_kind="memory",
         mcp_summary=rt.mcp_summary,
-        watch_active=False,
+        watch_active=bool(watch is not None and getattr(watch, "active", False)),
     )
 
 
@@ -866,18 +887,15 @@ def compress_session_context(slug: str, body: CompressBody) -> dict[str, Any]:
         apply_compress_to_agent_state,
         format_compress_report,
     )
-    from llgraph.context.context_settings import is_auto_compress_strategy, resolve_context_settings
     from llgraph.display.execution_log import log_compress_event
-    from llgraph.session.session_manifest import sync_session_manifest_to_agent_state
 
-    settings = resolve_context_settings(workspace)
-    preserve = False if is_auto_compress_strategy(settings.compress_strategy) else None
     report = apply_compress_to_agent_state(
         agent_session.agent,
         thread_id=agent_session.thread_id,
         workspace=workspace,
         force=True,
-        preserve_current_turn=preserve,
+        preserve_current_turn=False,
+        trigger="manual",
     )
     if report is None:
         return {"ok": True, "compressed": False, "message": "无需压缩或消息为空。"}
@@ -888,17 +906,6 @@ def compress_session_context(slug: str, body: CompressBody) -> dict[str, Any]:
         report=report,
         trigger="manual",
     )
-    if agent_session.context_session is not None:
-        sync_session_manifest_to_agent_state(
-            agent_session.agent,
-            thread_id=agent_session.thread_id,
-            workspace=workspace,
-            session=agent_session.context_session,
-            user_message="",
-            with_memory=True,
-            archive_path=report.archive_path,
-            allow_write=agent_session.allow_write,
-        )
     return {
         "ok": True,
         "compressed": True,
@@ -912,12 +919,65 @@ def get_index_status_api(slug: str) -> dict[str, Any]:
     """代码索引状态（对标 /index status）。"""
     workspace = _ws(slug)
     from llgraph.code_index.embedder import format_embedding_status
+    from llgraph.code_index.index_progress import estimate_progress_percent, read_live_progress
     from llgraph.code_index.index_settings import resolve_index_settings
     from llgraph.code_index.manifest import load_manifest
     from llgraph.code_index.paths import meta_path
     from llgraph.code_index.store import get_index_status
 
     idx_cfg = resolve_index_settings(workspace)
+    indexing_job = RUNTIME_MANAGER.index_job_running(workspace)
+    watch_paused = False
+    # 配置开启时：访问状态即拉起 Web 进程内 Watch（对齐 CLI with_agent）
+    watch_active = False
+    if idx_cfg.watch_enabled and idx_cfg.watch_with_agent:
+        # 索引任务运行中勿抢锁拉 Watch（暂停，非启动失败）
+        if indexing_job:
+            watch_paused = True
+            watch_active = False
+        else:
+            try:
+                watch_active = RUNTIME_MANAGER.ensure_index_watch(workspace)
+            except Exception:
+                watch_active = RUNTIME_MANAGER.index_watch_active(workspace)
+
+    progress = read_live_progress(workspace)
+    if (
+        progress
+        and progress.get("running")
+        and not indexing_job
+    ):
+        # 无 Web 后台线程时：若进度长时间未刷新则视为脏标记（进程崩溃）
+        # CLI 同步仍会持续写 live_progress，此时保留 running 供前端展示
+        updated = progress.get("updated_at")
+        stale = True
+        if isinstance(updated, str) and updated:
+            try:
+                from datetime import datetime, timezone
+
+                ts = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - ts).total_seconds()
+                stale = age > 20
+            except ValueError:
+                stale = True
+        if stale:
+            progress = {
+                **progress,
+                "running": False,
+                "phase": progress.get("phase") or "done",
+            }
+    if progress and progress.get("running"):
+        # API 侧重算百分比，避免旧进程内算法导致「卡在 82%」假象
+        recomputed = estimate_progress_percent(
+            files_scanned=int(progress.get("files_scanned") or 0),
+            files_skipped=int(progress.get("files_skipped") or 0),
+            files_updated=int(progress.get("files_updated") or 0),
+            files_total=progress.get("files_total"),
+            phase=str(progress.get("phase") or "sync"),
+        )
+        if recomputed is not None:
+            progress = {**progress, "percent": recomputed}
+
     manifest = load_manifest(workspace)
     sync_complete = None
     meta_file = meta_path(workspace)
@@ -943,9 +1003,13 @@ def get_index_status_api(slug: str) -> dict[str, Any]:
             "sync_complete": sync_complete,
             "watch_enabled": idx_cfg.watch_enabled,
             "watch_with_agent": idx_cfg.watch_with_agent,
+            "watch_active": watch_active,
+            "watch_paused": watch_paused,
             "embedding": str(exc),
             "max_files": idx_cfg.max_files,
             "deps_missing": True,
+            "progress": progress,
+            "indexing": bool(progress and progress.get("running")) or indexing_job,
         }
 
     return {
@@ -958,41 +1022,38 @@ def get_index_status_api(slug: str) -> dict[str, Any]:
         "sync_complete": sync_complete,
         "watch_enabled": idx_cfg.watch_enabled,
         "watch_with_agent": idx_cfg.watch_with_agent,
+        "watch_active": watch_active,
+        "watch_paused": watch_paused,
         "embedding": format_embedding_status(workspace),
         "max_files": idx_cfg.max_files,
         "deps_missing": False,
+        "progress": progress,
+        "indexing": bool(
+            (progress and progress.get("running"))
+            or indexing_job
+        ),
     }
 
 
 @app.post("/api/workspaces/{slug}/index")
 def run_index_action(slug: str, body: IndexActionBody) -> dict[str, Any]:
-    """执行索引操作（incremental / full / rebuild / dry-run）。"""
+    """启动索引操作（后台执行；进度见 index-status.progress）。"""
     workspace = _ws(slug)
-    from llgraph.code_index.index_dispatch import dispatch_index
-
     action = body.action.strip().lower()
-    argv_map = {
-        "status": ["status"],
-        "full": ["full"],
-        "incremental": ["incremental"],
-        "rebuild": ["rebuild"],
-        "dry-run": ["dry-run"],
-    }
-    argv = argv_map.get(action)
-    if argv is None:
-        raise HTTPException(status_code=400, detail=f"未知操作: {body.action}")
+    if action == "status":
+        return get_index_status_api(slug)
 
-    result = dispatch_index(
-        workspace,
-        argv,
-        prog="/index",
-        bare_means_status=False,
-    )
+    result = RUNTIME_MANAGER.start_index_job(workspace, action)
+    if result.get("busy"):
+        raise HTTPException(status_code=409, detail=result.get("error") or "索引任务进行中")
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error") or "无法启动索引")
     return {
-        "ok": result.exit_code == 0,
-        "exit_code": result.exit_code,
+        "ok": True,
+        "started": True,
+        "exit_code": None,
         "action": action,
-        "log_path": str(result.log_path) if result.log_path else None,
+        "log_path": None,
     }
 
 
@@ -1111,6 +1172,32 @@ def code_search(slug: str, body: CodeSearchBody) -> dict[str, Any]:
     }
 
 
+@app.get("/api/workspaces/{slug}/memory-status")
+def memory_status(slug: str) -> dict[str, Any]:
+    """长期记忆库概览（条数、路径、配置）。"""
+    workspace = _ws(slug)
+    from llgraph.memory.web_search import memory_status as build_memory_status
+
+    return build_memory_status(workspace)
+
+
+@app.post("/api/workspaces/{slug}/memory-search")
+def memory_search(slug: str, body: MemorySearchBody) -> dict[str, Any]:
+    """长期记忆向量 + 关键词检索；空 query 时浏览列表。"""
+    workspace = _ws(slug)
+    from llgraph.memory.web_search import search_memories_for_web
+
+    top_k = max(1, min(body.top_k, 100))
+    min_score = max(0.0, min(body.min_score, 1.0))
+    return search_memories_for_web(
+        workspace,
+        query=body.query.strip(),
+        top_k=top_k,
+        min_score=min_score,
+        kind=body.kind,
+    )
+
+
 @app.get("/api/workspaces/{slug}/execution-log")
 def get_execution_log(slug: str, limit: int = 30) -> dict[str, Any]:
     """执行日志尾部（对标 /log tail）。"""
@@ -1124,11 +1211,13 @@ def get_execution_log(slug: str, limit: int = 30) -> dict[str, Any]:
     cap = max(1, min(limit, 200))
     records = read_execution_tail(workspace, limit=cap)
     path = execution_log_path(workspace)
+    lines = [format_execution_record(r) for r in records]
+    lines = [ln for ln in lines if ln.strip()]
     return {
         "path": str(path),
         "records": records,
-        "lines": [format_execution_record(r) for r in records],
-        "count": len(records),
+        "lines": lines,
+        "count": len(lines),
     }
 
 
@@ -1296,14 +1385,14 @@ def get_session_last_run(slug: str, thread_id: str) -> dict[str, Any]:
     return {"thread_id": thread_id, "last_run": data}
 
 
-@app.get("/api/workspaces/{slug}/sessions/{thread_id}/last-trace")
-def get_session_last_trace(slug: str, thread_id: str) -> dict:
-    """Web Trace 面板：按轮次 + 合并视图（兼容）。"""
-    from llgraph.session.web_trace_store import load_last_web_trace, load_web_trace_turns
+@app.get("/api/workspaces/{slug}/sessions/{thread_id}/trace")
+def get_session_trace(slug: str, thread_id: str) -> dict:
+    """Web Trace 面板：按轮次 + history/live 合并视图。"""
+    from llgraph.session.web_trace_store import load_web_trace_turns, load_web_trace_view
 
     ws = _ws(slug)
     turns = load_web_trace_turns(ws, thread_id)
-    data = load_last_web_trace(ws, thread_id)
+    data = load_web_trace_view(ws, thread_id)
     if not turns and not data:
         return {"log_lines": [], "steps": [], "turns": [], "live_ts": ""}
     log_lines = data.get("log_lines") if data and isinstance(data.get("log_lines"), list) else []
@@ -1639,15 +1728,45 @@ async def agent_chat(
 
         write_flag = str(allow_write).strip().lower() in ("true", "1", "yes", "on")
 
+        # 在返回 HTTP 前落盘附件 + pending user，避免刷新后丢图（异步 Agent 尚未跑到 save）
+        image_refs: list = []
+        image_payload: list[dict[str, str]] = []
+        if parsed_images:
+            from llgraph.session.session_image_store import (
+                attachment_api_path,
+                save_chat_images,
+            )
+
+            image_refs = save_chat_images(workspace, thread_id, parsed_images)
+            image_payload = [
+                {
+                    "id": ref.image_id,
+                    "media_type": ref.media_type,
+                    "url": attachment_api_path(slug, thread_id, ref.image_id),
+                }
+                for ref in image_refs
+            ]
+        if text or image_refs:
+            from llgraph.session.session_file_store import append_pending_user_turn
+
+            append_pending_user_turn(
+                workspace,
+                thread_id,
+                text,
+                image_refs=image_refs or None,
+            )
+
         req = AgentChatRequest(
             workspace=workspace,
             thread_id=thread_id,
             message=message,
             images=parsed_images,
+            image_refs=image_refs or None,
+            skip_pending_user_append=True,
             allow_write=write_flag,
         )
         start_agent_chat_async(req, loop)
-        return {"ok": True, "thread_id": thread_id}
+        return {"ok": True, "thread_id": thread_id, "images": image_payload}
     except HTTPException:
         raise
     except Exception as exc:

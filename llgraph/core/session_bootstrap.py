@@ -78,6 +78,9 @@ def build_agent_session_for_thread(
         if watch_service is not None and watch_service.active:
             watch_service.notify_changed(rel)
 
+    from llgraph.subagent.parent_slot import SubagentParentSlot
+
+    subagent_slot = SubagentParentSlot()
     agent = build_agent(
         with_memory=True,
         workspace_root=workspace,
@@ -91,9 +94,10 @@ def build_agent_session_for_thread(
         context_session=bundle.context_session,
         sandbox_policy=bundle.sandbox_policy,
         thread_id=thread_id,
+        subagent_parent_slot=subagent_slot,
     )
     restore_session_to_agent(agent, workspace, thread_id)
-    return AgentSessionContext(
+    session = AgentSessionContext(
         agent=agent,
         workspace=workspace,
         thread_id=thread_id,
@@ -111,7 +115,10 @@ def build_agent_session_for_thread(
         web_search_enabled=bundle.web_search_enabled,
         sandbox_policy=bundle.sandbox_policy,
         sandbox_cli_enabled=bundle.sandbox_cli_enabled,
+        subagent_parent_slot=subagent_slot,
     )
+    subagent_slot.bind_from_session(session)
+    return session
 
 
 def get_or_build_agent_session_for_thread(

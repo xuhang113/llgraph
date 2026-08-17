@@ -25,14 +25,18 @@ export default function ThinkingFold({ segments, liveText = '', live = false }: 
       : '';
 
   return (
-    <details className="cursor-thinking-fold" open={live}>
+    <details className={`cursor-thinking-fold${live ? ' cursor-thinking-fold--live' : ''}`} open={live}>
       <summary className="cursor-thinking-fold-summary">
         <span className="cursor-thinking-fold-icon" aria-hidden>
           ◎
         </span>
         <span className="cursor-thinking-fold-label">{live ? '思考中' : '思考过程'}</span>
         {meta && <span className="cursor-thinking-fold-meta">{meta}</span>}
-        {!live && <span className="cursor-thinking-fold-hint">点击展开</span>}
+        {live ? (
+          <span className="cursor-thinking-fold-live-dot" aria-hidden />
+        ) : (
+          <span className="cursor-thinking-fold-hint">点击展开</span>
+        )}
       </summary>
       <div className="cursor-thinking-fold-body">
         {streaming ? (

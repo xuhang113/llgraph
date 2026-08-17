@@ -18,9 +18,9 @@ import WorkerMainPanel from '../../components/console/WorkerMainPanel';
 import ChatComposer from '../../components/console/ChatComposer';
 import { metaCommandModalTitle } from '../../utils/contextDisplay';
 import {
-  dedupeConsecutiveUserMessages,
-  parseAgentHistoryMessages,
-} from '../../utils/messageText';
+  fetchEnrichedAgentChatMessages,
+  preferRicherAgentChat,
+} from '../../utils/fetchEnrichedAgentChat';
 import ChatThread, { type ChatMessage } from '../../components/console/ChatThread';
 import CursorRightPanel, { type RightPanelTab } from '../../components/console/CursorRightPanel';
 import ConsoleOps, { type ConsoleOpsHandle } from '../../components/console/ConsoleOps';
@@ -28,6 +28,7 @@ import PanelResizeHandle from '../../components/console/PanelResizeHandle';
 import CursorSidebar from '../../components/console/CursorSidebar';
 import EditableSessionTitle from '../../components/console/EditableSessionTitle';
 import CodeSearchPanel from '../../components/console/CodeSearchPanel';
+import MemorySearchPanel from '../../components/console/MemorySearchPanel';
 import { useStickToBottomScroll } from '../../utils/useStickToBottomScroll';
 import SurveyDialog, {
   PlanConfirmDialog,
@@ -67,7 +68,7 @@ import {
   loadTracePanelCache,
   saveTracePanelCache,
 } from '../../utils/tracePanelStore';
-import { useAppDialog } from '../../components/AppDialog';
+import { useAppDialog } from '../../components/appDialogContext';
 import {
   writeStoredWorkspaceMeta,
   readStoredWorkspaceSlug,
@@ -96,8 +97,10 @@ import {
 import { planExecutionAllowWrite } from './planHelpers';
 import {
   parseTraceStep,
+  parseTraceSteps,
   panelLinesFromTexts,
   releaseTurnOpen,
+  pushCompletedTraceTurn,
   loadTraceTurnsFromRemote,
   mergeLiveTraceIntoPanel,
   isRemoteTraceAhead,
@@ -107,7 +110,7 @@ import {
 import { parseWorkerMessages } from './workerUtils';
 import { shouldSuppressSessionTrace } from './sseHelpers';
 import { SSE_TRACE_CONTENT_TYPES } from './constants';
-import { bumpSidebarSession, prependAgentSession } from './sidebarUtils';
+import { bumpSidebarSession, prependAgentSession, removeSessionsFromTree } from './sidebarUtils';
 import type { TraceLine } from './types';
 import { useWorkspaceCatalog } from '../../hooks/useWorkspaceCatalog';
 import { createHandleSSEEvent } from '../../hooks/useConsoleSSE';
@@ -204,6 +207,7 @@ export default function ConsolePage() {
   );
   const [panelResizing, setPanelResizing] = useState<'sidebar' | 'right' | null>(null);
   const [codeSearchOpen, setCodeSearchOpen] = useState(false);
+  const [memorySearchOpen, setMemorySearchOpen] = useState(false);
   const [multiSelectMode, setMultiSelectMode] = useState(false);
   const [selectedSessionIds, setSelectedSessionIds] = useState<Set<string>>(() => new Set());
   const streamedRef = useRef(false);
@@ -227,6 +231,7 @@ export default function ConsolePage() {
     () => {},
   );
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const mainScrollElRef = useRef<HTMLDivElement | null>(null);
   const consoleOpsRef = useRef<ConsoleOpsHandle>(null);
   const sidebarWidthRef = useRef(sidebarWidth);
   const rightPanelWidthRef = useRef(rightPanelWidth);
@@ -324,45 +329,77 @@ export default function ConsolePage() {
         return null;
       }
       try {
-        const remote = await api.lastTrace(slug, threadId);
+        const remote = await api.sessionTrace(slug, threadId);
         const loaded = loadTraceTurnsFromRemote(remote);
-        let panelSteps = loaded.currentSteps;
-        let panelTurns = loaded.completed;
+        const panelTurns = loaded.completed;
+        // 视图用：仅当前轮 currentSteps；缓存用：含各轮 reply，避免空数组冲掉本地 body
+        const viewSteps = loaded.currentSteps;
+        const cacheSteps = mergeTraceStepsUnique(
+          mergeTraceStepsUnique(viewSteps, parseTraceSteps(remote.steps)),
+          panelTurns.flatMap((t) => t.steps),
+        );
+        const panelSteps = viewSteps;
         let panelLines: TraceLine[] = remote.log_lines?.length
           ? panelLinesFromTexts(remote.log_lines)
-          : stepsToPanelLogLines(panelSteps);
-        saveTracePanelCache(
-          slug,
-          threadId,
-          panelLines.map((l) => l.text),
-          panelSteps,
+          : stepsToPanelLogLines(cacheSteps.length > 0 ? cacheSteps : panelSteps);
+        if (cacheSteps.length > 0 || panelLines.length > 0) {
+          saveTracePanelCache(
+            slug,
+            threadId,
+            panelLines.map((l) => l.text),
+            cacheSteps,
+          );
+        }
+        const curPanelSteps = mergeTraceStepsUnique(
+          panelTraceStepsRef.current,
+          panelTraceTurnsRef.current.flatMap((t) => t.steps),
         );
-        const curPanelSteps = panelTraceStepsRef.current;
+        const curLiveSteps = mergeTraceStepsUnique(curPanelSteps, traceStepsRef.current);
         const curPanelLines = panelTraceLinesRef.current;
-        const panelEmpty = curPanelSteps.length === 0 && curPanelLines.length === 0;
+        const panelEmpty = curLiveSteps.length === 0 && curPanelLines.length === 0;
         const remoteRicher = isRemoteTraceAhead(
           panelSteps,
           panelLines.length,
-          curPanelSteps,
+          curLiveSteps,
           curPanelLines.length,
         );
-        const agentRunning =
-          runningThreadsRef.current.has(threadId) ||
-          (selectedRef.current?.kind === 'agent' &&
-            selectedRef.current.thread_id === threadId);
+        // 勿把「仅选中」当成在跑，否则 idle 会话会反复刷 live_web_trace（易误认为 SSE 还在生成）
+        const agentRunning = runningThreadsRef.current.has(threadId);
         const remoteMax = maxStepId(panelSteps);
-        const currentMax = maxStepId(curPanelSteps);
+        const currentMax = maxStepId(curLiveSteps);
         const remoteFreshWhileRunning =
           agentRunning && remoteMax >= currentMax && panelSteps.length > 0;
+        // 新一轮已清空 live：勿用上一轮 session trace 快照回填，否则对话区会短暂展示上一轮 Trace
+        const turnStartedAt = traceTurnStartRef.current;
+        if (
+          agentRunning &&
+          curLiveSteps.length === 0 &&
+          turnStartedAt != null &&
+          turnStartedAt > 0
+        ) {
+          const liveTs = String(remote.live_ts ?? '');
+          const remoteMs = liveTs ? Date.parse(liveTs) : Number.NaN;
+          if (!Number.isFinite(remoteMs) || remoteMs + 500 < turnStartedAt) {
+            if (panelTurns.length > panelTraceTurnsRef.current.length) {
+              setPanelTraceTurns(panelTurns);
+              panelTraceTurnsRef.current = panelTurns;
+            }
+            return { panelLines, panelSteps: [], panelTurns };
+          }
+        }
         if (panelEmpty || remoteRicher || remoteFreshWhileRunning) {
           const liveTs = String(remote.live_ts ?? '');
           if (liveTs) {
             traceLiveTsRef.current.set(threadId, liveTs);
           }
           applyTraceToViewIfSelected(threadId, panelLines, panelSteps, panelTurns);
+          // 刷新后 SSE 短回放可能残留在 live traceSteps，用落盘步骤对齐
+          if (panelSteps.length >= traceStepsRef.current.length) {
+            traceStepsRef.current = panelSteps;
+            setTraceSteps(panelSteps);
+          }
         }
-        return { panelLines, panelSteps, panelTurns };
-      } catch {
+        return { panelLines, panelSteps, panelTurns };      } catch {
         return null;
       }
     },
@@ -573,12 +610,24 @@ export default function ConsolePage() {
     resubscribeSession,
   ]);
 
+  const dropSessionSubscription = useCallback((threadId: string) => {
+    if (!threadId) {
+      return;
+    }
+    sessionSubsRef.current.get(threadId)?.();
+    sessionSubsRef.current.delete(threadId);
+  }, []);
+
   const syncAgentRunningState = useCallback(
-    async (threadId: string, opts: { updateBusy?: boolean } = {}) => {
+    async (
+      threadId: string,
+      opts: { updateBusy?: boolean; trustServer?: boolean } = {},
+    ) => {
       if (!slug || !threadId) {
         return false;
       }
       const updateBusy = opts.updateBusy !== false;
+      const trustServer = opts.trustServer === true;
       try {
         const meta = await api.sessionMeta(slug, threadId);
         const running = Boolean(meta.running ?? meta.lock?.owner === 'web');
@@ -588,42 +637,47 @@ export default function ConsolePage() {
           if (updateBusy && selectedRef.current?.thread_id === threadId) {
             setBusy(true);
           }
-        } else {
-          const lastEvt = lastSessionEventAtRef.current.get(threadId) ?? 0;
-          const staleLocalTurn =
-            localTurn && lastEvt > 0 && Date.now() - lastEvt > 8_000;
-          if (!localTurn || staleLocalTurn) {
-            runningThreadsRef.current.delete(threadId);
-            streamAbortRef.current.delete(threadId);
-            streamLastEventAtRef.current.delete(threadId);
-            if (updateBusy && selectedRef.current?.thread_id === threadId) {
-              setBusy(false);
-              if (staleLocalTurn) {
-                void api
-                  .messages(slug, threadId)
-                  .then((data) => {
-                    if (selectedRef.current?.thread_id !== threadId) {
-                      return;
-                    }
-                    const parsed = dedupeConsecutiveUserMessages(
-                      parseAgentHistoryMessages(data.messages || []),
-                    );
-                    setMessages(parsed);
-                    setStreamText('');
-                  })
-                  .catch(() => {});
-              }
+          return true;
+        }
+        const lastEvt = lastSessionEventAtRef.current.get(threadId) ?? 0;
+        const staleLocalTurn =
+          localTurn && lastEvt > 0 && Date.now() - lastEvt > 8_000;
+        // trustServer：切回前台/选中 idle 会话时以服务端为准，勿保留本地 busy 造成「假 SSE」
+        const shouldClear = trustServer || !localTurn || staleLocalTurn;
+        if (shouldClear) {
+          runningThreadsRef.current.delete(threadId);
+          streamAbortRef.current.delete(threadId);
+          streamLastEventAtRef.current.delete(threadId);
+          lastSessionEventAtRef.current.delete(threadId);
+          if (trustServer) {
+            dropSessionSubscription(threadId);
+          }
+          if (updateBusy && selectedRef.current?.thread_id === threadId) {
+            setBusy(false);
+            setStreamText('');
+            setThinkingText('');
+            if (trustServer || staleLocalTurn) {
+              void fetchEnrichedAgentChatMessages(slug, threadId, {
+                liveLines: panelTraceLinesRef.current,
+                liveSteps: panelTraceStepsRef.current,
+                liveTurns: panelTraceTurnsRef.current,
+              })
+                .then((parsed) => {
+                  if (selectedRef.current?.thread_id !== threadId) {
+                    return;
+                  }
+                  setMessages((prev) => preferRicherAgentChat(prev, parsed));
+                })
+                .catch(() => {});
             }
           }
         }
-        return (
-          running || runningThreadsRef.current.has(threadId)
-        );
+        return runningThreadsRef.current.has(threadId);
       } catch {
         return runningThreadsRef.current.has(threadId);
       }
     },
-    [slug],
+    [slug, dropSessionSubscription],
   );
 
   const resumeSessionAfterSelect = useCallback(
@@ -631,11 +685,18 @@ export default function ConsolePage() {
       if (!slug || selectedRef.current?.thread_id !== node.thread_id) {
         return;
       }
-      resubscribeSession(node.thread_id);
       ensureRunningSessionSubscriptions();
 
       if (node.kind === 'agent') {
-        await syncAgentRunningState(node.thread_id);
+        const still = await syncAgentRunningState(node.thread_id, {
+          trustServer: true,
+        });
+        if (still) {
+          resubscribeSession(node.thread_id);
+        } else {
+          dropSessionSubscription(node.thread_id);
+          setBusy(false);
+        }
       } else if (node.kind === 'plan') {
         try {
           const detail = await api.plan(slug, node.thread_id);
@@ -645,7 +706,11 @@ export default function ConsolePage() {
           if (detail.job?.running || (detail as { lock?: { owner?: string } }).lock?.owner === 'web') {
             runningThreadsRef.current.add(node.thread_id);
             setBusy(true);
+            resubscribeSession(node.thread_id);
             ensurePlanSubscription(node.thread_id);
+          } else {
+            dropSessionSubscription(node.thread_id);
+            setBusy(false);
           }
         } catch {
           /* ignore */
@@ -688,7 +753,9 @@ export default function ConsolePage() {
     [
       slug,
       resubscribeSession,
+      dropSessionSubscription,
       ensureRunningSessionSubscriptions,
+      ensurePlanSubscription,
       syncRemoteTrace,
       syncAgentRunningState,
     ],
@@ -731,20 +798,8 @@ export default function ConsolePage() {
   });
 
   const reconnectSessionSubscriptions = useCallback(() => {
-    const threads = new Set<string>();
-    for (const tid of runningThreadsRef.current) {
-      threads.add(tid);
-    }
-    const sel = selectedRef.current;
-    if (sel) {
-      threads.add(sel.thread_id);
-      if (sel.kind === 'worker') {
-        const main = sel.thread_id.split(':worker:')[0];
-        if (main) {
-          threads.add(main);
-        }
-      }
-    }
+    // 只重连「确实在跑」的会话；idle 选中项不要因切回标签开 EventSource
+    const threads = new Set<string>(runningThreadsRef.current);
     for (const tid of threads) {
       if (tid) {
         resubscribeSession(tid);
@@ -781,17 +836,8 @@ export default function ConsolePage() {
     }
     const id = window.setInterval(() => {
       ensureRunningSessionSubscriptions();
-      const sel = selectedRef.current;
-      if (sel?.kind === 'agent' && slug) {
-        const last = lastSessionEventAtRef.current.get(sel.thread_id) ?? 0;
-        if (last <= 0 || Date.now() - last >= SSE_TRACE_POLL_SKIP_MS) {
-          void syncRemoteTrace(sel.thread_id);
-        }
-      }
+      // 仅对进行中的会话轮询 session trace；idle 选中会话勿刷半截 live（「模型决策中」）
       for (const tid of runningThreadsRef.current) {
-        if (sel?.kind === 'agent' && sel.thread_id === tid) {
-          continue;
-        }
         const last = lastSessionEventAtRef.current.get(tid) ?? 0;
         if (last > 0 && Date.now() - last < SSE_TRACE_POLL_SKIP_MS) {
           continue;
@@ -826,14 +872,53 @@ export default function ConsolePage() {
       if (document.visibilityState !== 'visible') {
         return;
       }
-      for (const tid of runningThreadsRef.current) {
-        void syncRemoteTrace(tid);
-      }
-      reconnectSessionSubscriptions();
+      void (async () => {
+        const sel = selectedRef.current;
+        if (sel?.kind === 'agent') {
+          const still = await syncAgentRunningState(sel.thread_id, {
+            trustServer: true,
+          });
+          if (!still) {
+            // 已停止：断开订阅并退出 busy；补拉落盘 messages/trace，避免切回后对话区空白误判终止
+            dropSessionSubscription(sel.thread_id);
+            setBusy(false);
+            setStreamText('');
+            setThinkingText('');
+            void syncRemoteTrace(sel.thread_id);
+            // syncAgentRunningState(trustServer) 已异步 enrich；再兜底一次防竞态
+            void fetchEnrichedAgentChatMessages(slug, sel.thread_id, {
+              liveLines: panelTraceLinesRef.current,
+              liveSteps: panelTraceStepsRef.current,
+              liveTurns: panelTraceTurnsRef.current,
+            })
+              .then((parsed) => {
+                if (selectedRef.current?.thread_id !== sel.thread_id) {
+                  return;
+                }
+                setMessages((prev) => preferRicherAgentChat(prev, parsed));
+              })
+              .catch(() => {});
+            return;
+          }
+          setBusy(true);
+          runningThreadsRef.current.add(sel.thread_id);
+          void syncRemoteTrace(sel.thread_id);
+        }
+        for (const tid of [...runningThreadsRef.current]) {
+          void syncRemoteTrace(tid);
+        }
+        reconnectSessionSubscriptions();
+      })();
     };
     document.addEventListener('visibilitychange', onVisibility);
     return () => document.removeEventListener('visibilitychange', onVisibility);
-  }, [slug, syncRemoteTrace, reconnectSessionSubscriptions]);
+  }, [
+    slug,
+    syncRemoteTrace,
+    syncAgentRunningState,
+    dropSessionSubscription,
+    reconnectSessionSubscriptions,
+  ]);
 
   useEffect(() => {
     if (!busy) {
@@ -990,6 +1075,7 @@ export default function ConsolePage() {
   const mainScrollPinDeps = useMemo(
     () => [
       messages.length,
+      messages[messages.length - 1]?.id ?? '',
       streamText.length,
       traceStepsFingerprint(panelTraceSteps),
       traceStepsFingerprint(traceSteps),
@@ -997,9 +1083,11 @@ export default function ConsolePage() {
       traceLines.map((l) => l.text).join('\n').length,
       thinkingText.length,
       busy,
+      historyLoading,
     ],
     [
       messages.length,
+      messages,
       streamText.length,
       panelTraceSteps,
       traceSteps,
@@ -1007,12 +1095,38 @@ export default function ConsolePage() {
       traceLines,
       thinkingText,
       busy,
+      historyLoading,
     ],
   );
   const mainScroll = useStickToBottomScroll<HTMLDivElement>(mainScrollPinDeps, {
     enabled: true,
     resetKey: selected?.thread_id ?? '',
+    // 历史加载中强制贴底，避免中途高度变化把 pinned 误判成「用户上滑」
+    forcePin: historyLoading,
   });
+
+  const mergeMainScrollRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      mainScrollElRef.current = node;
+      mainScroll.ref(node);
+    },
+    [mainScroll.ref],
+  );
+
+  useEffect(() => {
+    if (historyLoading) {
+      return;
+    }
+    // 历史落定后再贴底几次，吃掉 Markdown/图片布局与 enrich 补全
+    const timers = [0, 80, 240].map((ms) =>
+      window.setTimeout(() => mainScroll.stickToBottom(), ms),
+    );
+    return () => {
+      for (const t of timers) {
+        window.clearTimeout(t);
+      }
+    };
+  }, [historyLoading, selected?.thread_id, mainScroll.stickToBottom]);
 
   useEffect(() => {
     try {
@@ -1069,6 +1183,13 @@ export default function ConsolePage() {
     }
   }, [slug, selected?.thread_id, selected?.kind]);
 
+  const prewarmAgentSession = useCallback(
+    (activeSlug: string, threadId: string) => {
+      void api.prewarmSession(activeSlug, threadId, allowWrite).catch(() => {});
+    },
+    [allowWrite],
+  );
+
   useEffect(() => {
     if (!slug || treeReadySlug !== slug || agents.length === 0) {
       return;
@@ -1089,8 +1210,11 @@ export default function ConsolePage() {
     }
     selectedRef.current = node;
     setSelected(node);
+    if (node.kind === 'agent') {
+      prewarmAgentSession(slug, node.thread_id);
+    }
     void loadHistory(node);
-  }, [slug, treeReadySlug, agents, plans, loadHistory]);
+  }, [slug, treeReadySlug, agents, plans, loadHistory, prewarmAgentSession]);
 
   useEffect(() => {
     const current = selectedRef.current;
@@ -1162,6 +1286,9 @@ export default function ConsolePage() {
     setBusy(runningThreadsRef.current.has(node.thread_id));
     if (slug) {
       writeStoredSessionThread(slug, node.thread_id);
+      if (node.kind === 'agent') {
+        prewarmAgentSession(slug, node.thread_id);
+      }
     }
     loadHistory(node);
     if (pollRef.current) {
@@ -1182,7 +1309,7 @@ export default function ConsolePage() {
           setMessages(chat);
           if (selectedRef.current?.thread_id === node.thread_id) {
             try {
-              const remote = await api.lastTrace(slug, node.thread_id);
+              const remote = await api.sessionTrace(slug, node.thread_id);
               let pollLines: TraceLine[] = [];
               let pollSteps: TraceStep[] = [];
               if (remote.steps?.length) {
@@ -1319,7 +1446,6 @@ export default function ConsolePage() {
       updated_at: now,
     };
     prependAgentSession(setAgents, newNode);
-    void api.prewarmSession(activeSlug, thread_id, true).catch(() => {});
     void api.setWriteMode(activeSlug, true, thread_id).catch(() => {});
     handleSelect(newNode);
   };
@@ -1390,6 +1516,7 @@ export default function ConsolePage() {
     try {
       abortRef.current?.abort();
       await api.deleteSession(slug, node.thread_id);
+      removeSessionsFromTree([node.thread_id], setAgents, setPlans);
       if (isSessionAffectedByDelete(node.thread_id)) {
         clearSessionView();
       }
@@ -1475,6 +1602,10 @@ export default function ConsolePage() {
     try {
       abortRef.current?.abort();
       const res = await api.deleteSessions(slug, ids);
+      const succeeded = res.results.filter((r) => r.ok).map((r) => r.thread_id);
+      if (succeeded.length > 0) {
+        removeSessionsFromTree(succeeded, setAgents, setPlans);
+      }
       if (ids.some((id) => isSessionAffectedByDelete(id))) {
         clearSessionView();
       }
@@ -1632,9 +1763,9 @@ export default function ConsolePage() {
       : mergedPanelTrace.lines.length > 0
         ? panelLinesFromTexts(mergedPanelTrace.lines)
         : panelTraceLines;
-  /** Agent 执行中：对话区仅展示当前轮 live trace；完成后收起 */
-  const currentTurnSteps =
-    busy && traceSteps.length > 0 ? traceSteps : panelTraceSteps;
+  /** 右侧 Trace：完整历史轮 + 当前轮。对话区 SSE：只展示当前轮（不与右侧整板重复）。
+   * 刷新后 SSE 回放可能只有缓冲尾部几步，当前轮步骤须与 panel 合并，不能只用短 live. */
+  const currentTurnSteps = mergeTraceStepsUnique(panelTraceSteps, traceSteps);
   const displayPanelTurns = buildDisplayTraceTurns(panelTraceTurns, currentTurnSteps, {
     busy,
     currentDurationSec: currentTurnDurationSec ?? undefined,
@@ -1643,22 +1774,30 @@ export default function ConsolePage() {
         ? `第 ${panelTraceTurns.length + 1} 轮 · 进行中`
         : undefined,
   });
-  const agentChatTraceText =
-    busy && selected?.kind === 'agent' ? liveTraceText : '';
+  /** 对话区仅当前进行中的一轮；用户气泡已在上方，日志里的「用户消息」行不再重复。 */
+  const agentChatLiveTurn =
+    busy && selected?.kind === 'agent'
+      ? displayPanelTurns.find((turn) => turn.live)
+      : undefined;
+  const agentChatTraceTurns = agentChatLiveTurn ? [agentChatLiveTurn] : [];
   const agentChatTraceSteps =
-    busy && selected?.kind === 'agent' ? currentTurnSteps : [];
-  const agentChatTraceTurns =
-    busy && selected?.kind === 'agent' && currentTurnSteps.length > 0
-      ? displayPanelTurns.slice(-1)
-      : [];
+    busy && selected?.kind === 'agent' ? (agentChatLiveTurn?.steps ?? []) : [];
+  const agentChatTraceText =
+    busy && selected?.kind === 'agent' && agentChatLiveTurn
+      ? (displayPanelLines.map((l) => l.text).join('\n') || liveTraceText)
+          .split('\n')
+          .filter((line) => !line.includes('用户消息'))
+          .join('\n')
+      : '';
   const planChatTraceText =
     busy && selected?.kind === 'plan'
-      ? panelTraceLines.map((l) => l.text).join('\n')
-      : busy
-        ? liveTraceText
-        : '';
+      ? panelTraceLines
+          .map((l) => l.text)
+          .filter((line) => !line.includes('用户消息'))
+          .join('\n')
+      : '';
   const planChatTraceSteps =
-    busy && selected?.kind === 'plan' ? panelTraceSteps : busy ? traceSteps : [];
+    busy && selected?.kind === 'plan' ? panelTraceSteps : [];
 
   const handleModelChange = async (modelId: string) => {
     if (!slug || !modelId || llmSettings?.model === modelId) {
@@ -1820,6 +1959,15 @@ export default function ConsolePage() {
     bumpSidebarSession(node, setAgents, setPlans);
     streamedRef.current = false;
     traceFlushedRef.current = false;
+    // 先归档上一轮 current steps，避免 busy=true 到 turn_start 之间对话区仍展示上一轮 Trace
+    const prevTurnNum = panelTraceTurnsRef.current.length + 1;
+    pushCompletedTraceTurn(
+      panelTraceTurnsRef,
+      panelTraceStepsRef,
+      setPanelTraceTurns,
+      setPanelTraceSteps,
+      `第 ${prevTurnNum} 轮`,
+    );
     setTraceLines([]);
     setTraceSteps([]);
     traceLinesRef.current = [];
@@ -1839,13 +1987,39 @@ export default function ConsolePage() {
     lastSessionEventAtRef.current.set(node.thread_id, Date.now());
     runningThreadsRef.current.add(node.thread_id);
     try {
-      await api.startAgentChat(
+      const chatRes = await api.startAgentChat(
         slug,
         node.thread_id,
         text,
         allowWrite,
         images.map((img) => img.file),
       );
+      const persisted = chatRes.images ?? [];
+      if (persisted.length > 0) {
+        const byIndex = persisted;
+        setMessages((prev) => {
+          const next = [...prev];
+          for (let i = next.length - 1; i >= 0; i -= 1) {
+            const m = next[i];
+            if (m.role !== 'user') {
+              continue;
+            }
+            if ((m.images?.length ?? 0) === 0) {
+              break;
+            }
+            next[i] = {
+              ...m,
+              images: byIndex.map((img) => ({
+                id: img.id,
+                media_type: img.media_type,
+                url: img.url,
+              })),
+            };
+            break;
+          }
+          return next;
+        });
+      }
       refreshTree();
     } catch (e) {
       runningThreadsRef.current.delete(node.thread_id);
@@ -2135,6 +2309,7 @@ export default function ConsolePage() {
         onBatchDelete={handleBatchDeleteSessions}
         onDeleteEmpty={handleDeleteEmptySessions}
         onCodeSearch={() => setCodeSearchOpen(true)}
+        onMemorySearch={() => setMemorySearchOpen(true)}
       />
 
       <main className="cursor-main">
@@ -2237,7 +2412,7 @@ export default function ConsolePage() {
               </div>
             </header>
 
-            <div className="cursor-main-scroll" ref={mainScroll.ref}>
+            <div className="cursor-main-scroll" ref={mergeMainScrollRef}>
               {selected?.kind === 'plan' && !planDetail ? (
                 <div className="cursor-catalog-empty">加载 Plan 工作流…</div>
               ) : showPlanMain ? (
@@ -2281,9 +2456,12 @@ export default function ConsolePage() {
                       liveTraceText={planChatTraceText}
                       liveTraceSteps={planChatTraceSteps}
                       streamText={streamText}
+                      liveThinking={thinkingText}
                       busy={busy}
                       historyLoading={historyLoading}
                       traceMode={caps?.trace_mode}
+                      scrollRootRef={mainScrollElRef}
+                      slug={slug}
                     />
                   </section>
                 </>
@@ -2298,6 +2476,7 @@ export default function ConsolePage() {
                   traceLines={workerTraceText}
                   liveTraceSteps={workerLiveSteps}
                   busy={busy || workerMeta.status === 'running'}
+                  scrollRootRef={mainScrollElRef}
                   onBack={handleBackToPlan}
                   onStop={() => void handleTaskStop(workerMeta.taskId)}
                   onRun={() => void handleTaskRun(workerMeta.taskId)}
@@ -2349,9 +2528,12 @@ export default function ConsolePage() {
                   liveTraceSteps={agentChatTraceSteps}
                   liveTraceTurns={agentChatTraceTurns}
                   streamText={streamText}
+                  liveThinking={thinkingText}
                   busy={busy}
                   historyLoading={historyLoading}
                   traceMode={caps?.trace_mode}
+                  scrollRootRef={mainScrollElRef}
+                  slug={slug}
                 />
                 </>
               )}
@@ -2579,6 +2761,9 @@ export default function ConsolePage() {
 
       {codeSearchOpen && slug && (
         <CodeSearchPanel slug={slug} onClose={() => setCodeSearchOpen(false)} />
+      )}
+      {memorySearchOpen && slug && (
+        <MemorySearchPanel slug={slug} onClose={() => setMemorySearchOpen(false)} />
       )}
     </div>
   );

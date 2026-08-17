@@ -1,0 +1,72 @@
+import type { MermaidConfig } from 'mermaid';
+
+/** 对齐 Cursor / VS Code Markdown 预览的浅色 Mermaid 主题（base + classic）。 */
+export function buildMermaidConfig(): MermaidConfig {
+  return {
+    startOnLoad: false,
+    securityLevel: 'strict',
+    theme: 'base',
+    look: 'classic',
+    fontFamily:
+      'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+    themeVariables: {
+      darkMode: false,
+      background: '#ffffff',
+      fontSize: '13px',
+      fontFamily:
+        'ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      textColor: '#1b1b18',
+      primaryColor: '#eef2ff',
+      primaryTextColor: '#1b1b18',
+      primaryBorderColor: '#7986cb',
+      secondaryColor: '#e8eaf6',
+      secondaryTextColor: '#1b1b18',
+      secondaryBorderColor: '#9fa8da',
+      tertiaryColor: '#ffffff',
+      tertiaryTextColor: '#1b1b18',
+      tertiaryBorderColor: '#c5cae9',
+      mainBkg: '#eef2ff',
+      nodeBorder: '#7986cb',
+      nodeTextColor: '#1b1b18',
+      lineColor: '#6b7280',
+      edgeLabelBackground: '#ffffff',
+      clusterBkg: '#fafaf8',
+      clusterBorder: '#e4e4df',
+      titleColor: '#1b1b18',
+      labelTextColor: '#1b1b18',
+      actorBkg: '#eef2ff',
+      actorBorder: '#7986cb',
+      actorTextColor: '#1b1b18',
+      actorLineColor: '#6b7280',
+      signalColor: '#6b7280',
+      signalTextColor: '#1b1b18',
+      labelBoxBkgColor: '#eef2ff',
+      labelBoxBorderColor: '#9fa8da',
+      noteBkgColor: '#fffbeb',
+      noteTextColor: '#1b1b18',
+      noteBorderColor: '#fcd34d',
+    },
+    flowchart: {
+      htmlLabels: true,
+      curve: 'basis',
+      padding: 20,
+      nodeSpacing: 50,
+      rankSpacing: 58,
+      useMaxWidth: true,
+      diagramPadding: 12,
+    },
+    sequence: {
+      useMaxWidth: true,
+      diagramMarginX: 20,
+      diagramMarginY: 14,
+      actorMargin: 64,
+      width: 168,
+      boxMargin: 12,
+      messageMargin: 40,
+    },
+    gantt: {
+      useMaxWidth: true,
+      fontSize: 13,
+    },
+  };
+}

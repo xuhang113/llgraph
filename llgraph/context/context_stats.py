@@ -17,7 +17,20 @@ from llgraph.context.context_settings import resolve_context_settings
 from llgraph.context.context_builder import build_workspace_context_block
 from llgraph.core.tools import get_agent_tools
 
-_SUMMARY_TAGS = ("<conversation-anchor>", "<conversation-summary>")
+
+def _is_summarized_conversation_message(msg: BaseMessage) -> bool:
+    """
+    是否为压缩后的会话摘要（锚点 / 旧版 summary），不含 session-manifest。
+
+    @param msg LangChain 消息
+    @return 是否计入 Summarized conversation
+    """
+    from llgraph.context.conversation_anchor import (
+        is_conversation_anchor_message,
+        is_conversation_summary_message,
+    )
+
+    return is_conversation_anchor_message(msg) or is_conversation_summary_message(msg)
 
 
 @dataclass(frozen=True)
@@ -202,10 +215,7 @@ def _split_message_tokens(messages: list[BaseMessage]) -> tuple[int, int]:
     for msg in messages:
         chars = _message_content_chars(msg)
         tokens = chars_to_tokens(chars)
-        content = getattr(msg, "content", "") or ""
-        if not isinstance(content, str):
-            content = str(content)
-        if isinstance(msg, SystemMessage) and any(tag in content for tag in _SUMMARY_TAGS):
+        if _is_summarized_conversation_message(msg):
             summarized += tokens
         else:
             conversation += tokens

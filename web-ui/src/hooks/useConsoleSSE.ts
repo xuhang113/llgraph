@@ -14,12 +14,14 @@ import {
 } from '../utils/tracePanelStore';
 import {
   appendAssistantReplyIfMissing,
-  reconcileHistoryAfterTurnDone,
-  enrichChatWithTraceReplies,
   extractMessageContent,
   formatAgentChatDisplayText,
-  parseAgentHistoryMessages,
+  isUserVisibleAssistantText,
 } from '../utils/messageText';
+import {
+  fetchEnrichedAgentChatMessages,
+  preferRicherAgentChat,
+} from '../utils/fetchEnrichedAgentChat';
 import { clearPendingUserMessage } from '../utils/pendingUserMessage';
 import { buildPlanChatMessages } from '../utils/planChat';
 import type { TraceLine } from '../pages/console/types';
@@ -39,6 +41,7 @@ import {
 import { parseWorkerMessages } from '../pages/console/workerUtils';
 import {
   eventMatchesWorkerTask,
+  isExploreSubagentEvent,
   isPlannerSubagentEvent,
   isSubagentWorkerEvent,
 } from '../pages/console/sseHelpers';
@@ -180,6 +183,11 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
 
   return (event: Record<string, unknown>, eventThread: string) => {
     const type = String(event.type || '');
+    // 子 Agent 启动/结束登记：侧栏需立即出现入口（不等 turn end）
+    if (type === 'subagent_started' || type === 'subagent_updated') {
+      refreshTree();
+      return;
+    }
     const traceWhileStopped =
       type === 'trace_line' ||
       type === 'trace_step' ||
@@ -246,6 +254,27 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       }
     }
 
+    // Agent 主会话：explore/subagent 明细只写子 thread cache，禁止污染对话区 live
+    if (agentView && isExploreSubagentEvent(event) && traceEventTypes.has(type)) {
+      const sub = String(event.sub_thread || '').trim();
+      if (slug && sub) {
+        if (type === 'trace_line') {
+          const line = String(event.text || '');
+          if (line.trim()) {
+            appendTracePanelCacheLine(slug, sub, line);
+          }
+        } else if (type === 'trace_step') {
+          const raw = event.step as Record<string, unknown> | undefined;
+          if (raw) {
+            appendTracePanelCacheStep(slug, sub, parseTraceStep(raw));
+          }
+        }
+      }
+      if (type !== 'end' && type !== 'error' && type !== 'interrupt') {
+        return;
+      }
+    }
+
     if (
       planView &&
       (isPlannerSubagentEvent(event) || isPlanPlannerThread) &&
@@ -270,7 +299,11 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
             const step = parseTraceStep(raw);
             appendTracePanelCacheStep(slug, sub, step);
             setPanelTraceSteps((prev) => {
-              const next = [...prev, step];
+              const idx = prev.findIndex((s) => s.step_id === step.step_id);
+              const next =
+                idx >= 0
+                  ? prev.map((s, i) => (i === idx ? step : s))
+                  : [...prev, step];
               panelTraceStepsRef.current = next;
               return next;
             });
@@ -438,7 +471,10 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       traceTurnStartRef.current = Date.now();
       setTraceActivitySec(0);
       setCurrentTurnDurationSec(null);
-      if (claimTurnStart(eventThread, turnOpenRef.current)) {
+      // 刷新重连的 replay 不得清掉 session trace 已恢复的完整步骤
+      if (event.replay === true) {
+        turnOpenRef.current.add(eventThread);
+      } else if (claimTurnStart(eventThread, turnOpenRef.current)) {
         const turnNum = panelTraceTurnsRef.current.length + 1;
         pushCompletedTraceTurn(
           panelTraceTurnsRef,
@@ -516,15 +552,21 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
         if (event.replay === true && exists) {
           return;
         }
-        if (!exists) {
-          setPanelTraceSteps((prev) => {
-            const next = [...prev, step];
-            panelTraceStepsRef.current = next;
-            return next;
-          });
-        }
-        const liveExists = traceStepsRef.current.some((s) => s.step_id === step.step_id);
-        if (!liveExists) {
+        setPanelTraceSteps((prev) => {
+          const idx = prev.findIndex((s) => s.step_id === step.step_id);
+          const next =
+            idx >= 0
+              ? prev.map((s, i) => (i === idx ? step : s))
+              : [...prev, step];
+          panelTraceStepsRef.current = next;
+          return next;
+        });
+        const liveIdx = traceStepsRef.current.findIndex((s) => s.step_id === step.step_id);
+        if (liveIdx >= 0) {
+          const next = traceStepsRef.current.map((s, i) => (i === liveIdx ? step : s));
+          traceStepsRef.current = next;
+          setTraceSteps(next);
+        } else {
           const next = [...traceStepsRef.current, step];
           traceStepsRef.current = next;
           setTraceSteps(next);
@@ -534,14 +576,12 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
         }
         if (agentView && step.kind === 'reply') {
           const replyPreview = formatAgentChatDisplayText(extractReplyTextFromTraceStep(step));
-          if (replyPreview.trim()) {
-            if (streamedRef.current) {
-              setMessages((prev) => appendAssistantReplyIfMissing(prev, replyPreview));
-              setStreamText('');
-            } else {
-              streamedRef.current = true;
-              setStreamText(replyPreview);
-            }
+          if (isUserVisibleAssistantText(replyPreview)) {
+            // 步骤模式下 reply 常整段到达、无 stream_delta；必须写入 messages，
+            // 不能只放 streamText（turn_done 清流后对话区会空白）。
+            setMessages((prev) => appendAssistantReplyIfMissing(prev, replyPreview));
+            streamedRef.current = true;
+            setStreamText(replyPreview);
           }
         }
       }
@@ -585,39 +625,46 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       runningThreadsRef.current.delete(eventThread);
       streamAbortRef.current.delete(eventThread);
       streamLastEventAtRef.current.delete(eventThread);
+      const stepPool = [
+        ...panelTraceStepsRef.current,
+        ...parseTraceSteps(event.trace_steps),
+      ];
+      const replyFromSteps = stepPool
+        .filter((s) => s.kind === 'reply')
+        .map((s) => formatAgentChatDisplayText(extractReplyTextFromTraceStep(s)))
+        .filter((t) => isUserVisibleAssistantText(t));
       const fallbackReply = formatAgentChatDisplayText(extractMessageContent(event.text));
+      const effectiveReply = isUserVisibleAssistantText(fallbackReply)
+        ? fallbackReply
+        : (replyFromSteps[replyFromSteps.length - 1] || '');
       if (agentView) {
         setBusy(false);
         setThinkingText('');
         setTraceActivitySec(0);
-        if (fallbackReply.trim()) {
-          setMessages((prev) => appendAssistantReplyIfMissing(prev, fallbackReply));
+        if (isUserVisibleAssistantText(effectiveReply)) {
+          setMessages((prev) => appendAssistantReplyIfMissing(prev, effectiveReply));
         }
+        // 先清流式区：正文已在 messages
+        setStreamText('');
         if (slug && sel?.kind === 'agent' && sel.thread_id === eventThread) {
-          void api
-            .messages(slug, eventThread)
-            .then((data) => {
-              const traceSteps = parseTraceSteps(event.trace_steps);
-              const parsed = enrichChatWithTraceReplies(
-                reconcileHistoryAfterTurnDone(
-                  parseAgentHistoryMessages(data.messages || []),
-                  fallbackReply,
-                ),
-                traceSteps,
-              );
-              setMessages(parsed);
-              setStreamText('');
+          void fetchEnrichedAgentChatMessages(slug, eventThread, {
+            fallbackReply: effectiveReply,
+            liveLines: panelTraceLinesRef.current,
+            liveSteps: stepPool,
+            liveTurns: panelTraceTurnsRef.current,
+          })
+            .then((parsed) => {
+              if (selectedRef.current?.thread_id !== eventThread) {
+                return;
+              }
+              setMessages((prev) => preferRicherAgentChat(prev, parsed));
             })
-            .catch(() => {
-              setStreamText('');
-            });
-        } else {
-          setStreamText('');
+            .catch(() => {});
         }
       } else {
         setStreamText('');
-        if (fallbackReply.trim()) {
-          setMessages((prev) => appendAssistantReplyIfMissing(prev, fallbackReply));
+        if (isUserVisibleAssistantText(effectiveReply)) {
+          setMessages((prev) => appendAssistantReplyIfMissing(prev, effectiveReply));
         }
       }
       streamedRef.current = false;
@@ -626,6 +673,8 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
         setFileChangesTick((n) => n + 1);
       }
       bumpContextRefresh();
+    } else if (type === 'title_updated') {
+      refreshTree();
     } else if (type === 'interrupt') {
       const payload = event.payload as Record<string, unknown>;
       if (payload?.type === 'tasks_incomplete') {

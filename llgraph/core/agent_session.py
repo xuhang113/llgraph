@@ -37,3 +37,7 @@ class AgentSessionContext:
     sandbox_cli_enabled: bool | None = None
     mode_switch: SessionModeTransition | None = None
     return_agent_thread_id: str | None = None
+    # spawn_subagent 工具闭包；每轮对话前 bind SSE
+    subagent_parent_slot: Any | None = None
+    sse_emit: Callable[[dict[str, Any]], None] | None = None
+    sse_loop: Any | None = None

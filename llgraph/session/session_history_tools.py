@@ -29,23 +29,22 @@ def create_session_history_tools(workspace_root: Path) -> list:
         include_tool_results: bool = False,
     ) -> str:
         """
-        按用户问题或关键词检索本会话全历史（归档 jsonl、messages.jsonl、结构化锚点章节）。
+        按关键词检索**本会话多轮历史**（归档、messages.jsonl、锚点章节）。
 
-        应在以下情况主动调用（勿假设上下文里仍有完整旧对话）：
-        - 用户提到「之前/刚才/上次/延续」或引用未在当前窗口出现的决策、文件、报错、shell 命令；
-        - 上下文已压缩、切换模型、或你对任务背景不确定（防失忆）；
-        - 置顶 <conversation-anchor> 不足以回答细节。
+        **仅当**需要早先轮次细节且当前上下文里没有时再调用：
+        - 用户明确提「之前/刚才/上次/延续/你说过」或引用未在当前窗口出现的结论/命令；
+        - 或存在 conversation-anchor / 压缩归档，且要核对压缩前细节。
 
-        工作流程：先本工具 → 命中不足时用返回的 read_file 行段（start_line/end_line）精读。
-        禁止：search_files 扫 messages.jsonl、cat 整文件、或绕过本工具直接读全量历史。
+        **禁止**用于：
+        - 找回「当前用户消息在问什么」（当前 Human 消息即目标，应直接读对话，勿搜历史）；
+        - 纯代码/实现排查（用 grep_files / search_code_* / read_file）；
+        - 臆造「用户异议」「上一轮结论」等当前会话并不存在的情节。
 
-        检索 shell/find/git/命令 类问题时，会自动纳入 tool 输出与 AI 的 tool_calls 参数。
+        工作流：本工具 → 不足再用返回的 read_file 行段；禁止 cat 全量 messages.jsonl。
 
-        不要用于：当前轮已可见的最近几轮内容；纯代码检索请用 search_code_parallel/grep_files。
-
-        @param query 检索问句或 3～12 个关键词（中英文、文件路径片段、服务名等）
+        @param query 检索关键词（具体业务词；勿填「用户异议」「上一轮结论」等元叙事）
         @param top_k 返回条数，默认 8，最大 20
-        @param include_tool_results 是否包含历史 tool 长输出（shell/命令类 query 会自动 true）
+        @param include_tool_results 是否含历史 tool 长输出
         """
         try:
             thread_id = require_active_thread_id()
@@ -56,6 +55,12 @@ def create_session_history_tools(workspace_root: Path) -> list:
             k = max(1, min(20, int(top_k)))
         except (TypeError, ValueError):
             k = settings.session_history_search_top_k
+
+        from llgraph.session.session_history_search import guard_session_history_query
+
+        blocked = guard_session_history_query(root, thread_id, query)
+        if blocked:
+            return blocked
 
         return search_session_history(
             root,

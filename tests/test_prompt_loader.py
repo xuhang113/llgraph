@@ -46,17 +46,23 @@ def test_compose_agent_system_prompt_non_empty() -> None:
     )
     assert "test-model" in text
     assert hint in text
-    assert "工具选型" in hint
     assert "grep_files" in text
-    assert "ReAct" in text
-    assert "Cursor" in text
+    assert "llgraph" in text
+    assert "# Doing tasks" in text
+    assert "# Using your tools" in text
+    assert "# Output efficiency" in text
+    assert "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__" in text
+    # 边界前为静态原则，检索路由在动态侧
+    static, _, dynamic = text.partition("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__")
+    assert "# Doing tasks" in static
+    assert "Code search routing" in dynamic or "search_code_parallel" in dynamic
+    assert len(text) < 14_000
 
 
 def test_compose_search_order_hint_includes_routing_when_indexed() -> None:
     _, hint = compose_search_order_hint(index_ready=True)
-    assert "工具选型" in hint
-    assert "常见多余 step" in hint
-    assert "search_code_parallel" in hint
+    assert "Code search routing" in hint or "search_code_parallel" in hint
+    assert "Avoid" in hint or "search_code_parallel" in hint
 
 
 def test_compose_plan_and_thought_helpers() -> None:
@@ -71,4 +77,4 @@ def test_compose_plan_and_thought_helpers() -> None:
     assert "【规划】" in header
 
     builtin = compose_thought_builtin_retrieval()
-    assert "grep_files" in builtin
+    assert "grep" in builtin.lower() or "tool" in builtin.lower()

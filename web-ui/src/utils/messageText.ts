@@ -29,7 +29,10 @@ export function extractMessageContent(content: unknown): string {
   return String(content);
 }
 
-function extractImagesFromContentBlocks(blocks: unknown[]): ChatImageAttachment[] {
+function extractImagesFromContentBlocks(
+  blocks: unknown[],
+  attachmentUrlFor?: (imageId: string) => string,
+): ChatImageAttachment[] {
   const images: ChatImageAttachment[] = [];
   for (const block of blocks) {
     if (!block || typeof block !== 'object') {
@@ -41,7 +44,8 @@ function extractImagesFromContentBlocks(blocks: unknown[]): ChatImageAttachment[
       const id = String(row.id ?? '').trim();
       const mediaType = String(row.media_type ?? 'image/png');
       if (id) {
-        images.push({ id, media_type: mediaType });
+        const url = attachmentUrlFor?.(id) || undefined;
+        images.push(url ? { id, media_type: mediaType, url } : { id, media_type: mediaType });
       }
     }
   }
@@ -105,7 +109,7 @@ export function resolveHistoryImages(
     return images;
   }
   if (Array.isArray(content)) {
-    return extractFromContentBlocks(content).images;
+    return extractImagesFromContentBlocks(content);
   }
   return [];
 }
@@ -115,7 +119,8 @@ export function resolveHistoryDisplayText(
   _raw?: Record<string, unknown>,
   _toolCalls?: unknown,
 ): string {
-  if (displayText !== undefined && displayText !== null) {
+  // 空串不能挡住 content：工具轮 AI 常带 display_text=""，最终答复则依赖 content
+  if (displayText !== undefined && displayText !== null && String(displayText).trim()) {
     return String(displayText).trim();
   }
   return extractMessageContent(content).trim();
@@ -153,7 +158,29 @@ export function extractLlgraphThinkingText(raw?: Record<string, unknown>): strin
   return typeof thinking === 'string' ? thinking.trim() : '';
 }
 
-/** 按行拆分助手正文：规划/trace 行 vs 用户可见答复（代码块内不拆）。 */
+function splitInlinePlanningFromLine(line: string): { replyParts: string[]; planParts: string[] } {
+  if (!line.includes('【规划】')) {
+    return { replyParts: [line], planParts: [] };
+  }
+  const segments = line.split('【规划】');
+  const replyParts: string[] = [];
+  const planParts: string[] = [];
+  const head = segments[0];
+  if (head?.trim()) {
+    replyParts.push(head.trimEnd());
+  }
+  for (let i = 1; i < segments.length; i += 1) {
+    const piece = segments[i]?.trim();
+    if (piece) {
+      planParts.push(`【规划】${piece}`);
+    } else if (i === segments.length - 1) {
+      planParts.push('【规划】');
+    }
+  }
+  return { replyParts, planParts };
+}
+
+/** 按行拆分助手正文：规划/trace 行 vs 用户可见答复（代码块内不拆；支持行内【规划】）。 */
 export function splitAssistantPlanningLines(text: string): {
   planLines: string[];
   replyLines: string[];
@@ -170,11 +197,60 @@ export function splitAssistantPlanningLines(text: string): {
     }
     if (!inFence && isPlanningLine(line)) {
       planLines.push(line);
-    } else {
-      replyLines.push(line);
+      continue;
     }
+    if (!inFence && line.includes('【规划】')) {
+      const split = splitInlinePlanningFromLine(line);
+      for (const part of split.replyParts) {
+        if (part.trim()) {
+          replyLines.push(part);
+        }
+      }
+      planLines.push(...split.planParts);
+      continue;
+    }
+    replyLines.push(line);
   }
   return { planLines, replyLines };
+}
+
+/** 折叠区展示：去掉【规划】前缀，保留正文。 */
+export function formatPlanningFoldText(text: string): string {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/^【规划】\s?/, '').trimEnd())
+    .join('\n')
+    .trim();
+}
+
+/** 流式助手正文：拆出可见答复 vs 规划/推理（含尾部未完整的【规划】标记）。 */
+export function splitAssistantStreamDisplay(text: string): {
+  replyText: string;
+  planningText: string;
+} {
+  const cleaned = stripSurveyForDisplay(stripInboundToolCallMarkup(text || ''));
+  let body = cleaned;
+  let trailingPlanning = '';
+
+  const partialIdx = body.lastIndexOf('【规');
+  if (partialIdx >= 0) {
+    const tail = body.slice(partialIdx);
+    if (!tail.startsWith('【规划】')) {
+      trailingPlanning = tail.trim();
+      body = body.slice(0, partialIdx).trimEnd();
+    }
+  }
+
+  const { planLines, replyLines } = splitAssistantPlanningLines(body);
+  const planningParts = [...planLines];
+  if (trailingPlanning) {
+    planningParts.push(trailingPlanning);
+  }
+
+  return {
+    replyText: replyLines.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+    planningText: planningParts.join('\n').trim(),
+  };
 }
 
 /** 历史 tool 输出指针，不应作为 Trace 展示。 */
@@ -184,6 +260,20 @@ export function isArchivedToolPlaceholder(text: string): boolean {
     t.includes('[历史工具输出已省略') ||
     t.includes('[历史工具输出已归档]') ||
     t.includes('.llgraph/context/tool-results/')
+  );
+}
+
+/** 会话内置上下文（manifest/anchor），非用户发言。 */
+export function isPinnedSessionContextHuman(text: string, msgKind?: string): boolean {
+  const kind = String(msgKind || '').toLowerCase();
+  if (kind === 'manifest' || kind === 'anchor' || kind === 'summary') {
+    return true;
+  }
+  const t = text.trim();
+  return (
+    t.startsWith('<conversation-anchor>') ||
+    t.startsWith('<conversation-summary>') ||
+    t.includes('<session-manifest>')
   );
 }
 
@@ -266,11 +356,9 @@ export function stripInboundToolCallMarkup(text: string): string {
   return out.replace(/\n{3,}/g, '\n\n').trim();
 }
 
-/** Web 聊天区助手正文：剥离 tool markup 与【规划】行。保留空行，避免 GFM 表格吞掉后续段落。 */
+/** Web 聊天区助手正文：剥离 tool markup 与【规划】（含行内）。保留空行，避免 GFM 表格吞掉后续段落。 */
 export function formatAgentChatDisplayText(text: string): string {
-  const cleaned = stripSurveyForDisplay(stripInboundToolCallMarkup(text || ''));
-  const lines = cleaned.split('\n').filter((ln) => !ln.trim().startsWith('【规划】'));
-  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return splitAssistantStreamDisplay(text).replyText;
 }
 
 export function isInjectedSystemContent(text: string): boolean {
@@ -323,13 +411,24 @@ export function isDispatchPlaceholderText(text: string): boolean {
   return DISPATCH_PLACEHOLDER_TEXTS.some((p) => t === p);
 }
 
-/** 用户消息比对：折叠空白，便于 trace 120 字预览与落盘全文对齐。 */
+/** 用户消息比对：折叠空白；仅全文相等或 trace 120 字预览与落盘全文对齐。 */
 export function normalizeUserMessageForMatch(text: string): string {
   return text
     .replace(/\r\n/g, '\n')
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/(?:…|\.\.\.)+$/u, '');
+}
+
+function isTraceUserPreview(text: string, normalized: string, otherNormalized: string): boolean {
+  const raw = text.trim();
+  if (raw.endsWith('…') || raw.endsWith('...')) {
+    return true;
+  }
+  if (normalized.length >= otherNormalized.length) {
+    return false;
+  }
+  return normalized.length <= 132 && otherNormalized.startsWith(normalized);
 }
 
 export function userMessagesEquivalent(a: string, b: string): boolean {
@@ -341,15 +440,13 @@ export function userMessagesEquivalent(a: string, b: string): boolean {
   if (left === right) {
     return true;
   }
-  const headLen = 120;
-  const leftHead = left.slice(0, headLen);
-  const rightHead = right.slice(0, headLen);
-  return (
-    left.startsWith(rightHead)
-    || right.startsWith(leftHead)
-    || leftHead.startsWith(rightHead)
-    || rightHead.startsWith(leftHead)
-  );
+  if (isTraceUserPreview(a, left, right) && right.startsWith(left)) {
+    return true;
+  }
+  if (isTraceUserPreview(b, right, left) && left.startsWith(right)) {
+    return true;
+  }
+  return false;
 }
 
 /** trace reply 可能拼接多段 dispatch 占位符前缀，剥离后再参与去重。 */
@@ -378,6 +475,12 @@ function normalizeAssistantReplyForMatch(text: string): string {
     .trim();
 }
 
+/** 是否应在对话区展示为助手正文（排除 dispatch 占位符）。 */
+export function isUserVisibleAssistantText(text: string): boolean {
+  const normalized = normalizeAssistantReplyForMatch(text);
+  return Boolean(normalized) && !isDispatchPlaceholderText(normalized);
+}
+
 export function assistantReplyTextsMatch(existing: string, candidate: string): boolean {
   const left = normalizeAssistantReplyForMatch(existing);
   const right = normalizeAssistantReplyForMatch(candidate);
@@ -392,7 +495,18 @@ export function assistantReplyTextsMatch(existing: string, candidate: string): b
   if (shorter.length < 48) {
     return false;
   }
-  return longer.startsWith(shorter) || longer.includes(shorter);
+  if (longer.startsWith(shorter) || longer.includes(shorter)) {
+    return true;
+  }
+  // Trace 全文 vs messages 摘要：前缀不同（如 **现象** vs ## 结论），用中段指纹对齐
+  if (shorter.length >= 80) {
+    const start = Math.min(Math.floor(shorter.length * 0.2), shorter.length - 80);
+    const fingerprint = shorter.slice(start, start + 80);
+    if (fingerprint.trim().length >= 48 && longer.includes(fingerprint)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** 从 messages.jsonl raw 读取 llgraph.turn_reply_text（结构化轮末正文）。 */
@@ -474,28 +588,42 @@ export function enrichChatWithTraceReplies(
   turns?: TraceTurn[],
 ): ChatMessage[] {
   const replies: string[] = [];
+  const seen = new Set<string>();
   const collect = (step: TraceStep) => {
     if (step.kind !== 'reply') {
       return;
     }
     const text = normalizeAssistantReplyForMatch(extractReplyTextFromTraceStep(step));
-    if (text && !isDispatchPlaceholderText(text)) {
-      replies.push(text);
+    if (!text || isDispatchPlaceholderText(text) || seen.has(text)) {
+      return;
     }
+    seen.add(text);
+    replies.push(text);
   };
+  // turns / steps 都扫：completed turns 与 remote.steps / live currentSteps 可能只在一侧有 body
   if (turns && turns.length > 0) {
     for (const turn of turns) {
       for (const step of turn.steps) {
         collect(step);
       }
     }
-  } else {
-    for (const step of steps) {
-      collect(step);
-    }
+  }
+  for (const step of steps) {
+    collect(step);
+  }
+  const existingAsst = chat.filter((m) => m.role === 'assistant');
+  // 多轮已 reorder 且助手数已够：勿再把「同轮更长 Trace 正文」追加成假的末轮
+  if ((turns?.length ?? 0) >= 2 && existingAsst.length >= replies.length) {
+    return chat;
   }
   let result = chat;
   for (const reply of replies) {
+    const already = result.some(
+      (m) => m.role === 'assistant' && assistantReplyTextsMatch(m.text, reply),
+    );
+    if (already) {
+      continue;
+    }
     result = appendAssistantReplyIfMissing(result, reply);
   }
   return result;
@@ -551,6 +679,9 @@ function isRealUserTurnBoundary(m: MessageItem): boolean {
   }
   const cleaned = stripInjectedContext(display);
   const images = resolveHistoryImages(m.content, (m as { images?: ChatImageAttachment[] }).images);
+  if (isPinnedSessionContextHuman(cleaned, msgKind)) {
+    return false;
+  }
   if ((!cleaned && images.length === 0) || (cleaned && isInjectedSystemContent(cleaned))) {
     return false;
   }
@@ -657,6 +788,9 @@ export function parseApiMessagesToChat(
       }
       const cleaned = stripInjectedContext(display);
       const images = resolveHistoryImages(m.content, (m as { images?: ChatImageAttachment[] }).images);
+      if (isPinnedSessionContextHuman(cleaned, msgKind)) {
+        continue;
+      }
       if ((!cleaned && images.length === 0) || (cleaned && isInjectedSystemContent(cleaned))) {
         continue;
       }
@@ -678,6 +812,14 @@ export function parseApiMessagesToChat(
         continue;
       }
       if (role === 'assistant' && visible.trim()) {
+        // 轮末正文前先挂本轮 thinking，避免只显示回复、思考丢到后面或丢失
+        if (thinkingMeta.trim()) {
+          chat.push({
+            id: `${idPrefix}-${i}-think`,
+            role: 'thinking',
+            text: thinkingMeta,
+          });
+        }
         chat.push({ id: `${idPrefix}-${i}`, role: 'assistant', text: visible });
       }
     } else if (display.trim() && !isInjectedSystemContent(display)) {
@@ -748,20 +890,27 @@ const TRACE_USER_MSG_RE = /▶\s*用户消息\s+(.+)$/;
 
 /** 从 trace 日志行提取最近一条用户消息（trace 内为 120 字预览）。 */
 export function extractLatestUserTextFromTraceLines(lines: string[]): string | null {
-  let last: string | null = null;
+  const all = extractUserTextsFromTraceLines(lines);
+  return all.length > 0 ? all[all.length - 1] : null;
+}
+
+/** 从 trace 日志按时间顺序提取全部用户消息预览（▶ 用户消息 …）。 */
+export function extractUserTextsFromTraceLines(lines: string[]): string[] {
+  const out: string[] = [];
   for (const line of lines) {
     const m = line.match(TRACE_USER_MSG_RE);
     if (m?.[1]?.trim()) {
-      last = m[1].trim();
+      out.push(m[1].trim());
     }
   }
-  return last;
+  return out;
 }
 
 export function userMessageAlreadyInChat(chat: ChatMessage[], candidate: string): boolean {
   const t = candidate.trim();
+  // 空候选不能当「已存在」——否则纯图片用户无法从缓存补回
   if (!t) {
-    return true;
+    return false;
   }
   for (let i = chat.length - 1; i >= 0; i -= 1) {
     const m = chat[i];
@@ -793,7 +942,7 @@ export function dedupeConsecutiveUserMessages(chat: ChatMessage[]): ChatMessage[
   return out;
 }
 
-/** 重载历史时保留同会话用户消息的本地预览图（image_ref 尚未落盘时）。 */
+/** 重载历史时保留同会话用户消息的本地预览图（image_ref 尚未落盘时）。优先保留可访问的非 blob URL。 */
 export function preserveUserMessageImages(
   cached: ChatMessage[] | undefined,
   loaded: ChatMessage[],
@@ -806,11 +955,26 @@ export function preserveUserMessageImages(
   }
   const textMatches = (a: string, b: string) => userMessagesEquivalent(a, b);
   return loaded.map((m) => {
-    if (m.role !== 'user' || (m.images?.length ?? 0) > 0) {
+    if (m.role !== 'user') {
+      return m;
+    }
+    const loadedHasStableUrl = (m.images ?? []).some(
+      (img) => Boolean(img.url) && !String(img.url).startsWith('blob:'),
+    );
+    if (loadedHasStableUrl) {
       return m;
     }
     for (const prev of prevWithImages) {
-      if (textMatches(prev.text, m.text)) {
+      if (!textMatches(prev.text, m.text)) {
+        continue;
+      }
+      const prevStable = (prev.images ?? []).filter(
+        (img) => Boolean(img.url) && !String(img.url).startsWith('blob:'),
+      );
+      if (prevStable.length > 0) {
+        return { ...m, images: prevStable };
+      }
+      if ((m.images?.length ?? 0) === 0 && (prev.images?.length ?? 0) > 0) {
         return { ...m, images: prev.images };
       }
     }
@@ -842,21 +1006,370 @@ export function mergeRunningSessionMessages(
   return merged;
 }
 
+/** 在 chat 中定位第 turnIndex 轮的起始插入点（该轮 thinking/assistant 之前）。 */
+function findTurnInsertIndex(messages: ChatMessage[], turnIndex: number): number {
+  const assistantIndices: number[] = [];
+  messages.forEach((m, i) => {
+    if (m.role === 'assistant') {
+      assistantIndices.push(i);
+    }
+  });
+
+  if (assistantIndices.length === 0) {
+    return messages.length;
+  }
+
+  const start =
+    turnIndex === 0
+      ? 0
+      : assistantIndices[Math.min(turnIndex - 1, assistantIndices.length - 1)] + 1;
+
+  const end =
+    turnIndex < assistantIndices.length
+      ? assistantIndices[turnIndex]
+      : messages.length;
+
+  let insertAt = start;
+  while (insertAt < end && messages[insertAt]?.role === 'user') {
+    insertAt += 1;
+  }
+  return insertAt;
+}
+
+/** 按 trace 轮次顺序补全缺失的用户消息（插入对应轮 thinking/assistant 之前）。 */
+export function recoverUsersFromTraceInOrder(
+  chat: ChatMessage[],
+  traceLines: string[],
+): ChatMessage[] {
+  const traceUsers = extractUserTextsFromTraceLines(traceLines);
+  if (traceUsers.length === 0) {
+    return chat;
+  }
+
+  const assistantCount = chat.filter((m) => m.role === 'assistant').length;
+  const recoverCount =
+    assistantCount > 0 ? Math.min(traceUsers.length, assistantCount) : 1;
+
+  let result = chat;
+  for (let i = 0; i < recoverCount; i += 1) {
+    const preview = traceUsers[i];
+    if (userMessageAlreadyInChat(result, preview)) {
+      continue;
+    }
+    const insertAt = findTurnInsertIndex(result, i);
+    result = [
+      ...result.slice(0, insertAt),
+      { id: `u-trace-${i}-${Math.random()}`, role: 'user', text: preview },
+      ...result.slice(insertAt),
+    ];
+  }
+  return dedupeConsecutiveUserMessages(result);
+}
+
 export function mergeChatWithPendingUserMessages(
   chat: ChatMessage[],
   opts: { traceLines?: string[]; pendingText?: string | null; allowTraceUser?: boolean },
 ): ChatMessage[] {
   const allowTrace = opts.allowTraceUser !== false;
-  const candidates = [
-    opts.pendingText?.trim() || '',
-    allowTrace ? extractLatestUserTextFromTraceLines(opts.traceLines || []) || '' : '',
-  ].filter(Boolean);
   let next = chat;
-  for (const text of candidates) {
-    if (userMessageAlreadyInChat(next, text)) {
-      continue;
+
+  // jsonl 已有用户消息时不再从 trace 批量补入，避免全部堆到首个助手前
+  if (allowTrace && !chat.some((m) => m.role === 'user')) {
+    next = recoverUsersFromTraceInOrder(chat, opts.traceLines || []);
+  }
+
+  const pending = opts.pendingText?.trim() || '';
+  if (pending && !userMessageAlreadyInChat(next, pending)) {
+    const last = next[next.length - 1];
+    if (last?.role !== 'user') {
+      next = [...next, { id: `u-pending-${Date.now()}-${Math.random()}`, role: 'user', text: pending }];
     }
-    next = [...next, { id: `u-pending-${Date.now()}-${Math.random()}`, role: 'user', text }];
   }
   return next;
+}
+
+const TRACE_TURN_SEP_RE = /^───\s*本轮/;
+
+function splitTraceLinesByTurn(lines: string[]): string[][] {
+  const turns: string[][] = [];
+  let current: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (TRACE_TURN_SEP_RE.test(trimmed)) {
+      if (current.length > 0) {
+        turns.push(current);
+      }
+      current = [];
+      continue;
+    }
+    if (trimmed) {
+      current.push(line);
+    }
+  }
+  if (current.length > 0) {
+    turns.push(current);
+  }
+  return turns;
+}
+
+function extractUserPreviewFromTurnLines(lines: string[]): string {
+  for (const line of lines) {
+    const m = line.match(TRACE_USER_MSG_RE);
+    if (m?.[1]?.trim()) {
+      return m[1].trim();
+    }
+  }
+  return '';
+}
+
+function extractUserPreviewFromTraceTurn(turn: TraceTurn, turnLineGroups: string[][]): string {
+  // 只认本轮 log；勿 fallback 到其它 turn 的「▶ 用户消息」（会把上一轮日志贴到本轮）
+  void turnLineGroups;
+  return extractUserPreviewFromTurnLines(turn.log_lines ?? []);
+}
+
+function extractReplyTextFromTurnSteps(steps: TraceStep[]): string {
+  for (const step of steps) {
+    if (step.kind !== 'reply') {
+      continue;
+    }
+    const normalized = normalizeAssistantReplyForMatch(extractReplyTextFromTraceStep(step));
+    if (normalized && !isDispatchPlaceholderText(normalized)) {
+      return normalized;
+    }
+  }
+  return '';
+}
+
+function resolveUserForTraceTurn(
+  preview: string,
+  usersInChat: ChatMessage[],
+  usedIds: Set<string>,
+  turnIndex: number,
+): ChatMessage | null {
+  if (preview) {
+    for (const user of usersInChat) {
+      if (usedIds.has(user.id)) {
+        continue;
+      }
+      if (userMessagesEquivalent(user.text, preview)) {
+        usedIds.add(user.id);
+        return user;
+      }
+    }
+  }
+  // 预览为空时优先消费带图的未用用户（纯截图轮）
+  const nextWithImages = usersInChat.find(
+    (user) => !usedIds.has(user.id) && (user.images?.length ?? 0) > 0,
+  );
+  if (nextWithImages) {
+    usedIds.add(nextWithImages.id);
+    return nextWithImages;
+  }
+  const nextUser = usersInChat.find((user) => !usedIds.has(user.id));
+  if (nextUser) {
+    usedIds.add(nextUser.id);
+    return nextUser;
+  }
+  if (preview) {
+    return { id: `u-turn-${turnIndex}`, role: 'user', text: preview };
+  }
+  return null;
+}
+
+function resolveAssistantForTraceTurn(
+  replyText: string,
+  assistantsInChat: ChatMessage[],
+  usedIds: Set<string>,
+  turnIndex: number,
+): ChatMessage | null {
+  if (replyText) {
+    for (const assistant of assistantsInChat) {
+      if (usedIds.has(assistant.id)) {
+        continue;
+      }
+      if (assistantReplyTextsMatch(assistant.text, replyText)) {
+        usedIds.add(assistant.id);
+        return assistant;
+      }
+    }
+    const nextChat = assistantsInChat.find((assistant) => !usedIds.has(assistant.id));
+    if (nextChat) {
+      usedIds.add(nextChat.id);
+      return nextChat;
+    }
+    return { id: `a-turn-${turnIndex}`, role: 'assistant', text: replyText };
+  }
+  const fallback = assistantsInChat.find((assistant) => !usedIds.has(assistant.id));
+  if (fallback) {
+    usedIds.add(fallback.id);
+  }
+  return fallback ?? null;
+}
+
+function userImagesEquivalent(a: ChatMessage, b: ChatMessage): boolean {
+  const left = (a.images ?? [])
+    .map((img) => String(img.id || '').trim())
+    .filter(Boolean)
+    .sort()
+    .join(',');
+  const right = (b.images ?? [])
+    .map((img) => String(img.id || '').trim())
+    .filter(Boolean)
+    .sort()
+    .join(',');
+  return Boolean(left) && left === right;
+}
+
+/**
+ * 按 trace 轮次交错 user / thinking / assistant（压缩后 jsonl 缺中间轮次时用 trace 重建顺序）。
+ * 同一轮内可有多条 thinking，必须全部落在该轮 assistant 之前（勿把多余 thinking 丢到全文末尾）。
+ */
+export function reorderChatByTraceTurns(
+  chat: ChatMessage[],
+  traceTurns: TraceTurn[],
+  traceLines: string[] = [],
+): ChatMessage[] {
+  if (traceTurns.length < 2) {
+    return chat;
+  }
+
+  const prefix = chat.filter((m) => m.role === 'system' || m.role === 'trace');
+  const usersInChat = chat.filter((m) => m.role === 'user');
+  const thinkingInChat = chat.filter((m) => m.role === 'thinking');
+  const assistantsInChat = chat.filter((m) => m.role === 'assistant');
+  const turnLineGroups = splitTraceLinesByTurn(traceLines);
+  const indexById = new Map(chat.map((m, idx) => [m.id, idx]));
+
+  const usedUserIds = new Set<string>();
+  const usedAsstIds = new Set<string>();
+  const usedThinkingIds = new Set<string>();
+  const body: ChatMessage[] = [];
+
+  for (let i = 0; i < traceTurns.length; i += 1) {
+    const turn = traceTurns[i];
+    const preview = extractUserPreviewFromTraceTurn(turn, turnLineGroups);
+    const userMsg = resolveUserForTraceTurn(preview, usersInChat, usedUserIds, i);
+    if (userMsg) {
+      body.push(userMsg);
+    }
+
+    const replyText = extractReplyTextFromTurnSteps(turn.steps);
+    const assistantMsg = resolveAssistantForTraceTurn(
+      replyText,
+      assistantsInChat,
+      usedAsstIds,
+      i,
+    );
+
+    const userIdx = userMsg ? (indexById.get(userMsg.id) ?? -1) : -1;
+    const asstInChat =
+      assistantMsg != null && assistantsInChat.some((a) => a.id === assistantMsg.id);
+    const asstIdx = asstInChat && assistantMsg ? (indexById.get(assistantMsg.id) ?? -1) : -1;
+
+    let placedThinking = 0;
+    for (const thinking of thinkingInChat) {
+      if (usedThinkingIds.has(thinking.id)) {
+        continue;
+      }
+      const tIdx = indexById.get(thinking.id) ?? -1;
+      if (tIdx < 0) {
+        continue;
+      }
+      const afterUser = userIdx < 0 || tIdx > userIdx;
+      const beforeAsst = asstIdx < 0 || tIdx < asstIdx;
+      if (afterUser && beforeAsst && asstIdx >= 0) {
+        usedThinkingIds.add(thinking.id);
+        body.push(thinking);
+        placedThinking += 1;
+      }
+    }
+    // 合成 assistant（无 jsonl 锚点）时仍至少挂一条 thinking，避免整轮空白
+    if (placedThinking === 0 && asstIdx < 0) {
+      const thinking = thinkingInChat.find((m) => !usedThinkingIds.has(m.id));
+      if (thinking) {
+        usedThinkingIds.add(thinking.id);
+        body.push(thinking);
+      }
+    }
+
+    if (assistantMsg) {
+      body.push(assistantMsg);
+    }
+  }
+
+  // 未认领的 thinking：插到「最后一个 user 之后、该轮 assistant 之前」，禁止堆到回复后面
+  for (const thinking of thinkingInChat) {
+    if (usedThinkingIds.has(thinking.id)) {
+      continue;
+    }
+    let insertAt = body.length;
+    for (let j = body.length - 1; j >= 0; j -= 1) {
+      if (body[j].role === 'assistant') {
+        insertAt = j;
+        break;
+      }
+      if (body[j].role === 'user') {
+        insertAt = j + 1;
+        break;
+      }
+    }
+    body.splice(insertAt, 0, thinking);
+    usedThinkingIds.add(thinking.id);
+  }
+  for (const assistant of assistantsInChat) {
+    if (!usedAsstIds.has(assistant.id)) {
+      body.push(assistant);
+    }
+  }
+  const bodyUserCount = body.filter((m) => m.role === 'user').length;
+  for (const user of usersInChat) {
+    if (usedUserIds.has(user.id)) {
+      continue;
+    }
+    // 重复用户（同文案或同附图）勿堆到末尾，否则像「问完没答」或假多一轮
+    const dup = body.some(
+      (m) =>
+        m.role === 'user' &&
+        (userMessagesEquivalent(m.text, user.text) || userImagesEquivalent(m, user)),
+    );
+    if (dup) {
+      continue;
+    }
+    // 轮次已齐：不再追加孤儿用户（纯图重复等）
+    if (bodyUserCount >= traceTurns.length) {
+      continue;
+    }
+    body.push(user);
+  }
+
+  return [...prefix, ...body];
+}
+
+/** 历史加载：合并 pending/trace 用户，并按 trace 轮次或 reply 步骤补全助手正文。 */
+export function finalizeAgentHistoryChat(
+  parsed: ChatMessage[],
+  opts: {
+    traceLines?: string[];
+    traceTurns?: TraceTurn[];
+    traceSteps?: TraceStep[];
+    pendingText?: string | null;
+  },
+): ChatMessage[] {
+  const traceLines = opts.traceLines ?? [];
+  const traceTurns = opts.traceTurns ?? [];
+  const traceSteps = opts.traceSteps ?? [];
+
+  let chat = mergeChatWithPendingUserMessages(parsed, {
+    traceLines,
+    pendingText: opts.pendingText,
+    allowTraceUser: true,
+  });
+
+  if (traceTurns.length >= 2) {
+    chat = reorderChatByTraceTurns(chat, traceTurns, traceLines);
+  }
+
+  // reorder 之后仍要 enrich：防止轮次对齐丢助手，或 reply 只在 steps 侧
+  return enrichChatWithTraceReplies(chat, traceSteps, traceTurns);
 }

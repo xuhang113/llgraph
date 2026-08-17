@@ -1,3 +1,4 @@
+import type { RefObject } from 'react';
 import type { TraceStep } from '../../types/trace';
 import type { ChatMessage } from './ChatThread';
 import ChatThread from './ChatThread';
@@ -21,6 +22,7 @@ interface Props {
   traceLines: string;
   liveTraceSteps?: TraceStep[];
   busy: boolean;
+  scrollRootRef?: RefObject<HTMLElement | null>;
   onBack: () => void;
   onStop?: () => void;
   onRun?: () => void;
@@ -36,6 +38,7 @@ export default function WorkerMainPanel({
   traceLines,
   liveTraceSteps = [],
   busy,
+  scrollRootRef,
   onBack,
   onStop,
   onRun,
@@ -82,6 +85,7 @@ export default function WorkerMainPanel({
           streamText=""
           busy={busy && taskStatus === 'running'}
           traceMode="steps"
+          scrollRootRef={scrollRootRef}
         />
         {messages.length === 0 && !traceLines.trim() && liveTraceSteps.length === 0 && (
           <div className="cursor-worker-main-empty">

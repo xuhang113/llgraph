@@ -6,7 +6,12 @@ export function pendingUserMessageKey(slug: string, threadId: string): string {
 
 export function savePendingUserMessage(slug: string, threadId: string, text: string): void {
   const t = text.trim();
-  if (!slug || !threadId || !t) {
+  if (!slug || !threadId) {
+    return;
+  }
+  // 纯图片发送：清掉上一轮文字 pending，避免历史合并把旧日志贴到本轮
+  if (!t) {
+    clearPendingUserMessage(slug, threadId);
     return;
   }
   try {

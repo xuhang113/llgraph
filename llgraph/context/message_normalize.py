@@ -142,23 +142,15 @@ def prepare_messages_for_llm_dispatch(
                 cleaned,
             )
     if workspace is not None:
-        from llgraph.context.context_compressor import estimate_tokens
-        from llgraph.context.context_dispatch_window import apply_dispatch_window_trim
         from llgraph.context.context_settings import resolve_context_settings
-
-        ctx_settings = resolve_context_settings(workspace)
         from llgraph.context.incremental_context import (
             dedupe_read_tool_messages_for_dispatch,
             prune_tool_messages_for_dispatch,
         )
 
+        ctx_settings = resolve_context_settings(workspace)
         cleaned = prune_tool_messages_for_dispatch(cleaned, workspace, ctx_settings)
         cleaned = dedupe_read_tool_messages_for_dispatch(cleaned, ctx_settings)
-        cleaned = apply_dispatch_window_trim(
-            cleaned,
-            settings=ctx_settings,
-            estimate_tokens=estimate_tokens,
-        )
     ordered = reorder_pinned_session_messages(cleaned)
     normalized = normalize_messages_for_llm(
         ordered,
@@ -170,8 +162,13 @@ def prepare_messages_for_llm_dispatch(
 
     with_correction = append_user_correction_nudge_for_dispatch(normalized)
     from llgraph.context.react_step_reminder import append_react_step_reminder_for_dispatch
+    from llgraph.context.investigate_harness import append_soft_close_for_dispatch
 
-    with_reminder = append_react_step_reminder_for_dispatch(with_correction)
+    with_reminder = append_react_step_reminder_for_dispatch(
+        with_correction,
+        workspace=workspace,
+    )
+    with_soft = append_soft_close_for_dispatch(with_reminder, workspace=workspace)
 
     if workspace is not None:
         from llgraph.context.outbound_redact import (
@@ -180,8 +177,8 @@ def prepare_messages_for_llm_dispatch(
         )
 
         redact_settings = resolve_outbound_redact_settings(workspace)
-        return redact_messages_for_dispatch(with_reminder, redact_settings)
-    return with_reminder
+        return redact_messages_for_dispatch(with_soft, redact_settings)
+    return with_soft
 
 
 def normalize_messages_for_llm(

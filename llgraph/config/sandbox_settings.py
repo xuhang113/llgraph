@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from llgraph.core.agent_config import LLGRAPH_DIR, USER_LLGRAPH_HOME, deep_merge_config
+from llgraph.core.agent_config import LLGRAPH_DIR, deep_merge_config, user_llgraph_home
 
 SANDBOX_CONFIG_FILENAME = "sandbox.json"
 
@@ -41,7 +41,7 @@ def user_sandbox_config_path() -> Path:
 
     @return ~/.llgraph/sandbox.json
     """
-    return USER_LLGRAPH_HOME / SANDBOX_CONFIG_FILENAME
+    return user_llgraph_home() / SANDBOX_CONFIG_FILENAME
 
 
 def workspace_sandbox_config_path(workspace: Path) -> Path:

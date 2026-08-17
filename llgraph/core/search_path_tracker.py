@@ -138,9 +138,10 @@ def format_retrieval_batch_hint(user_message: str) -> str:
             "## 检索批量化（减少 LLM 往返）",
             f"用户消息含多个可合并检索词：{quoted}",
             f"**首轮建议一条 grep**（勿拆多轮）：`grep_files(pattern=\"{grep_pat}\", path=\".\")`",
+            "已有字面量 → **禁止先** `search_code_parallel`；parallel 仅用于完全不知模块时且每问 ≤1 次。",
             "禁止：先 grep 表名、下一轮再 grep 类名/字段名；应一次 `pattern=\"表名|类名|字段|…\"`。",
-            "grep 命中后，**同轮或下一轮**用 `read_files(paths=[...])` 一次读齐 DO/Mapper/Service（≤8 个 path），勿分多轮 read。",
-            "目标：单表/单点问题 **2～4 次模型决策**内够答就停。",
+            "grep 命中后，**同轮或下一轮**用 `read_files(paths=[...])` 一次读齐关键实现（≤8 path）。",
+            "结案必须回答 `<user_query>`，勿改写成无关模块字段说明书。",
         ]
     )
 

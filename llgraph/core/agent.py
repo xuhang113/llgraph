@@ -109,6 +109,7 @@ def build_agent(
     context_session: ContextSession | None = None,
     sandbox_policy: SandboxPolicy | None = None,
     thread_id: str | None = None,
+    subagent_parent_slot: Any | None = None,
 ):
     """
     构建 ReAct Agent：LLM（Gateway）+ 工具循环。
@@ -124,6 +125,7 @@ def build_agent(
     @param web_search_enabled 是否注册 web_search
     @param sandbox_policy OS 沙箱策略
     @param thread_id 会话 thread（启用 memory 时用于 checkpoint 隔离）
+    @param subagent_parent_slot 父运行时槽；非空且有 thread_id 时注册 spawn_subagent
     @return 已编译的 LangGraph Runnable
     """
     root = Path(workspace_root or ".").expanduser().resolve()
@@ -139,6 +141,13 @@ def build_agent(
         web_search_enabled=web_search_enabled,
         sandbox_policy=sandbox_policy,
     )
+    if subagent_parent_slot is not None and thread_id:
+        from llgraph.subagent.agent_tools import create_subagent_tools
+
+        tools = [
+            *tools,
+            *create_subagent_tools(parent_slot=subagent_parent_slot),
+        ]
     from llgraph.core.llm_settings import resolve_effective_model
     from llgraph.core.prompt_cache import (
         build_cache_control,
@@ -241,6 +250,8 @@ def rebuild_agent_preserving_memory(
         web_search_enabled=web,
         context_session=agent_session.context_session,
         sandbox_policy=policy,
+        thread_id=agent_session.thread_id,
+        subagent_parent_slot=getattr(agent_session, "subagent_parent_slot", None),
     )
     if messages and agent_session.with_memory:
         from llgraph.context.message_normalize import reorder_pinned_session_messages
@@ -251,6 +262,9 @@ def rebuild_agent_preserving_memory(
         except Exception:
             pass
     agent_session.agent = new_agent
+    slot = getattr(agent_session, "subagent_parent_slot", None)
+    if slot is not None:
+        slot.bind_from_session(agent_session)
     return new_agent
 
 
@@ -289,6 +303,8 @@ def invoke_agent(
     cancel_check: Any | None = None,
     run_source: str = "cli",
     images: list[ChatImageInput] | None = None,
+    image_refs: list | None = None,
+    skip_pending_user_append: bool = False,
 ) -> str:
     """
     执行一轮对话并返回助手最后一条文本。
@@ -302,6 +318,8 @@ def invoke_agent(
     @param context_session Rule/Skill 会话状态
     @param effective_message_override 覆盖发给模型的消息（自定义命令用）
     @param images 用户附带的图片（Web 多模态）
+    @param image_refs 已落盘附件引用（Web 可在 POST 时先写盘）
+    @param skip_pending_user_append True 时跳过 append_pending（调用方已写）
     @param write_failure_tracker 写工具失败跟踪
     @param allow_write Web/CLI 当前是否可写（同步 manifest 与 workspace-context）
     @param cancel_check 可选；返回 True 时中断 ReAct（含进行中的 LLM stream）
@@ -468,13 +486,28 @@ def invoke_agent(
         recent_messages=recent_messages,
         edited_paths=edited_paths,
     )
-    turn_image_refs: list = []
+    from llgraph.memory.recall import build_agent_memories_for_turn
+    from llgraph.memory.scheduler import touch_memory_workspace
+
+    touch_memory_workspace(root)
+    memory_block, _mem_report = build_agent_memories_for_turn(
+        root, user_message, trace=trace
+    )
+    if memory_block.strip():
+        context_block = (
+            f"{memory_block}\n\n{context_block}" if context_block.strip() else memory_block
+        )
+    turn_image_refs: list = list(image_refs or [])
     outbound_t0 = time.perf_counter()
     if effective_message_override is not None:
         effective = effective_message_override
     else:
         images_for_llm = images
-        if with_memory and images:
+        if with_memory and turn_image_refs:
+            from llgraph.session.session_image_store import load_chat_images_as_input
+
+            images_for_llm = load_chat_images_as_input(root, thread_id, turn_image_refs)
+        elif with_memory and images:
             from llgraph.session.session_image_store import (
                 load_chat_images_as_input,
                 save_chat_images,
@@ -487,7 +520,7 @@ def invoke_agent(
             images=images_for_llm,
             context_block=context_block,
         )
-    if with_memory and (user_message.strip() or images):
+    if with_memory and not skip_pending_user_append and (user_message.strip() or images or turn_image_refs):
         from llgraph.session.session_file_store import append_pending_user_turn
 
         append_pending_user_turn(
@@ -707,6 +740,11 @@ def invoke_agent(
             thread_id,
             turn_image_refs=turn_image_refs or None,
         )
+        if not cancelled:
+            from llgraph.memory.scheduler import schedule_light_consolidate
+
+            # 记忆写入只走 ReAct 热路径 manage_memory；不在轮次外再调 LLM 抽取
+            schedule_light_consolidate(root)
         end_prune = apply_incremental_tool_prune_to_agent_state(
             agent,
             thread_id=thread_id,
@@ -716,4 +754,13 @@ def invoke_agent(
             from llgraph.terminal.ops_notice import ops_notice
 
             ops_notice(format_tool_prune_report(end_prune))
+        if not cancelled and run_source != "web":
+            from llgraph.session.session_title_llm import schedule_session_title_llm_refresh
+
+            schedule_session_title_llm_refresh(
+                root,
+                thread_id,
+                user_message=user_message,
+                assistant_reply=turn_result.text or "",
+            )
     return turn_result.text

@@ -137,7 +137,7 @@ def _attach_sink(
 
 def _persist_web_trace(ctx: PlanRuntimeContext, workspace: Path, thread_id: str) -> None:
     """
-    将 Plan 本轮 trace 落盘，供 Web 切换会话后从 lastTrace API 恢复。
+    将 Plan 本轮 trace 落盘，供 Web 切换会话后从 /trace API 恢复。
 
     @param ctx Plan 运行时上下文
     @param workspace 工作区根
@@ -153,9 +153,9 @@ def _persist_web_trace(ctx: PlanRuntimeContext, workspace: Path, thread_id: str)
         step_payloads = [_step_to_dict(s) for s in trace.last_turn_steps]
     if not log_lines and not step_payloads:
         return
-    from llgraph.session.web_trace_store import save_last_web_trace
+    from llgraph.session.web_trace_store import append_web_trace_turn
 
-    save_last_web_trace(
+    append_web_trace_turn(
         workspace,
         thread_id,
         log_lines=log_lines,

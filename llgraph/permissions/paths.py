@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from llgraph.core.agent_config import USER_LLGRAPH_HOME
+from llgraph.core.agent_config import user_llgraph_home
 from llgraph.session.user_storage import user_rules_dir, user_skills_dir
 from llgraph.sandbox.policy import SandboxPolicy
 
@@ -76,7 +76,7 @@ def resolve_read_path(
     resolved = expanded.resolve()
     allowed_roots = (
         root,
-        USER_LLGRAPH_HOME.resolve(),
+        user_llgraph_home().resolve(),
         user_skills_dir().resolve(),
         user_rules_dir().resolve(),
     )

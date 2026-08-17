@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react';
 import { api, type Capabilities, type ContextDetail, type ContextUsage, type IndexStatus } from '../../api/client';
 import ContextDetailSections from './ContextDetailSections';
+import IndexSyncProgress from './IndexSyncProgress';
 import {
   formatContextTokens,
   resolveSlashMetaModalRoute,
@@ -220,7 +221,11 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
     setIndexLoading(true);
     setIndexNote('');
     try {
-      setIndexStatus(await api.indexStatus(slug));
+      const idx = await api.indexStatus(slug);
+      setIndexStatus(idx);
+      if (idx.indexing || (idx.progress?.running && idx.progress.action !== 'watch')) {
+        setIndexRunning(true);
+      }
     } catch (err) {
       setIndexStatus(null);
       setIndexNote(err instanceof Error ? err.message : String(err));
@@ -234,6 +239,58 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
     setModal('index');
     void loadIndexModal();
   }, [closeMenu, loadIndexModal]);
+
+  useEffect(() => {
+    if (modal !== 'index' || !slug) {
+      return;
+    }
+    const running =
+      indexRunning || !!indexStatus?.indexing || !!indexStatus?.progress?.running;
+    if (!running) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const idx = await api.indexStatus(slug);
+          setIndexStatus(idx);
+          if (idx.indexing || (idx.progress?.running && idx.progress.action !== 'watch')) {
+            setIndexRunning(true);
+            return;
+          }
+          setIndexRunning((was) => {
+            if (was) {
+              const p = idx.progress;
+              if (p?.action === 'watch') {
+                return false;
+              }
+              if (p?.ok === false && p.error) {
+                setIndexNote(`索引失败：${p.error}`);
+              } else {
+                const action =
+                  p?.action === 'incremental'
+                    ? '增量'
+                    : p?.action === 'full'
+                      ? '全量'
+                      : p?.action === 'rebuild'
+                        ? '重建'
+                        : '索引';
+                const detail =
+                  typeof p?.files_updated === 'number'
+                    ? ` · 更新 ${p.files_updated.toLocaleString()} 文件 / ${Number(p.chunks_written || 0).toLocaleString()} chunks`
+                    : '';
+                setIndexNote(`${action}完成${detail}`);
+              }
+            }
+            return false;
+          });
+        } catch {
+          /* ignore */
+        }
+      })();
+    }, 450);
+    return () => window.clearInterval(timer);
+  }, [modal, slug, indexRunning, indexStatus?.indexing, indexStatus?.progress?.running]);
 
   const showMetaOutput = useCallback((title: string, body: string) => {
     closeMenu();
@@ -333,19 +390,14 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
       return;
     }
     setIndexRunning(true);
-    setIndexNote('');
+    setIndexNote(
+      `${action === 'incremental' ? '增量' : action === 'full' ? '全量' : '重建'}已启动…`,
+    );
     try {
-      const res = await api.runIndex(slug, action);
-      setIndexNote(
-        res.ok
-          ? `${action === 'incremental' ? '增量' : action === 'full' ? '全量' : '重建'}完成${res.log_path ? ` · 日志 ${res.log_path}` : ''}`
-          : `${action} 失败（exit ${res.exit_code}）`,
-      );
-      await loadIndexModal();
+      await api.runIndex(slug, action);
     } catch (err) {
-      setIndexNote(err instanceof Error ? err.message : String(err));
-    } finally {
       setIndexRunning(false);
+      setIndexNote(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -466,9 +518,10 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
                     type="button"
                     className="cursor-ops-primary-btn"
                     disabled={compressing || contextLoading}
+                    aria-busy={compressing}
                     onClick={() => void compressHistory()}
                   >
-                    {compressing ? '压缩中…' : '压缩历史'}
+                    压缩历史
                   </button>
                   <button
                     type="button"
@@ -492,16 +545,29 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
 
       {modal === 'index' && (
         <OpsModalShell title="代码索引" onClose={closeModal}>
-          {(indexLoading || indexRunning) && !indexStatus && (
-            <ProgressStrip label={indexRunning ? '索引构建中，请稍候…' : '加载索引状态…'} />
-          )}
-          {indexRunning && indexStatus && <ProgressStrip label="索引构建中，请稍候…" />}
+          {indexLoading && !indexStatus && <ProgressStrip label="加载索引状态…" />}
           {indexStatus && (
             <>
+              {(indexRunning || indexStatus.indexing || indexStatus.progress?.running) &&
+                indexStatus.progress && (
+                  <IndexSyncProgress progress={indexStatus.progress} compact />
+                )}
+              {(indexRunning || indexStatus.indexing) && !indexStatus.progress && (
+                <IndexSyncProgress
+                  progress={{ running: true, phase: 'prepare', action: 'full' }}
+                  compact
+                />
+              )}
               <div className="cursor-ops-index-grid">
                 <div className="cursor-ops-index-stat">
                   <span>状态</span>
-                  <strong>{indexStatus.exists ? '已建立' : '未建立'}</strong>
+                  <strong>
+                    {indexRunning || indexStatus.indexing || indexStatus.progress?.running
+                      ? '同步中'
+                      : indexStatus.exists
+                        ? '已建立'
+                        : '未建立'}
+                  </strong>
                 </div>
                 <div className="cursor-ops-index-stat">
                   <span>Chunks</span>
@@ -518,7 +584,21 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
               </div>
               <p className="cursor-ops-meta-line muted">
                 最近索引 {indexStatus.last_indexed_at || '无'} · Watch{' '}
-                {indexStatus.watch_enabled ? '开启' : '关闭'}
+                {!indexStatus.watch_enabled
+                  ? '关闭'
+                  : indexStatus.watch_paused ||
+                      indexStatus.indexing ||
+                      indexStatus.progress?.running
+                    ? '索引中已暂停'
+                    : indexStatus.watch_active
+                      ? '监听中'
+                      : indexStatus.watch_active === false
+                        ? indexStatus.watch_with_agent
+                          ? '配置开启（启动失败）'
+                          : '配置开启'
+                        : indexStatus.watch_enabled
+                          ? '配置开启'
+                          : '关闭'}
               </p>
               <p className="cursor-ops-embed-line">{indexStatus.embedding}</p>
               <div className="cursor-ops-modal-actions">
@@ -527,7 +607,7 @@ const ConsoleOps = forwardRef<ConsoleOpsHandle, Props>(function ConsoleOps(
                     key={action}
                     type="button"
                     className="cursor-ops-secondary-btn"
-                    disabled={indexRunning || indexLoading}
+                    disabled={indexRunning || indexLoading || !!indexStatus.indexing}
                     onClick={() => void runIndexAction(action)}
                   >
                     {action === 'incremental' ? '增量' : action === 'full' ? '全量' : '重建'}

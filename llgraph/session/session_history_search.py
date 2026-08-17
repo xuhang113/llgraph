@@ -289,6 +289,70 @@ def _search_anchor_sections(
     return hits
 
 
+_META_HISTORY_QUERY_RE = re.compile(
+    r"(用户异议|上一轮结论|先前结论|不预设|重新调查|调查重置|任务背景不确定)",
+)
+
+
+def _count_human_turns_in_messages(path: Path) -> int:
+    """粗算 messages.jsonl 中 human 条数。"""
+    if not path.is_file():
+        return 0
+    n = 0
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            role = obj.get("type") or (obj.get("data") or {}).get("type")
+            if role in ("human", "user"):
+                n += 1
+            elif isinstance(obj.get("data"), dict) and obj["data"].get("type") == "human":
+                n += 1
+    except OSError:
+        return 0
+    return n
+
+
+def guard_session_history_query(
+    workspace: Path,
+    thread_id: str,
+    query: str,
+) -> str | None:
+    """
+    拦截滥用会话历史检索（首轮幻觉「异议」、用历史找回当前问题）。
+
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @param query 查询词
+    @return 拦截说明；放行时 None
+    """
+    q = (query or "").strip()
+    if not q:
+        return "search_session_history: query 不能为空。"
+    if _META_HISTORY_QUERY_RE.search(q):
+        return (
+            "search_session_history: 拒绝元叙事查询（如「用户异议」「上一轮结论」）。"
+            "当前用户问题已在对话最新 Human 消息中；请用业务关键词检索更早轮次，"
+            "或直接继续代码排查（grep_files / read_file）。"
+        )
+    msg_path = session_messages_path(workspace, thread_id)
+    # 仅一轮用户消息且无归档时：几乎只是在搜当前问句，无意义
+    archive = session_archive_jsonl_path(workspace, thread_id)
+    has_archive = archive.is_file() and archive.stat().st_size > 0
+    human_n = _count_human_turns_in_messages(msg_path)
+    if human_n <= 1 and not has_archive:
+        return (
+            "search_session_history: 当前会话几乎只有本轮用户消息、无多轮历史可搜。"
+            "请直接依据最新 Human 消息继续排查，不要用本工具找回「用户在问什么」。"
+        )
+    return None
+
+
 def search_session_history(
     workspace: Path,
     thread_id: str,

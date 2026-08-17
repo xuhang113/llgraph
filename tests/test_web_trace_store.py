@@ -5,28 +5,33 @@ from __future__ import annotations
 from pathlib import Path
 
 from llgraph.session.web_trace_store import (
-    load_last_web_trace,
+    load_web_trace_view,
     load_web_trace_turns,
-    save_last_web_trace,
+    append_web_trace_turn,
     update_live_web_trace,
 )
 
 
-def test_load_last_web_trace_appends_live_without_double_wrapping(tmp_path: Path) -> None:
+def test_load_web_trace_view_appends_live_without_double_wrapping(tmp_path: Path) -> None:
+    from llgraph.session.user_storage import session_thread_dir
+
     thread_id = "cli-test01"
-    save_last_web_trace(
+    append_web_trace_turn(
         tmp_path,
         thread_id,
         log_lines=["[10:00:00] 本轮完成"],
         steps=[],
     )
+    sess = session_thread_dir(tmp_path, thread_id)
+    assert (sess / "web_trace_history.json").is_file()
+    assert not (sess / "last_web_trace.json").exists()
     update_live_web_trace(
         tmp_path,
         thread_id,
         log_lines=["[10:01:00] 准备中...", "[10:01:00] 思考中..."],
         steps=[],
     )
-    data = load_last_web_trace(tmp_path, thread_id)
+    data = load_web_trace_view(tmp_path, thread_id)
     assert data is not None
     lines = [str(x) for x in data.get("log_lines") or []]
     sep_count = sum(1 for line in lines if line.startswith("─── 本轮"))
@@ -37,13 +42,13 @@ def test_load_last_web_trace_appends_live_without_double_wrapping(tmp_path: Path
 
 def test_load_web_trace_turns_keeps_per_turn_steps(tmp_path: Path) -> None:
     thread_id = "cli-test03"
-    save_last_web_trace(
+    append_web_trace_turn(
         tmp_path,
         thread_id,
         log_lines=["line-a"],
         steps=[{"step_id": 1, "kind": "plan", "title": "模型决策", "elapsed": 1.0, "summary": "a"}],
     )
-    save_last_web_trace(
+    append_web_trace_turn(
         tmp_path,
         thread_id,
         log_lines=["line-b"],
@@ -59,7 +64,7 @@ def test_load_web_trace_turns_keeps_per_turn_steps(tmp_path: Path) -> None:
     assert turns[1]["label"].startswith("第 2 轮")
 
 
-def test_load_last_web_trace_live_idempotent(tmp_path: Path) -> None:
+def test_load_web_trace_view_live_idempotent(tmp_path: Path) -> None:
     thread_id = "cli-test02"
     update_live_web_trace(
         tmp_path,
@@ -67,7 +72,7 @@ def test_load_last_web_trace_live_idempotent(tmp_path: Path) -> None:
         log_lines=["[10:01:00] 思考中..."],
         steps=[],
     )
-    first = load_last_web_trace(tmp_path, thread_id)
-    second = load_last_web_trace(tmp_path, thread_id)
+    first = load_web_trace_view(tmp_path, thread_id)
+    second = load_web_trace_view(tmp_path, thread_id)
     assert first is not None and second is not None
     assert first.get("log_lines") == second.get("log_lines")

@@ -60,14 +60,172 @@ def emit_invoke_prelude_step(
     kind: str = "preprocess",
 ) -> int:
     """
-    invoke 前预处理步骤：写入 pending_invoke_steps 并即时推送 Web SSE。
+    invoke 前预处理：仅写日志，不进入 Trace 步骤 / Web SSE。
+
+    真正发生裁剪/压缩时仍由 emit_tool_prune_trace_step / emit_compress_trace_step 展示。
+
+    @return 恒为 0（不占步骤号）
+    """
+    import logging
+
+    logger = logging.getLogger("llgraph.trace.prelude")
+    detail = ""
+    if body_lines:
+        detail = " | " + " · ".join(str(x) for x in body_lines[:4])
+    logger.info(
+        "invoke_prelude kind=%s title=%s summary=%s elapsed=%.3fs%s",
+        kind,
+        title,
+        summary,
+        elapsed,
+        detail,
+    )
+    return 0
+
+
+def emit_explore_trace_step(
+    session: Any,
+    *,
+    title: str,
+    summary: str,
+    elapsed: float,
+    sub_thread: str,
+    body_lines: list[str] | None = None,
+) -> int:
+    """
+    父会话 Trace：登记 explore 子 Agent 步骤（可展开拉子 Trace）。
+
+    @param session TraceSession（父）
+    @param title 如 Explore
+    @param summary 折叠摘要
+    @param elapsed 子 Agent 耗时秒
+    @param sub_thread 子会话 thread_id
+    @param body_lines 展开预览（摘要片段）
+    @return 步骤编号；未展示时 0
+    """
+    from llgraph.display.trace_display import TraceStepRecord, _resolve_elapsed_kind
+
+    if session is None or session.is_silent() or not session.shows_process():
+        return 0
+    sub = (sub_thread or "").strip()
+    if not sub:
+        return 0
+
+    lines = list(body_lines or [])
+    if not any(ln.startswith("sub_thread=") for ln in lines):
+        lines = [f"sub_thread={sub}", *lines]
+
+    printer = session.active_printer
+    if printer is not None:
+        step_id = printer._register_step(  # noqa: SLF001 — 共享登记路径
+            "explore",
+            title,
+            elapsed,
+            summary,
+            body_lines=lines,
+            elapsed_kind=_resolve_elapsed_kind("explore"),
+            sub_thread=sub,
+        )
+        printer._print_step_summary(  # noqa: SLF001
+            step_id,
+            title,
+            elapsed,
+            summary,
+            step_marker="◈",
+            inline_preview=2,
+        )
+        return step_id
+
+    step_id = len(getattr(session, "last_turn_steps", []) or []) + 1
+    record = TraceStepRecord(
+        step_id=step_id,
+        kind="explore",
+        title=title,
+        elapsed=elapsed,
+        summary=summary,
+        body_lines=lines,
+        elapsed_kind=_resolve_elapsed_kind("explore"),
+        sub_thread=sub,
+    )
+    if hasattr(session, "last_turn_steps"):
+        session.last_turn_steps.append(record)
+    sink = session.trace_sink
+    if sink is not None and hasattr(sink, "step_added"):
+        sink.step_added(record)
+    return step_id
+
+
+def update_explore_trace_step(
+    session: Any,
+    step_id: int,
+    *,
+    summary: str,
+    elapsed: float,
+    body_lines: list[str] | None = None,
+) -> bool:
+    """
+    更新已登记的 explore 步骤（同 step_id 回填摘要/耗时，避免跑完再插一条）。
+
+    @param session TraceSession（父）
+    @param step_id emit_explore_trace_step 返回值
+    @param summary 折叠摘要
+    @param elapsed 子 Agent 耗时秒
+    @param body_lines 展开预览
+    @return 是否更新成功
+    """
+    if session is None or step_id <= 0:
+        return False
+
+    record = None
+    printer = session.active_printer
+    if printer is not None:
+        for step in getattr(printer, "_steps", []) or []:
+            if int(getattr(step, "step_id", 0) or 0) == step_id:
+                record = step
+                break
+    if record is None:
+        for step in getattr(session, "last_turn_steps", []) or []:
+            if int(getattr(step, "step_id", 0) or 0) == step_id:
+                record = step
+                break
+    if record is None:
+        return False
+
+    record.summary = summary
+    record.elapsed = float(elapsed)
+    if body_lines is not None:
+        lines = list(body_lines)
+        sub = (getattr(record, "sub_thread", None) or "").strip()
+        if sub and not any(ln.startswith("sub_thread=") for ln in lines):
+            lines = [f"sub_thread={sub}", *lines]
+        record.body_lines = lines
+
+    sink = session.trace_sink
+    if sink is not None and hasattr(sink, "step_added"):
+        sink.step_added(record)
+    return True
+
+
+def emit_turn_epilogue_step(
+    session: Any,
+    *,
+    title: str,
+    summary: str,
+    elapsed: float,
+    body_lines: list[str] | None = None,
+    kind: str = "preprocess",
+) -> int:
+    """
+    轮次结束后的追加步骤：写入 last_turn_steps 并推送 SSE（不进下一轮 pending）。
+
+    用于 active_printer 已清空、但本轮 turn_done 尚未发出时的追加步骤。
 
     @param session TraceSession
     @param title 步骤标题
-    @param summary 折叠行摘要
-    @param elapsed 墙钟耗时（秒）
+    @param summary 折叠摘要
+    @param elapsed 耗时秒
     @param body_lines 展开详情
-    @param kind 步骤类型（compress / tool_prune / preprocess）
+    @param kind 步骤类型
     @return 步骤编号；未展示时 0
     """
     from llgraph.display.trace_display import TraceStepRecord, _resolve_elapsed_kind
@@ -75,7 +233,19 @@ def emit_invoke_prelude_step(
     if session is None or session.is_silent() or not session.shows_process():
         return 0
 
-    step_id = len(session.pending_invoke_steps) + 1
+    printer = session.active_printer
+    if printer is not None:
+        return printer.emit_preprocess_step(
+            title,
+            summary,
+            body_lines or [],
+            elapsed,
+            kind=kind,
+            inline_preview=2,
+        )
+
+    steps = list(getattr(session, "last_turn_steps", None) or [])
+    step_id = len(steps) + 1
     record = TraceStepRecord(
         step_id=step_id,
         kind=kind,
@@ -85,18 +255,8 @@ def emit_invoke_prelude_step(
         body_lines=body_lines or [],
         elapsed_kind=_resolve_elapsed_kind(kind),
     )
-    printer = session.active_printer
-    if printer is not None:
-        return printer.emit_preprocess_step(
-            title,
-            summary,
-            record.body_lines,
-            elapsed,
-            kind=kind,
-            inline_preview=2,
-        )
-
-    session.pending_invoke_steps.append(record)
+    steps.append(record)
+    session.last_turn_steps = steps
     sink = session.trace_sink
     if sink is not None and hasattr(sink, "step_added"):
         sink.step_added(record)

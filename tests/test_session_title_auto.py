@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from llgraph.plan.plan_store import is_placeholder_plan_title
 from llgraph.session.session_meta import (
     disambiguate_session_titles,
     ensure_session_title_auto,
     extract_title_candidate,
+    extract_user_body_for_title,
     get_session_title,
+    is_weak_auto_session_title,
     normalize_session_title,
     peek_title_from_messages_jsonl,
     resolve_session_full_title,
@@ -19,6 +22,7 @@ from llgraph.session.session_meta import (
     suggest_full_title_from_text,
     suggest_title_from_text,
 )
+from llgraph.session.session_title_llm import maybe_refresh_session_title_with_llm
 
 
 def test_ensure_title_skips_when_title_exists(tmp_path: Path) -> None:
@@ -150,3 +154,64 @@ def test_suggest_full_title_longer_than_display() -> None:
     assert len(short) <= 24
     assert len(full) >= len(short)
     assert full.startswith("demo-query-service")
+
+
+def test_extract_user_body_from_structured_key_blocks() -> None:
+    msg = (
+        "service:\n"
+        "data-baize-service\n"
+        "detail:\n"
+        "CommunicationsException, druid version 1.2.16, jdbcUrl timeout"
+    )
+    body = extract_user_body_for_title(msg)
+    assert body.startswith("CommunicationsException")
+    assert "service:" not in body
+
+
+def test_weak_auto_title_detection() -> None:
+    assert is_weak_auto_session_title("app:")
+    assert is_weak_auto_session_title("status:")
+    assert is_weak_auto_session_title("package com")
+    assert not is_weak_auto_session_title("StarRocks 连接超时告警")
+
+
+def test_ensure_title_from_app_content_uses_body(tmp_path: Path) -> None:
+    workspace = tmp_path
+    thread_id = "cli-weaktitle"
+    result = ensure_session_title_auto(
+        workspace,
+        thread_id,
+        "app:\ndata-svc\ncontent:\n连接超时",
+    )
+    assert result == "连接超时"
+
+
+def test_llm_refresh_sets_title_when_missing(tmp_path: Path) -> None:
+    from llgraph.session.user_storage import session_messages_path, session_thread_dir
+
+    workspace = tmp_path
+    thread_id = "cli-llmtitle1"
+    thread_dir = session_thread_dir(workspace, thread_id)
+    thread_dir.mkdir(parents=True)
+    msg = (
+        "app:\n"
+        "data-baize-service\n"
+        "content:\n"
+        "CommunicationsException 连接 StarRocks 超时，如何屏蔽告警"
+    )
+    session_messages_path(workspace, thread_id).write_text(
+        json.dumps({"role": "user", "content": msg}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    with patch(
+        "llgraph.session.session_title_llm._invoke_session_title_llm",
+        return_value="StarRocks 连接超时告警屏蔽",
+    ):
+        title = maybe_refresh_session_title_with_llm(
+            workspace,
+            thread_id,
+            user_message=msg,
+            assistant_reply="建议调整连接池与告警阈值",
+        )
+    assert title == "StarRocks 连接超时告警屏蔽"
+    assert get_session_title(workspace, thread_id) == title

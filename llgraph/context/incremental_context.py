@@ -85,6 +85,71 @@ def resolve_auto_compress_threshold(settings: ContextSettings) -> int:
     return ratio_threshold
 
 
+def _protected_cited_indices(
+    messages: list[BaseMessage],
+    settings: ContextSettings,
+    pressure: float,
+    *,
+    already_kept: set[int],
+) -> set[int]:
+    """
+    下游引用信号：非满窗压力时，把被后续 AI 引用过的 ToolMessage 额外纳入保护。
+
+    @param messages 消息列表
+    @param settings 上下文配置
+    @param pressure 当前裁剪压力
+    @param already_kept 已按 recency 保留的下标
+    @return 额外保护的下标集合（已去掉 already_kept、按上限截断）
+    """
+    if not settings.protect_cited_tool_messages:
+        return set()
+    if settings.max_protected_cited_tool_messages <= 0:
+        return set()
+    # 满窗压力（>=1）时不再保护，优先回收 token
+    if pressure >= 1.0:
+        return set()
+    from llgraph.context.context_citation import cited_tool_indices
+
+    cited = cited_tool_indices(messages) - already_kept
+    if not cited:
+        return set()
+    # 只保护最近的 N 条被引用项，避免无界膨胀
+    keep_recent_cited = sorted(cited)[-settings.max_protected_cited_tool_messages :]
+    return set(keep_recent_cited)
+
+
+def _prune_or_mask_tool_message(
+    msg: ToolMessage,
+    workspace: Path,
+    settings: ContextSettings,
+    *,
+    cited_pairs: list[tuple[str, int]] | None = None,
+) -> ToolMessage:
+    """裁剪单条 ToolMessage；被引用行可选附「引用区预览」。"""
+    tool_name = str(getattr(msg, "name", "") or "")
+    mask_chars = (
+        settings.read_tool_mask_max_chars
+        if tool_name in _READ_TOOL_NAMES
+        else settings.compress_tool_mask_max_chars
+    )
+    original = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+    masked = mask_tool_message_content(msg, workspace, max_chars=mask_chars)
+    if masked.content == msg.content or not cited_pairs:
+        return masked
+    from llgraph.context.context_citation import build_cited_line_preview
+
+    preview = build_cited_line_preview(original, cited_pairs)
+    if not preview:
+        return masked
+    body = masked.content if isinstance(masked.content, str) else str(masked.content or "")
+    enriched = f"{body}\n--- 被引用行预览（后续结论引用过） ---\n{preview}\n--- 预览结束 ---"
+    return ToolMessage(
+        content=enriched,
+        tool_call_id=masked.tool_call_id,
+        name=getattr(masked, "name", None),
+    )
+
+
 def prune_stale_tool_messages(
     messages: list[BaseMessage],
     workspace: Path,
@@ -92,6 +157,9 @@ def prune_stale_tool_messages(
 ) -> tuple[list[BaseMessage], int]:
     """
     保留最近 N 条 ToolMessage 全文，更早的超长 tool 输出替换为指针。
+
+    被后续 AI 引用过的 ToolMessage 优先保留（下游引用信号，非满窗压力时生效）；
+    若仍被裁剪，指针里附「被引用行 ± 上下文」预览。
 
     @param messages 当前消息列表
     @param workspace 工作区根
@@ -112,23 +180,25 @@ def prune_stale_tool_messages(
         pressure,
         min_keep=settings.keep_recent_tool_messages,
     )
-    if keep >= len(tool_indices):
+    keep_indices = set(tool_indices[-keep:]) if keep > 0 else set()
+    keep_indices |= _protected_cited_indices(
+        messages, settings, pressure, already_kept=keep_indices
+    )
+    if keep_indices.issuperset(tool_indices):
         return messages, 0
 
-    keep_indices = set(tool_indices[-keep:]) if keep > 0 else set()
+    from llgraph.context.context_citation import cited_line_pairs_for_tool
+
     new_messages: list[BaseMessage] = []
     pruned = 0
     for idx, msg in enumerate(messages):
         if not isinstance(msg, ToolMessage) or idx in keep_indices:
             new_messages.append(msg)
             continue
-        tool_name = str(getattr(msg, "name", "") or "")
-        mask_chars = (
-            settings.read_tool_mask_max_chars
-            if tool_name in _READ_TOOL_NAMES
-            else settings.compress_tool_mask_max_chars
+        cited_pairs = cited_line_pairs_for_tool(messages, idx) if settings.protect_cited_tool_messages else None
+        masked = _prune_or_mask_tool_message(
+            msg, workspace, settings, cited_pairs=cited_pairs
         )
-        masked = mask_tool_message_content(msg, workspace, max_chars=mask_chars)
         if masked.content != msg.content:
             pruned += 1
         new_messages.append(masked)
@@ -263,19 +333,37 @@ def prune_tool_messages_for_dispatch(
         pressure,
         min_keep=settings.dispatch_keep_full_tool_messages,
     )
-    if keep >= len(tool_indices):
+    keep_indices = set(tool_indices[-keep:]) if keep > 0 else set()
+    keep_indices |= _protected_cited_indices(
+        messages, settings, pressure, already_kept=keep_indices
+    )
+    if keep_indices.issuperset(tool_indices):
         return messages
 
-    mask_chars = settings.compress_tool_mask_max_chars
-    keep_indices = set(tool_indices[-keep:]) if keep > 0 else set()
+    from llgraph.context.context_citation import cited_line_pairs_for_tool
+    from llgraph.context.context_spill import mask_tool_message_to_dispatch_pointer
+
     new_messages: list[BaseMessage] = []
     for idx, msg in enumerate(messages):
         if not isinstance(msg, ToolMessage) or idx in keep_indices:
             new_messages.append(msg)
             continue
-        from llgraph.context.context_spill import mask_tool_message_to_dispatch_pointer
+        pointer = mask_tool_message_to_dispatch_pointer(msg)
+        if settings.protect_cited_tool_messages and pointer.content != msg.content:
+            original = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+            pairs = cited_line_pairs_for_tool(messages, idx)
+            if pairs:
+                from llgraph.context.context_citation import build_cited_line_preview
 
-        new_messages.append(mask_tool_message_to_dispatch_pointer(msg))
+                preview = build_cited_line_preview(original, pairs)
+                if preview:
+                    body = pointer.content if isinstance(pointer.content, str) else str(pointer.content or "")
+                    pointer = ToolMessage(
+                        content=f"{body}\n--- 被引用行预览（后续结论引用过） ---\n{preview}\n--- 预览结束 ---",
+                        tool_call_id=pointer.tool_call_id,
+                        name=getattr(pointer, "name", None),
+                    )
+        new_messages.append(pointer)
     return new_messages
 
 

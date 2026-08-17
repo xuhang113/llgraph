@@ -77,7 +77,7 @@ export function mergeTracePanelCacheTurn(
   saveTracePanelCache(slug, threadId, newLines, nextSteps);
 }
 
-/** 向缓存追加单个 trace 步骤（后台/切换会话落盘用）。 */
+/** 向缓存追加或更新单个 trace 步骤（Think 回填同 id 覆盖）。 */
 export function appendTracePanelCacheStep(
   slug: string,
   threadId: string,
@@ -87,10 +87,12 @@ export function appendTracePanelCacheStep(
     return;
   }
   const cached = loadTracePanelCache(slug, threadId) || { log_lines: [], steps: [] };
-  if (cached.steps.some((s) => s.step_id === step.step_id)) {
+  const existed = cached.steps.some((s) => s.step_id === step.step_id);
+  const nextSteps = mergeTraceStepsUnique(cached.steps, [step]);
+  if (existed) {
+    saveTracePanelCache(slug, threadId, cached.log_lines, nextSteps);
     return;
   }
-  const nextSteps = mergeTraceStepsUnique(cached.steps, [step]);
   const synth = stepsToPanelLogLines([step]).map((l) => l.text);
   saveTracePanelCache(slug, threadId, [...cached.log_lines, ...synth], nextSteps);
 }

@@ -486,6 +486,32 @@ def patch_gateway_kimi_reasoning_payload() -> None:
         model_id = getattr(self, "model", None) or payload.get("model")
         model_text = str(model_id or "")
         workspace = getattr(self, "llgraph_workspace", None)
+
+        # 所有模型：按工作区配置同步 thinking + adaptive effort（Claude 等不依赖 reasoning 注入）
+        from llgraph.core.model_thinking import (
+            merge_payload_thinking,
+            resolve_model_thinking_payload,
+            split_thinking_payload,
+        )
+
+        desired_thinking = resolve_model_thinking_payload(workspace, model_text)
+        if desired_thinking is not None:
+            desired_body, effort = split_thinking_payload(desired_thinking)
+            if desired_body is not None:
+                payload["thinking"] = merge_payload_thinking(
+                    payload.get("thinking"),
+                    desired_body,
+                    model_id=model_text,
+                )
+            if effort:
+                output_config = payload.get("output_config")
+                if not isinstance(output_config, dict):
+                    output_config = {}
+                else:
+                    output_config = dict(output_config)
+                output_config.setdefault("effort", effort)
+                payload["output_config"] = output_config
+
         if not should_inject_reasoning_payload(workspace, model_text):
             return payload
         formatted = payload.get("messages")
@@ -516,18 +542,6 @@ def patch_gateway_kimi_reasoning_payload() -> None:
                     None,
                     include_thinking_block=include_thinking_block,
                 )
-        from llgraph.core.model_thinking import (
-            merge_payload_thinking,
-            resolve_model_thinking_payload,
-        )
-
-        desired_thinking = resolve_model_thinking_payload(workspace, model_text)
-        if desired_thinking is not None:
-            payload["thinking"] = merge_payload_thinking(
-                payload.get("thinking"),
-                desired_thinking,
-                model_id=model_text,
-            )
         from llgraph.core.dispatch_payload_guard import validate_and_repair_formatted_messages
 
         repaired, issues = validate_and_repair_formatted_messages(formatted)

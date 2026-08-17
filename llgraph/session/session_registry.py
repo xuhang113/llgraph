@@ -314,24 +314,16 @@ def discover_sessions(workspace: Path) -> list[SessionSummary]:
         meta = load_session_meta(root, tid)
         meta_path = session_meta_json_path(root, tid)
         msg_path = session_messages_path(root, tid)
-        from llgraph.session.web_trace_store import (
-            last_web_trace_path,
-            live_web_trace_path,
-            web_trace_history_path,
-        )
+        meta_activity = _parse_iso(meta.get("updated_at")) or _mtime_iso(meta_path)
 
+        # 侧栏排序/日期分组以「对话活动」为准；Web trace / manifest 同步不计入（打开会话也会 touch）。
         updated_at = _max_iso(
             msg_updated,
             _mtime_iso(msg_path),
-            _parse_iso(meta.get("updated_at")),
-            _mtime_iso(meta_path),
-            _mtime_iso(manifest_path),
+            meta_activity,
             _mtime_iso(archive_path),
             _mtime_iso(edits_dir / "edits.jsonl"),
             started,
-            _mtime_iso(live_web_trace_path(root, tid)),
-            _mtime_iso(web_trace_history_path(root, tid)),
-            _mtime_iso(last_web_trace_path(root, tid)),
         )
 
         stored_title = get_session_title(root, tid)

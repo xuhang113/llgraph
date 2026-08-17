@@ -9,6 +9,7 @@ from pathlib import Path
 
 from llgraph.code_index.index_lock import IndexLock
 from llgraph.code_index.index_logging import get_index_logger
+from llgraph.code_index.index_progress import IndexProgressDisplay
 from llgraph.code_index.index_settings import resolve_index_settings
 from llgraph.code_index.indexer import run_index_paths
 from llgraph.core.workspace import WorkspaceContext
@@ -101,10 +102,21 @@ class IndexWatchService:
                 if src:
                     service._enqueue_deleted(src)
 
-        self._observer = Observer()
-        self._observer.schedule(Handler(), str(self._workspace), recursive=True)
-        self._observer.start()
-        self._running = True
+        try:
+            self._observer = Observer()
+            self._observer.schedule(Handler(), str(self._workspace), recursive=True)
+            self._observer.start()
+            self._running = True
+        except Exception as exc:
+            self._logger.warning("watch 启动失败: %s", exc)
+            try:
+                lock.release()
+            except Exception:
+                pass
+            self._index_lock = None
+            self._observer = None
+            self._running = False
+            return False
         debounce = self._settings.watch_debounce_sec
         from llgraph.terminal.notify import notify
 
@@ -201,7 +213,26 @@ class IndexWatchService:
         if not batch:
             return
         try:
-            result = run_index_paths(self._workspace, batch)
+            progress = IndexProgressDisplay(
+                enabled=False,
+                workspace=self._workspace,
+                action="watch",
+                files_total=len(batch),
+            )
+            result = run_index_paths(
+                self._workspace,
+                batch,
+                progress=progress,
+            )
+            progress.finish(
+                files_scanned=result.files_scanned,
+                files_updated=result.files_updated,
+                files_skipped=result.files_skipped,
+                chunks_written=result.chunks_written,
+                ok=not result.errors,
+                error="; ".join(result.errors[:3]) if result.errors else None,
+                emit_summary=False,
+            )
             self._last_run_at = datetime.now(timezone.utc).isoformat()
             self._last_files_updated = result.files_updated
         except Exception as exc:

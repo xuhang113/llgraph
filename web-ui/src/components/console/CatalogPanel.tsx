@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { api, type Capabilities } from '../../api/client';
 import MarkdownView from './MarkdownView';
-import { useAppDialog } from '../AppDialog';
+import { useAppDialog } from '../appDialogContext';
+import { formatMcpToolDisplay, mcpServerZh } from '../../utils/mcpDisplay';
 
 type CatalogKind = 'skills' | 'rules' | 'tools';
 
@@ -34,9 +35,16 @@ export default function CatalogPanel({ slug, kind, caps, onClose, onCapsRefresh 
   const [detail, setDetail] = useState<DetailState | null>(null);
   const [loading, setLoading] = useState(false);
   const [toggleBusy, setToggleBusy] = useState<string | null>(null);
+  const [toolsTab, setToolsTab] = useState<'builtin' | 'mcp'>('builtin');
 
   useEffect(() => {
     setDetail(null);
+  }, [kind, slug]);
+
+  useEffect(() => {
+    if (kind === 'tools') {
+      setToolsTab('builtin');
+    }
   }, [kind, slug]);
 
   const titleMap: Record<CatalogKind, string> = {
@@ -89,11 +97,9 @@ export default function CatalogPanel({ slug, kind, caps, onClose, onCapsRefresh 
     }
   };
 
-  const tools = caps
-    ? [...caps.builtin_tools, ...caps.mcp_tools].sort((a, b) =>
-        a.name.localeCompare(b.name),
-      )
-    : [];
+  const builtinTools = caps?.builtin_tools ?? [];
+  const mcpTools = caps?.mcp_tools ?? [];
+  const mcpServers = caps?.mcp_servers ?? [];
 
   const handleSkillToggle = async (name: string, active: boolean) => {
     setToggleBusy(name);
@@ -137,6 +143,28 @@ export default function CatalogPanel({ slug, kind, caps, onClose, onCapsRefresh 
           返回会话
         </button>
       </header>
+      {kind === 'tools' && (
+        <div className="cursor-catalog-tools-tabs" role="tablist" aria-label="工具分类">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={toolsTab === 'builtin'}
+            className={`cursor-catalog-tools-tab${toolsTab === 'builtin' ? ' is-active' : ''}`}
+            onClick={() => setToolsTab('builtin')}
+          >
+            内置工具 ({builtinTools.length})
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={toolsTab === 'mcp'}
+            className={`cursor-catalog-tools-tab${toolsTab === 'mcp' ? ' is-active' : ''}`}
+            onClick={() => setToolsTab('mcp')}
+          >
+            MCP ({mcpTools.length})
+          </button>
+        </div>
+      )}
       <div className={`cursor-catalog-body${kind === 'tools' ? ' cursor-catalog-body--single' : ''}`}>
         <div className="cursor-catalog-list">
           {kind === 'skills' &&
@@ -217,17 +245,64 @@ export default function CatalogPanel({ slug, kind, caps, onClose, onCapsRefresh 
             ) : (
               <div className="cursor-catalog-empty">暂无 Rule</div>
             ))}
-          {kind === 'tools' &&
-            (tools.length ? (
-              tools.map((t) => (
+          {kind === 'tools' && toolsTab === 'builtin' &&
+            (builtinTools.length ? (
+              builtinTools.map((t) => (
                 <div key={t.name} className="cursor-catalog-item cursor-catalog-item--static">
                   <span className="cursor-catalog-item-title">{t.name}</span>
                   <span className="cursor-catalog-item-desc">{t.description}</span>
                 </div>
               ))
             ) : (
-              <div className="cursor-catalog-empty">暂无工具</div>
+              <div className="cursor-catalog-empty">暂无内置工具</div>
             ))}
+          {kind === 'tools' && toolsTab === 'mcp' && (
+            <>
+              {caps?.mcp_loading && (
+                <div className="cursor-catalog-empty">MCP 后台加载中…</div>
+              )}
+              {!!mcpServers.length && (
+                <div className="cursor-catalog-item cursor-catalog-item--static">
+                  <span className="cursor-catalog-item-title">MCP Servers</span>
+                  <span className="cursor-catalog-item-desc">
+                    {mcpServers
+                      .map((s) => {
+                        const st =
+                          s.status === 'ok'
+                            ? `已连接 · ${s.tool_count ?? 0} 工具`
+                            : s.status === 'loading'
+                              ? '加载中'
+                              : s.status === 'error'
+                                ? `已跳过${s.error ? `：${s.error}` : ''}`
+                                : '未就绪';
+                        return `${s.name}：${mcpServerZh(s.name)}（${st}）`;
+                      })
+                      .join('\n')}
+                  </span>
+                </div>
+              )}
+              {!!caps?.mcp_summary && (
+                <div className="cursor-catalog-item cursor-catalog-item--static">
+                  <span className="cursor-catalog-item-title">摘要</span>
+                  <span className="cursor-catalog-item-desc">{caps.mcp_summary}</span>
+                </div>
+              )}
+              {mcpTools.length ? (
+                mcpTools.map((t) => (
+                  <div key={t.name} className="cursor-catalog-item cursor-catalog-item--static">
+                    <span className="cursor-catalog-item-title">{t.name}</span>
+                    <span className="cursor-catalog-item-desc">
+                      {formatMcpToolDisplay(t.name, t.description)}
+                    </span>
+                  </div>
+                ))
+              ) : (
+                !caps?.mcp_loading && (
+                  <div className="cursor-catalog-empty">暂无可用 MCP 工具</div>
+                )
+              )}
+            </>
+          )}
         </div>
         {kind !== 'tools' && (
           <div className="cursor-catalog-detail">

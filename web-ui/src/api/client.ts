@@ -69,11 +69,13 @@ export interface Workspace {
 }
 
 export interface TreeNode {
-  kind: 'agent' | 'plan' | 'worker';
+  kind: 'agent' | 'plan' | 'worker' | 'subagent';
   thread_id: string;
   title: string;
   title_full?: string;
   updated_at?: string | null;
+  /** 仅前端：新建会话尚未出现在 tree API 前保留侧栏占位 */
+  _optimistic?: boolean;
   phase?: string;
   plan_id?: string;
   task_id?: string;
@@ -85,7 +87,16 @@ export interface Capabilities {
   builtin_tools: Array<{ name: string; description: string }>;
   mcp_tools: Array<{ name: string; description: string }>;
   mcp_summary: string;
-  mcp_servers: Array<{ name: string; command: string; enabled: boolean }>;
+  mcp_errors?: string[];
+  mcp_loading?: boolean;
+  mcp_servers: Array<{
+    name: string;
+    command: string;
+    enabled: boolean;
+    status?: 'ok' | 'error' | 'loading' | 'idle';
+    error?: string | null;
+    tool_count?: number;
+  }>;
   skills: Array<{ name: string; description: string; scope: string; scope_label?: string; path: string; active?: boolean }>;
   rules: Array<{ id: string; description: string; scope: string; scope_label?: string; path: string; forced?: boolean; disabled?: boolean }>;
   commands: Array<{ name: string; description: string; requires_write: boolean }>;
@@ -106,6 +117,54 @@ export interface Capabilities {
   };
 }
 
+export interface MemoryHit {
+  memory_id: string;
+  kind: string;
+  content: string;
+  score?: number;
+  hit_count?: number;
+  confidence?: number;
+  source?: string;
+  status?: string;
+  created_at?: string;
+  updated_at?: string;
+  last_hit_at?: string;
+  content_hash?: string;
+}
+
+export interface MemoryStatus {
+  enabled: boolean;
+  user_id: string;
+  workspace_key: string;
+  workspace_slug: string;
+  memory_root: string;
+  counts: {
+    active: number;
+    pref: number;
+    fact: number;
+    proc: number;
+  };
+  settings?: {
+    auto_recall_top_k: number;
+    search_tool_top_k: number;
+    auto_recall_min_score: number;
+    memory_content_max_chars: number;
+  };
+}
+
+export interface MemorySearchResult {
+  enabled: boolean;
+  mode: 'search' | 'browse' | 'disabled';
+  query: string;
+  top_k: number;
+  min_score?: number;
+  hits: MemoryHit[];
+  filtered_below_min?: number;
+  elapsed_ms?: number;
+  count?: number;
+  message?: string;
+}
+
 export interface ContextUsage {
   total: number;
   limit: number;
@@ -123,10 +182,10 @@ export interface ContextSettingsSnapshot {
   compress_strategy: string;
   auto_compress_ratio: number;
   compress_during_react: boolean;
-  dispatch_keep_user_turns: number;
-  dispatch_window_token_ratio: number;
   incremental_tool_prune: boolean;
   keep_recent_tool_messages: number;
+  dispatch_tool_chain_compress?: boolean;
+  dispatch_keep_full_tool_messages?: number;
   tool_result_max_chars: number;
 }
 
@@ -145,6 +204,8 @@ export interface ContextBreakdownSection {
   preview: string;
   truncated: boolean;
   messages?: ContextMessageInspect[];
+  empty_hint?: string;
+  from_disk?: boolean;
 }
 
 export interface ContextMessageInspect {
@@ -170,6 +231,22 @@ export interface ContextDetail {
   dispatch_note: string;
 }
 
+export interface IndexProgress {
+  running: boolean;
+  action?: string | null;
+  phase?: string | null;
+  files_scanned?: number;
+  files_skipped?: number;
+  files_updated?: number;
+  chunks_written?: number;
+  files_total?: number | null;
+  percent?: number | null;
+  elapsed_sec?: number;
+  error?: string | null;
+  ok?: boolean;
+  updated_at?: string;
+}
+
 export interface IndexStatus {
   exists: boolean;
   chunk_count: number;
@@ -180,8 +257,15 @@ export interface IndexStatus {
   sync_complete: boolean | null;
   watch_enabled: boolean;
   watch_with_agent: boolean;
+  /** Web 进程内文件监听是否已启动 */
+  watch_active?: boolean;
+  /** 手动索引占用锁时 Watch 已暂停（非启动失败） */
+  watch_paused?: boolean;
   embedding: string;
   max_files: number;
+  /** 同步进度（后台 index 时轮询） */
+  progress?: IndexProgress | null;
+  indexing?: boolean;
 }
 
 export interface LlmModelOption {
@@ -630,13 +714,13 @@ export const api = {
       `/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/touch`,
       { method: 'POST' },
     ),
-  lastTrace: (slug: string, threadId: string) =>
+  sessionTrace: (slug: string, threadId: string) =>
     fetchJson<{
       log_lines: string[];
       steps: Record<string, unknown>[];
       turns?: Record<string, unknown>[];
       live_ts?: string;
-    }>(`/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/last-trace`),
+    }>(`/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/trace`),
   plan: (slug: string, threadId: string) =>
     fetchJson<PlanDetail>(`/workspaces/${slug}/plans/${threadId}`),
   worker: (slug: string, threadId: string, taskId: string) =>
@@ -654,13 +738,14 @@ export const api = {
     for (const file of imageFiles ?? []) {
       form.append('images', file);
     }
-    return fetchJson<{ ok: boolean; thread_id: string }>(
-      `/workspaces/${slug}/sessions/${threadId}/chat`,
-      {
-        method: 'POST',
-        body: form,
-      },
-    );
+    return fetchJson<{
+      ok: boolean;
+      thread_id: string;
+      images?: Array<{ id: string; media_type: string; url: string }>;
+    }>(`/workspaces/${slug}/sessions/${threadId}/chat`, {
+      method: 'POST',
+      body: form,
+    });
   },
   abortAgentChat: (slug: string, threadId: string) =>
     fetchJson<{ ok: boolean; message: string }>(
@@ -775,14 +860,17 @@ export const api = {
     ),
   indexStatus: (slug: string) => fetchJson<IndexStatus>(`/workspaces/${slug}/index-status`),
   runIndex: (slug: string, action: 'full' | 'incremental' | 'rebuild' | 'dry-run' | 'status') =>
-    fetchJson<{ ok: boolean; exit_code: number; action: string; log_path: string | null }>(
-      `/workspaces/${slug}/index`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action }),
-      },
-    ),
+    fetchJson<{
+      ok: boolean;
+      started?: boolean;
+      exit_code: number | null;
+      action: string;
+      log_path: string | null;
+    }>(`/workspaces/${slug}/index`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    }),
   toggleSkill: (slug: string, name: string, active: boolean) =>
     fetchJson<{ ok: boolean; name: string; active: boolean; active_skills: string[]; message: string }>(
       `/workspaces/${slug}/catalog/skill/${encodeURIComponent(name)}/toggle`,
@@ -842,6 +930,27 @@ export const api = {
         }),
       },
     ),
+  memoryStatus: (slug: string) =>
+    fetchJson<MemoryStatus>(`/workspaces/${slug}/memory-status`),
+  memorySearch: (
+    slug: string,
+    query: string,
+    opts: {
+      top_k?: number;
+      min_score?: number;
+      kind?: string;
+    } = {},
+  ) =>
+    fetchJson<MemorySearchResult>(`/workspaces/${slug}/memory-search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        top_k: opts.top_k ?? 20,
+        min_score: opts.min_score ?? 0,
+        kind: opts.kind ?? null,
+      }),
+    }),
   executionLog: (slug: string, limit = 30) =>
     fetchJson<{ path: string; lines: string[]; count: number }>(
       `/workspaces/${slug}/execution-log?limit=${limit}`,

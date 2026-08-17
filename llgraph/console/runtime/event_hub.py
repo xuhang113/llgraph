@@ -7,8 +7,18 @@ import threading
 from collections import defaultdict
 from typing import Any
 
-_BUFFER_MAX = 200
-_SKIP_BUFFER_TYPES = frozenset({"ping", "subscribed"})
+# 结构事件（步骤/轮次）必须尽量可回放；thinking/stream 单轮可达数百条，会挤掉 turn_start 与早期步骤
+_BUFFER_MAX = 2000
+_SKIP_BUFFER_TYPES = frozenset(
+    {
+        "ping",
+        "subscribed",
+        "thinking_delta",
+        "stream_delta",
+        "stream_end",
+        "trace_activity",
+    }
+)
 
 
 class EventHub:

@@ -41,21 +41,18 @@ def _settings(**overrides: object) -> ContextSettings:
         compress_trigger_max_tokens=None,
         session_history_search_enabled=True,
         session_history_search_top_k=8,
-        dispatch_keep_user_turns=0,
-        dispatch_min_user_turns=2,
-        dispatch_max_user_turns=8,
-        dispatch_window_token_ratio=0.35,
         compress_strategy="auto",
         compress_during_react=True,
         compress_summary_chunk_chars=120_000,
         dispatch_tool_chain_compress=True,
         dispatch_keep_full_tool_messages=2,
         dispatch_dedupe_read_paths=True,
-        dispatch_min_tool_rounds=12,
         grep_context_lines=5,
         grep_max_inline_chars=48000,
         spill_hit_context_lines=100,
         tool_prune_token_ratio=0.0,
+        protect_cited_tool_messages=True,
+        max_protected_cited_tool_messages=8,
     )
     base.update(overrides)
     return ContextSettings(**base)

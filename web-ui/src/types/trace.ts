@@ -3,6 +3,8 @@ export interface TraceTurn {
   turn_index: number;
   label: string;
   steps: TraceStep[];
+  /** 该轮 trace 日志行（含用户消息预览） */
+  log_lines?: string[];
   live?: boolean;
 }
 
@@ -16,33 +18,48 @@ export function parseTraceTurnsFromRemote(
       .map((row, index) => {
         const stepsRaw = row.steps;
         const steps: TraceStep[] = Array.isArray(stepsRaw)
-          ? stepsRaw
-              .filter((item): item is Record<string, unknown> => item != null && typeof item === 'object')
-              .map((step, stepIndex) => ({
-                step_id: Number(step.step_id ?? stepIndex + 1),
-                kind: String(step.kind ?? ''),
-                title: String(step.title ?? ''),
-                elapsed: Number(step.elapsed ?? 0),
-                elapsed_kind: String(step.elapsed_kind ?? resolveElapsedKind(String(step.kind ?? ''))),
-                summary: String(step.summary ?? ''),
-                body_lines: Array.isArray(step.body_lines) ? step.body_lines.map(String) : [],
-                usage: (step.usage as StepUsage | null | undefined) ?? null,
-                invoke_timing:
-                  (step.invoke_timing as InvokeTiming | null | undefined) ?? null,
-              }))
+          ? dedupeTraceStepsById(
+              stepsRaw
+                .filter((item): item is Record<string, unknown> => item != null && typeof item === 'object')
+                .map((step, stepIndex) => ({
+                  step_id: Number(step.step_id ?? stepIndex + 1),
+                  kind: String(step.kind ?? ''),
+                  title: String(step.title ?? ''),
+                  elapsed: Number(step.elapsed ?? 0),
+                  elapsed_kind: String(step.elapsed_kind ?? resolveElapsedKind(String(step.kind ?? ''))),
+                  summary: String(step.summary ?? ''),
+                  body_lines: Array.isArray(step.body_lines) ? step.body_lines.map(String) : [],
+                  usage: (step.usage as StepUsage | null | undefined) ?? null,
+                  invoke_timing:
+                    (step.invoke_timing as InvokeTiming | null | undefined) ?? null,
+                  sub_thread: step.sub_thread != null ? String(step.sub_thread) : undefined,
+                })),
+            )
           : [];
         const turnIndex = Number(row.turn_index ?? index + 1);
+        const logLinesRaw = row.log_lines;
+        const log_lines = Array.isArray(logLinesRaw)
+          ? logLinesRaw.map(String).filter((line) => line.trim())
+          : undefined;
         return {
           id: `turn-${turnIndex}`,
           turn_index: turnIndex,
           label: String(row.label ?? `第 ${turnIndex} 轮`),
           steps,
+          log_lines,
           live: Boolean(row.live),
         };
       });
   }
   if (fallbackSteps.length > 0) {
-    return [{ id: 'turn-1', turn_index: 1, label: '第 1 轮', steps: fallbackSteps }];
+    return [
+      {
+        id: 'turn-1',
+        turn_index: 1,
+        label: '第 1 轮',
+        steps: dedupeTraceStepsById(fallbackSteps),
+      },
+    ];
   }
   return [];
 }
@@ -106,6 +123,8 @@ export interface TraceStep {
   invoke_timing?: InvokeTiming | null;
   /** model=仅模型 / tool=工具等待 / preprocess=预处理 / wall=墙钟 */
   elapsed_kind?: string;
+  /** explore 子会话 thread，展开可拉子 Trace */
+  sub_thread?: string | null;
 }
 
 export function formatTraceDuration(seconds: number): string {
@@ -132,7 +151,7 @@ export function resolveElapsedKind(kind: string): string {
   if (kind === 'plan' || kind === 'thinking' || kind === 'reply') {
     return 'model';
   }
-  if (kind === 'tool') {
+  if (kind === 'tool' || kind === 'explore') {
     return 'tool';
   }
   if (
@@ -140,7 +159,10 @@ export function resolveElapsedKind(kind: string): string {
     kind === 'tool_prune' ||
     kind === 'preprocess' ||
     kind === 'search_params' ||
-    kind === 'tools'
+    kind === 'tools' ||
+    kind === 'memory_recall' ||
+    kind === 'memory_write' ||
+    kind === 'memory_consolidate'
   ) {
     return 'preprocess';
   }
@@ -209,19 +231,49 @@ export function stepMarker(step: TraceStep): string {
   if (step.kind === 'reply') {
     return '💬';
   }
+  if (step.kind === 'explore') {
+    return '◈';
+  }
   if (step.kind === 'plan' || step.title.includes('模型决策')) {
     return '▶';
   }
-  if (step.kind === 'preprocess' || step.kind === 'search_params') {
-    return '◇';
-  }
-  if (step.kind === 'tool_prune' || step.kind === 'compress') {
+  if (
+    step.kind === 'preprocess' ||
+    step.kind === 'search_params' ||
+    step.kind === 'tool_prune' ||
+    step.kind === 'compress' ||
+    step.kind === 'memory_recall' ||
+    step.kind === 'memory_write' ||
+    step.kind === 'memory_consolidate'
+  ) {
     return '◇';
   }
   if (step.kind === 'tool' || step.title.startsWith('执行')) {
     return '▷';
   }
   return '▶';
+}
+
+/** invoke 前例行预处理（历史 Trace 中仍可能存在，展示时过滤）。 */
+const INVOKE_PRELUDE_TITLES = new Set([
+  '工具结果裁剪',
+  '上下文检查',
+  'Manifest 同步',
+  '历史 sanitize',
+  '出站上下文',
+  'invoke 准备合计',
+]);
+
+export function isInvokePreludeStep(step: TraceStep): boolean {
+  if (step.kind === 'explore') {
+    return false;
+  }
+  return INVOKE_PRELUDE_TITLES.has(step.title);
+}
+
+/** Trace 面板可见步骤：去掉 ReAct 前置例行预处理。 */
+export function filterTraceStepsForDisplay(steps: TraceStep[]): TraceStep[] {
+  return steps.filter((step) => !isInvokePreludeStep(step));
 }
 
 const STEP_HEADER_RE = /^\[\d{2}:\d{2}:\d{2}\]\s*(?:▶|▷|◇)\s*#\d+/;
@@ -233,22 +285,50 @@ export interface TraceLineItem {
   text: string;
 }
 
-/** 按 step_id 合并步骤，避免 turn_done / live 重复追加。 */
+/** 同 step_id 保留正文更长的版本（Think 回填）。 */
+function preferRicherStep(a: TraceStep, b: TraceStep): TraceStep {
+  const aBody = (a.body_lines ?? []).join('\n').length;
+  const bBody = (b.body_lines ?? []).join('\n').length;
+  if (bBody !== aBody) {
+    return bBody > aBody ? b : a;
+  }
+  const aSum = (a.summary ?? '').length;
+  const bSum = (b.summary ?? '').length;
+  return bSum >= aSum ? b : a;
+}
+
+/** 按 step_id 合并步骤；同 id 取更完整正文，避免 Think 回填重复行。 */
 export function mergeTraceStepsUnique(
   panelSteps: TraceStep[],
   incomingSteps: TraceStep[],
 ): TraceStep[] {
   if (incomingSteps.length === 0) {
-    return panelSteps;
+    return dedupeTraceStepsById(panelSteps);
   }
   const byId = new Map<number, TraceStep>();
   for (const step of panelSteps) {
-    byId.set(step.step_id, step);
+    const prev = byId.get(step.step_id);
+    byId.set(step.step_id, prev ? preferRicherStep(prev, step) : step);
   }
   for (const step of incomingSteps) {
-    if (!byId.has(step.step_id)) {
-      byId.set(step.step_id, step);
-    }
+    const prev = byId.get(step.step_id);
+    byId.set(step.step_id, prev ? preferRicherStep(prev, step) : step);
+  }
+  return [...byId.values()].sort((a, b) => a.step_id - b.step_id);
+}
+
+/** 数组内按 step_id 去重（保留更完整正文）。 */
+export function dedupeTraceStepsById(steps: TraceStep[]): TraceStep[] {
+  if (steps.length <= 1) {
+    return steps;
+  }
+  const byId = new Map<number, TraceStep>();
+  for (const step of steps) {
+    const prev = byId.get(step.step_id);
+    byId.set(step.step_id, prev ? preferRicherStep(prev, step) : step);
+  }
+  if (byId.size === steps.length) {
+    return steps;
   }
   return [...byId.values()].sort((a, b) => a.step_id - b.step_id);
 }

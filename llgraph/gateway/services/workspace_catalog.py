@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,11 +19,10 @@ def resolve_context_root() -> Path:
     """
     解析 llgraph 用户 context 根目录。
 
-    @return ~/.llgraph/context 或 LLGRAPH_HOME/context
+    与 ``user_context_root`` 一致（均尊重 ``LLGRAPH_HOME``）。
+
+    @return ~/.llgraph/context 或 $LLGRAPH_HOME/context
     """
-    home = os.environ.get("LLGRAPH_HOME", "").strip()
-    if home:
-        return Path(home).expanduser().resolve() / "context"
     return user_context_root()
 
 

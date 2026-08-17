@@ -326,28 +326,20 @@ def main() -> int:
             prompt_cache_enabled_for_model,
             resolve_prompt_cache_settings,
         )
-        from llgraph.context.context_dispatch_window import trim_messages_for_dispatch_window
-        from llgraph.context.context_settings import resolve_context_settings
         from llgraph.context.message_normalize import prepare_messages_for_llm_dispatch
 
         settings = get_llgraph_settings()
         if not settings.get("api_key"):
             print("\n跳过 API 探测: 未配置 LLGRAPH_API_KEY", file=sys.stderr)
         else:
-            print("\nAPI 探测（dispatch 窗口 + 探测句，各模型 1 次）:")
+            print("\nAPI 探测（历史 + 探测句，各模型 1 次）:")
             probe = HumanMessage(content="请只回复一个词：ok")
-            ctx_settings = resolve_context_settings(workspace)
             sys_prompt = build_system_prompt(workspace, allow_write=False)
             cache_settings = resolve_prompt_cache_settings(workspace)
             for model_id in model_ids:
                 set_runtime_model(model_id)
                 profile = resolve_dispatch_profile(workspace, model_id)
                 dispatched, _ = rebuild_provider_safe_messages(canonical, profile)
-                if ctx_settings.dispatch_keep_user_turns > 0:
-                    dispatched = trim_messages_for_dispatch_window(
-                        dispatched,
-                        keep_user_turns=ctx_settings.dispatch_keep_user_turns,
-                    )
                 batch = [*dispatched, probe]
                 prepared = prepare_messages_for_llm_dispatch(
                     batch,

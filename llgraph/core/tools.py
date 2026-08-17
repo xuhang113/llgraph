@@ -9,6 +9,7 @@ from langchain_core.tools import tool
 from llgraph.code_index.index_settings import resolve_index_settings
 from llgraph.context.context_settings import resolve_context_settings
 from llgraph.core.code_index_tools import create_code_index_tools
+from llgraph.memory.tools import create_memory_tools
 from llgraph.context.context_spill import ContextSpill, apply_spill_to_tools
 from llgraph.core.filesystem_tools import create_filesystem_tools
 from llgraph.session.session_history_tools import create_session_history_tools
@@ -74,6 +75,7 @@ def get_agent_tools(
     )
     index_tools = create_code_index_tools(root)
     history_tools = create_session_history_tools(root)
+    memory_tools = create_memory_tools(root)
     plan_tools = create_plan_tools(root)
     shell_tools = create_shell_tools(ctx, allow_write=allow_write)
     sandbox_blocks_network = (
@@ -93,6 +95,7 @@ def get_agent_tools(
         *shell_tools,
         *index_tools,
         *history_tools,
+        *memory_tools,
         *plan_tools,
         *web_tools,
         *extra,
@@ -108,13 +111,23 @@ def load_mcp_tool_bundle(
     """
     加载 MCP 工具与 registry。
 
+    失败可降级：不抛异常，仅跳过失败 Server；不影响 Agent 其它工具。
+
     @param workspace 工作区根
     @param allow_write 是否允许 MCP 写类工具
     @return (tools, registry, summary)
     """
-    settings = resolve_mcp_settings(workspace, allow_write=allow_write)
-    tools, registry = create_mcp_tools(settings)
     from llgraph.config.mcp_config import format_mcp_summary
+
+    try:
+        settings = resolve_mcp_settings(workspace, allow_write=allow_write)
+    except Exception as exc:
+        return [], None, f"MCP: 配置解析失败（已跳过）{exc}"
+
+    try:
+        tools, registry = create_mcp_tools(settings)
+    except Exception as exc:
+        return [], None, f"MCP: 加载失败（已跳过，不影响其它功能）{exc}"
 
     summary = format_mcp_summary(settings)
     if registry is not None:

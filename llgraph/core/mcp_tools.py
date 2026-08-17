@@ -10,11 +10,103 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import StructuredTool
+from pydantic import BaseModel, Field, create_model
 
 from llgraph.config.mcp_config import McpServerConfig, McpSettings, format_mcp_summary
 from llgraph.permissions.mcp import is_write_mcp_tool
 
 logger = logging.getLogger(__name__)
+
+# Server / 工具中文备注（展示给 Agent 与 Web「工具」页）
+_MCP_SERVER_ZH: dict[str, str] = {
+    "mysql-biz": "业务库测试环境（内网 MySQL，只读）",
+    "mysql-bigdata": "大数据平台测试库（PolarDB MySQL，只读）",
+    "mysql": "MySQL 数据库（只读）",
+    "postgres": "PostgreSQL 数据库",
+    "filesystem": "工作区文件系统",
+}
+
+_MCP_TOOL_ZH: dict[str, str] = {
+    "mysql_query": "执行 SQL 查询；多库模式请用「库名.表名」，勿写库",
+    "query": "执行 SQL 查询",
+    "read_query": "执行只读 SQL 查询",
+    "read_file": "读取文件内容",
+    "read_text_file": "读取文本文件",
+    "list_directory": "列出目录下的文件与子目录",
+    "directory_tree": "查看目录树结构",
+    "search_files": "按名称搜索文件",
+    "get_file_info": "查看文件元信息",
+    "list_allowed_directories": "列出允许访问的根目录",
+}
+
+
+def mcp_zh_note(server_name: str, tool_name: str) -> str:
+    """
+    生成 MCP 工具中文备注。
+
+    @param server_name MCP Server 名
+    @param tool_name 原始工具名
+    @return 中文说明一行
+    """
+    srv = _MCP_SERVER_ZH.get(server_name, f"外部 MCP「{server_name}」")
+    tool = _MCP_TOOL_ZH.get(tool_name, f"调用工具「{tool_name}」")
+    return f"{srv} · {tool}"
+
+
+def _json_type_to_python(type_name: object) -> type:
+    if type_name == "integer":
+        return int
+    if type_name == "number":
+        return float
+    if type_name == "boolean":
+        return bool
+    if type_name == "object":
+        return dict
+    if type_name == "array":
+        return list
+    return str
+
+
+def _mcp_input_schema_to_model(
+    lc_name: str, input_schema: dict[str, Any]
+) -> type[BaseModel] | None:
+    """
+    将 MCP inputSchema 转为 Pydantic 入参模型，便于模型直接传 sql 等字段。
+
+    @param lc_name LangChain 工具名
+    @param input_schema MCP JSON Schema
+    @return 模型类；无法解析时返回 None（回退 arguments_json）
+    """
+    props = input_schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return None
+    required = {
+        str(x) for x in (input_schema.get("required") or []) if isinstance(x, str)
+    }
+    fields: dict[str, Any] = {}
+    for key, spec in props.items():
+        key_s = str(key)
+        if not isinstance(spec, dict):
+            spec = {}
+        typ = _json_type_to_python(spec.get("type"))
+        desc = str(spec.get("description") or key_s)
+        if key_s in required:
+            fields[key_s] = (typ, Field(description=desc))
+        else:
+            fields[key_s] = (typ | None, Field(default=None, description=desc))
+    if not fields:
+        return None
+    safe = "".join(c if c.isalnum() else "_" for c in lc_name)[:48] or "McpTool"
+    return create_model(f"McpArgs_{safe}", **fields)  # type: ignore[call-overload]
+
+
+class _McpArgumentsJson(BaseModel):
+    """无结构化 schema 时的回退入参。"""
+
+    arguments_json: str = Field(
+        default="{}",
+        description="工具参数的 JSON 对象字符串，例如 {\"sql\":\"SELECT 1\"}",
+    )
 
 
 class _McpServerRuntime:
@@ -37,10 +129,18 @@ class _McpServerRuntime:
 
         @return 是否成功
         """
-        self._thread = threading.Thread(target=self._thread_main, name=f"mcp-{self.config.name}", daemon=True)
+        self._thread = threading.Thread(
+            target=self._thread_main, name=f"mcp-{self.config.name}", daemon=True
+        )
         self._thread.start()
-        if not self._ready.wait(timeout=self.timeout_sec + 10):
-            self._error = "连接超时"
+        # 连接等待与 call_tool 超时分离：避免内网不通时卡满 timeout_sec（如 90s）
+        connect_wait = min(max(5.0, self.timeout_sec), 25.0) + 5.0
+        if not self._ready.wait(timeout=connect_wait):
+            self._error = f"连接超时（>{connect_wait:.0f}s）"
+            try:
+                self.stop()
+            except Exception:
+                pass
             return False
         return self._error is None
 
@@ -52,17 +152,41 @@ class _McpServerRuntime:
         except Exception as exc:
             self._error = str(exc)
             logger.exception("MCP %s 连接失败", self.config.name)
-        finally:
             self._ready.set()
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+            self._loop = None
+            return
+
+        # 连接成功后必须 run_forever，否则 call_tool 无法投递协程
+        self._ready.set()
+        try:
+            self._loop.run_forever()
+        finally:
+            try:
+                self._loop.run_until_complete(self._shutdown_async())
+            except Exception:
+                pass
+            try:
+                self._loop.close()
+            except Exception:
+                pass
+            self._loop = None
 
     async def _connect(self) -> None:
+        import os
+
         from mcp import ClientSession, StdioServerParameters
         from mcp.client.stdio import stdio_client
 
+        # 合并系统环境，避免只传 WORKSPACE_ROOT 时丢掉 PATH 导致 npx 失败
+        env = {**os.environ, **(self.config.env or {})}
         params = StdioServerParameters(
             command=self.config.command,
             args=self.config.args,
-            env=self.config.env or None,
+            env=env,
             cwd=self.config.cwd,
         )
         self._stdio_ctx = stdio_client(params)
@@ -72,6 +196,20 @@ class _McpServerRuntime:
         await self._session.initialize()
         listed = await self._session.list_tools()
         self._tools = list(listed.tools)
+
+    async def _shutdown_async(self) -> None:
+        if self._session is not None:
+            try:
+                await self._session.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._session = None
+        if self._stdio_ctx is not None:
+            try:
+                await self._stdio_ctx.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._stdio_ctx = None
 
     def list_tools(self) -> list[Any]:
         """返回 MCP 工具定义列表。"""
@@ -110,30 +248,24 @@ class _McpServerRuntime:
 
     def stop(self) -> None:
         """关闭会话与子进程。"""
-        if self._loop is None:
-            return
         loop = self._loop
         thread = self._thread
-        self._loop = None
-        self._thread = None
+        if loop is None:
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=1.5)
+            self._thread = None
+            return
 
-        async def _shutdown() -> None:
-            if self._session is not None:
-                await self._session.__aexit__(None, None, None)
-            if self._stdio_ctx is not None:
-                await self._stdio_ctx.__aexit__(None, None, None)
-
-        try:
-            fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
-            fut.result(timeout=2)
-        except Exception:
-            pass
         try:
             loop.call_soon_threadsafe(loop.stop)
         except Exception:
             pass
         if thread is not None and thread.is_alive():
-            thread.join(timeout=1.5)
+            thread.join(timeout=3.0)
+        self._thread = None
+        self._loop = None
+        self._session = None
+        self._stdio_ctx = None
 
 
 class McpToolRegistry:
@@ -145,38 +277,64 @@ class McpToolRegistry:
         self._langchain_tools: list[StructuredTool] = []
         self._load_errors: list[str] = []
 
+    @property
+    def load_errors(self) -> list[str]:
+        """各 Server 加载失败原因。"""
+        return list(self._load_errors)
+
     def start(self) -> None:
-        """连接所有已启用 Server 并注册工具。"""
+        """
+        连接所有已启用 Server 并注册工具。
+
+        单个 Server 失败只跳过该 Server，不影响其它 Server 与主流程。
+        """
         for cfg in self.settings.servers:
-            runtime = _McpServerRuntime(cfg, timeout_sec=self.settings.timeout_sec)
-            if not runtime.start():
-                msg = runtime._error or "未知错误"
-                self._load_errors.append(f"{cfg.name}: {msg}")
-                runtime.stop()
-                continue
-            self._runtimes[cfg.name] = runtime
-            self._langchain_tools.extend(
-                self._build_tools_for_server(cfg.name, runtime)
-            )
+            runtime: _McpServerRuntime | None = None
+            try:
+                runtime = _McpServerRuntime(cfg, timeout_sec=self.settings.timeout_sec)
+                if not runtime.start():
+                    msg = runtime._error or "未知错误"
+                    self._load_errors.append(f"{cfg.name}: {msg}")
+                    runtime.stop()
+                    continue
+                tools = self._build_tools_for_server(cfg.name, runtime)
+                self._runtimes[cfg.name] = runtime
+                self._langchain_tools.extend(tools)
+                runtime = None  # 所有权已转入 registry
+            except Exception as exc:
+                logger.warning("MCP Server %s 加载失败（已跳过）: %s", cfg.name, exc)
+                self._load_errors.append(f"{cfg.name}: {exc}")
+                if runtime is not None:
+                    try:
+                        runtime.stop()
+                    except Exception:
+                        pass
 
     def stop(self) -> None:
         """关闭所有 MCP 连接。"""
         for runtime in self._runtimes.values():
-            runtime.stop()
+            try:
+                runtime.stop()
+            except Exception:
+                pass
         self._runtimes.clear()
         self._langchain_tools.clear()
 
     def get_tools(self) -> list[StructuredTool]:
-        """已注册的 LangChain 工具。"""
+        """已注册的 LangChain 工具（仅加载成功的 Server）。"""
         return list(self._langchain_tools)
 
     def summary(self) -> str:
         """加载摘要。"""
+        ok = len(self._runtimes)
+        total = len(self.settings.servers)
         base = format_mcp_summary(self.settings)
         if self._langchain_tools:
-            base += f"\n  工具数: {len(self._langchain_tools)}"
+            base += f"\n  已加载: {ok}/{total} Server，工具数 {len(self._langchain_tools)}"
+        elif total:
+            base += f"\n  已加载: 0/{total} Server（失败已跳过，不影响其它功能）"
         for err in self._load_errors:
-            base += f"\n  [失败] {err}"
+            base += f"\n  [跳过] {err}"
         return base
 
     def _build_tools_for_server(
@@ -206,11 +364,42 @@ class McpToolRegistry:
                     schema_text = json.dumps(input_schema, ensure_ascii=False)[:1500]
                 except TypeError:
                     schema_text = str(input_schema)[:1500]
-            full_desc = f"[MCP:{server_name}] {desc}"
+            full_desc = (
+                f"【中文说明】{mcp_zh_note(server_name, name)}\n"
+                f"[MCP:{server_name}] {desc}"
+            )
             if schema_text:
                 full_desc += f"\n参数 JSON Schema: {schema_text}"
 
-            def make_func(tname: str, rt: _McpServerRuntime):
+            args_model = (
+                _mcp_input_schema_to_model(lc_name, input_schema)
+                if isinstance(input_schema, dict)
+                else None
+            )
+
+            def make_structured(tname: str, rt: _McpServerRuntime):
+                def _invoke(**kwargs: Any) -> str:
+                    """按 MCP schema 字段调用工具。"""
+                    args = {
+                        k: v
+                        for k, v in kwargs.items()
+                        if v is not None and k != "arguments_json"
+                    }
+                    # 兼容旧调用：仅传 arguments_json
+                    raw = kwargs.get("arguments_json")
+                    if not args and isinstance(raw, str):
+                        try:
+                            parsed = json.loads(raw.strip() or "{}")
+                        except json.JSONDecodeError as exc:
+                            return f"arguments_json 不是合法 JSON: {exc}"
+                        if not isinstance(parsed, dict):
+                            return "arguments_json 须为 JSON 对象"
+                        args = parsed
+                    return rt.call_tool_sync(tname, args)
+
+                return _invoke
+
+            def make_json_blob(tname: str, rt: _McpServerRuntime):
                 def _invoke(arguments_json: str = "{}") -> str:
                     """
                     调用 MCP 工具。
@@ -218,7 +407,11 @@ class McpToolRegistry:
                     @param arguments_json 工具参数的 JSON 对象字符串
                     """
                     try:
-                        args = json.loads(arguments_json) if arguments_json.strip() else {}
+                        args = (
+                            json.loads(arguments_json)
+                            if arguments_json and arguments_json.strip()
+                            else {}
+                        )
                     except json.JSONDecodeError as exc:
                         return f"arguments_json 不是合法 JSON: {exc}"
                     if not isinstance(args, dict):
@@ -227,12 +420,20 @@ class McpToolRegistry:
 
                 return _invoke
 
-            func = make_func(name, runtime)
-            tool = StructuredTool.from_function(
-                func=func,
-                name=lc_name[:64],
-                description=full_desc[:4000],
-            )
+            if args_model is not None:
+                tool = StructuredTool.from_function(
+                    func=make_structured(name, runtime),
+                    name=lc_name[:64],
+                    description=full_desc[:4000],
+                    args_schema=args_model,
+                )
+            else:
+                tool = StructuredTool.from_function(
+                    func=make_json_blob(name, runtime),
+                    name=lc_name[:64],
+                    description=full_desc[:4000],
+                    args_schema=_McpArgumentsJson,
+                )
             tools.append(tool)
         return tools
 
@@ -265,11 +466,22 @@ def create_mcp_tools(
     """
     启动 MCP 并返回 LangChain 工具。
 
+    加载失败不抛异常：返回已成功的工具；全部失败则工具列表为空。
+
     @param settings MCP 配置
-    @return (tools, registry) registry 用于退出时 stop
+    @return (tools, registry) registry 用于退出时 stop；无 server 时为 None
     """
     if not settings.servers:
         return [], None
     registry = McpToolRegistry(settings)
-    registry.start()
+    try:
+        registry.start()
+    except Exception as exc:
+        logger.exception("MCP 整体加载异常（已降级为空工具）: %s", exc)
+        registry._load_errors.append(f"(整体) {exc}")
+        try:
+            registry.stop()
+        except Exception:
+            pass
+        return [], registry
     return registry.get_tools(), registry

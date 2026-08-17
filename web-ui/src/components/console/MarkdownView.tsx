@@ -2,31 +2,15 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Children, isValidElement, type ReactNode } from 'react';
 import { contentToText } from '../../utils/format';
+import { normalizeMarkdownForRender } from '../../utils/markdownNormalize';
 import MermaidChart from './MermaidChart';
 import MarkdownCodeBlock from './MarkdownCodeBlock';
 
 interface Props {
   content: string;
   className?: string;
-}
-
-/** GFM 表格后若无空行，后续段落会被 remark-gfm 吃进 table。 */
-function ensureBlankLineAfterMarkdownTables(text: string): string {
-  const lines = text.split('\n');
-  const isTableLine = (line: string) => {
-    const t = line.trim();
-    return t.startsWith('|') && t.endsWith('|');
-  };
-  const out: string[] = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const prev = i > 0 ? lines[i - 1] : '';
-    if (line.trim() && !isTableLine(line) && isTableLine(prev)) {
-      out.push('');
-    }
-    out.push(line);
-  }
-  return out.join('\n');
+  /** 流式输出：容忍尾部不完整块，并做增量友好归一化 */
+  streaming?: boolean;
 }
 
 function extractMermaidSource(children: ReactNode): string | null {
@@ -67,11 +51,11 @@ const markdownComponents = {
   ),
 };
 
-export default function MarkdownView({ content, className = '' }: Props) {
+export default function MarkdownView({ content, className = '', streaming = false }: Props) {
   if (!content.trim()) {
     return null;
   }
-  const normalized = ensureBlankLineAfterMarkdownTables(content);
+  const normalized = normalizeMarkdownForRender(content, { streaming });
   return (
     <div className={`markdown-body ${className}`}>
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>

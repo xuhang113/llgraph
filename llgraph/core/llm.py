@@ -60,6 +60,9 @@ def create_gateway_llm(workspace: Path | None = None) -> ChatAnthropic:
     ws = _Path(workspace).expanduser().resolve() if workspace is not None else None
     llm_cfg = resolve_llm_settings(ws)
     thinking_payload = resolve_model_thinking_payload(ws, llm_cfg.model)
+    from llgraph.core.model_thinking import split_thinking_payload
+
+    thinking_body, thinking_effort = split_thinking_payload(thinking_payload)
     # 不显式传 temperature：部分网关对 temperature=0.2 会返回 400
     llm_kwargs: dict = {
         "model": llm_cfg.model,
@@ -67,8 +70,11 @@ def create_gateway_llm(workspace: Path | None = None) -> ChatAnthropic:
         "base_url": settings["base_url"],
         "max_tokens": llm_cfg.max_tokens,
     }
-    if thinking_payload is not None:
-        llm_kwargs["thinking"] = thinking_payload
+    if thinking_body is not None:
+        llm_kwargs["thinking"] = thinking_body
+    if thinking_effort:
+        # Claude adaptive：effort 必须在 output_config，langchain 用顶层 effort 参数
+        llm_kwargs["effort"] = thinking_effort
     # 单次模型 HTTP 超时，避免网关无响应时 Web 会话永久占锁
     llm_kwargs["timeout"] = float(llm_cfg.request_timeout_sec)
     llm = ChatAnthropic(**llm_kwargs)

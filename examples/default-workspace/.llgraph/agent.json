@@ -19,21 +19,19 @@
     "failures_before_hint": 2
   },
   "agent": {
-    "max_turns": 500
+    "max_turns": 100,
+    "batch_tools_nudge_after": 3,
+    "investigate": {
+      "guard_parallel_when_literals": true,
+      "outline_gate": false,
+      "soft_close_after_rounds": 20
+    }
   },
   "context": {
     "_docs": {
-      "compress_strategy": "auto | legacy | cursor(已废弃,等同auto)。auto=远早对话LLM摘要+出站按token自动扩展user轮；legacy=按keep_recent_turns保留尾段。",
-      "dispatch_keep_user_turns": "0=自动扩展出站轮数；>0=固定保留N个user轮。",
-      "dispatch_min_user_turns": "自动出站至少保留user轮数，默认2",
-      "dispatch_max_user_turns": "自动出站最多保留user轮数，默认8",
-      "dispatch_window_token_ratio": "自动出站历史可用上下文比例，默认0.35"
+      "compress_strategy": "auto | legacy | cursor(已废弃,等同auto)。auto=接近满窗LLM摘要；出站不裁user轮，超长工具结果指针/预览；legacy=按keep_recent_turns保留尾段。"
     },
     "compress_strategy": "auto",
-    "dispatch_keep_user_turns": 0,
-    "dispatch_min_user_turns": 2,
-    "dispatch_max_user_turns": 8,
-    "dispatch_window_token_ratio": 0.35,
     "compress_during_react": true,
     "budget_source": "model",
     "context_fallback_max_tokens": 200000,
@@ -48,8 +46,6 @@
     "tool_prune_token_ratio": 0.7,
     "spill_hit_context_lines": 100,
     "dispatch_dedupe_read_paths": true,
-    "dispatch_min_tool_rounds": 12,
-    "dispatch_min_user_turns": 1,
     "keep_recent_turns": 2,
     "keep_recent_token_ratio": 0.25,
     "compress_model": null,

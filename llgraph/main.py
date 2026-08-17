@@ -476,6 +476,14 @@ def main() -> None:
     )
     attach_watch_shutdown(watch_service)
 
+    from llgraph.memory.scheduler import (
+        attach_memory_scheduler_shutdown,
+        start_memory_consolidate_scheduler,
+    )
+
+    start_memory_consolidate_scheduler()
+    attach_memory_scheduler_shutdown()
+
     from llgraph.context.context_spill import ContextSpill
 
     edit_tracker: SessionEditTracker | None = None

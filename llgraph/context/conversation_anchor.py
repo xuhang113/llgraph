@@ -52,6 +52,11 @@ _SEMANTIC_SECTION_KEYS = (
 )
 
 _SESSION_GOAL_MAX_CHARS = 4_000
+_DECISIONS_MAX_CHARS = 12_000
+_ASSISTANT_SUBSTANTIVE_MIN_CHARS = 400
+_ASSISTANT_BULLET_EXTRACT_MIN_CHARS = 80
+_DECISIONS_FALLBACK_BULLET_MAX = 24
+_DECISIONS_FALLBACK_EXCERPT_CHARS = 600
 
 
 def _system_message_text(msg: BaseMessage) -> str:
@@ -202,6 +207,8 @@ def format_anchor_system_message(sections: dict[str, str], *, anchor_path: str) 
     lines.append(
         "需要逐条对话、完整 tool 输出时：read_file manifest 的 archive_path（完整对话归档文件）；"
         "大工具结果见 spill_dir；可用 search_session_history 按关键词检索历史。"
+        "若用户追问压缩前的调研结论/对比/细节，且锚点 decisions 不足，必须先 search_session_history，"
+        "禁止凭猜测续答。"
     )
     lines.append("</conversation-anchor>")
     return "\n".join(lines).strip()
@@ -408,11 +415,109 @@ def _summarize_prompt_header() -> str:
         "session_goal, files_modified, decisions, errors_resolved, detail_pointers。"
         "每个值为中文字符串；无信息则空字符串。"
         "必须保留：用户目标、已改文件路径、关键决策与结论、错误根因；禁止编造。"
-        "若本段含用户消息，session_goal 不得为空，须用 1～3 句概括用户核心诉求。"
+        "若本段含用户消息，session_goal 不得为空，须用 1～3 句概括用户核心诉求（勿粘贴 assistant 长文）。"
         "files_modified 须为列表行，每行 `- 相对路径: 说明`（仅真实改动，勿列对话提及路径）。"
-        "重要结论与后续方案写入 decisions；detail_pointers 可写需回查 archive/spill 的说明。"
+        "decisions 必填（assistant 有实质回复时不可空）：从 assistant 回复提炼关键结论、对比、定义、"
+        "架构说明、方案取舍、列表要点；纯调研/问答且无代码改动时，仍须写入 5～20 条 `- ` 列表。"
+        "禁止只保留 session_goal 而丢弃 assistant 正文；错误根因写入 errors_resolved。"
+        "detail_pointers 可写需回查 archive/spill 的说明。"
         "禁止输出 pending_tasks、related_code 或 markdown 代码块，仅输出 JSON。"
     )
+
+
+def _decisions_only_prompt_header() -> str:
+    return (
+        "你是 coding agent 的会话压缩器。本段 assistant 有实质回答，但 decisions 缺失或过薄。"
+        "只输出一个 JSON 对象，键必须且仅能包含：decisions（中文字符串）。"
+        "从 assistant 回复提炼 5～20 条 `- ` 列表：关键结论、对比、定义、方案、注意事项；禁止编造。"
+        "禁止输出 markdown 代码块，仅输出 JSON。"
+    )
+
+
+def _assistant_visible_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "".join(parts).strip()
+    return str(content or "").strip()
+
+
+def _assistant_visible_chars(messages: list[BaseMessage]) -> int:
+    total = 0
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            continue
+        total += len(_assistant_visible_text(getattr(msg, "content", "")))
+    return total
+
+
+def _decisions_min_chars_for_span(span_messages: list[BaseMessage]) -> int:
+    assistant_chars = _assistant_visible_chars(span_messages)
+    if assistant_chars < _ASSISTANT_SUBSTANTIVE_MIN_CHARS:
+        return 0
+    return min(1_200, max(200, assistant_chars // 15))
+
+
+def _decisions_needs_enrichment(delta: dict[str, str], span_messages: list[BaseMessage]) -> bool:
+    min_chars = _decisions_min_chars_for_span(span_messages)
+    if min_chars <= 0:
+        return False
+    decisions = (delta.get(SECTION_DECISIONS) or "").strip()
+    return len(decisions) < min_chars
+
+
+def _fallback_decisions_from_assistant(messages: list[BaseMessage]) -> str:
+    """
+    LLM 摘要未写出 decisions 时，从 assistant 回复机械提取要点（兜底，非替代智能摘要）。
+
+    @param messages 待压缩段或上下文消息
+    @return decisions 章节正文
+    """
+    bullets: list[str] = []
+    seen: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, AIMessage):
+            continue
+        text = _assistant_visible_text(getattr(msg, "content", ""))
+        if len(text) < _ASSISTANT_BULLET_EXTRACT_MIN_CHARS:
+            continue
+        extracted = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("## ", "### ", "#### ")):
+                item = stripped.lstrip("#").strip()
+            elif re.match(r"^[-*•]\s+", stripped):
+                item = re.sub(r"^[-*•]\s+", "- ", stripped)
+            elif re.match(r"^\d+[.)]\s+", stripped):
+                item = f"- {re.sub(r'^\d+[.)]\s+', '', stripped)}"
+            else:
+                continue
+            item = item[:500].strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            bullets.append(item if item.startswith("- ") else f"- {item}")
+            extracted = True
+            if len(bullets) >= _DECISIONS_FALLBACK_BULLET_MAX:
+                break
+        if not extracted and len(text) >= _ASSISTANT_SUBSTANTIVE_MIN_CHARS:
+            excerpt = " ".join(text.split())
+            excerpt = excerpt[:_DECISIONS_FALLBACK_EXCERPT_CHARS].strip()
+            if excerpt and excerpt not in seen:
+                seen.add(excerpt)
+                bullets.append(f"- （助手回复要点）{excerpt}")
+        if len(bullets) >= _DECISIONS_FALLBACK_BULLET_MAX:
+            break
+    body = "\n".join(bullets)
+    return body[:_DECISIONS_MAX_CHARS]
 
 
 def _invoke_anchor_summary_llm(
@@ -532,6 +637,27 @@ def summarize_span_to_anchor_delta(
         )
         if _delta_has_semantic_content(retry_delta):
             delta = merge_anchor_sections(delta, retry_delta)
+
+    if _decisions_needs_enrichment(delta, span_messages):
+        decisions_prompt = [
+            _decisions_only_prompt_header(),
+            "",
+            f"已有锚点：\n{existing_preview}",
+            f"\n本段对话：\n{_messages_to_transcript(span_messages)}",
+        ]
+        decisions_delta = _invoke_anchor_summary_llm(
+            workspace,
+            "\n".join(decisions_prompt),
+            model_name=model_name,
+        )
+        decisions_text = (decisions_delta.get(SECTION_DECISIONS) or "").strip()
+        if decisions_text:
+            delta = merge_anchor_sections(delta, {SECTION_DECISIONS: decisions_text})
+
+    if _decisions_needs_enrichment(delta, span_messages):
+        fallback = _fallback_decisions_from_assistant(span_messages)
+        if fallback.strip():
+            delta = merge_anchor_sections(delta, {SECTION_DECISIONS: fallback})
     return delta
 
 
@@ -674,6 +800,11 @@ def ensure_anchor_sections_minimum(
     ).strip():
         if user_texts:
             result[SECTION_SESSION_GOAL] = user_texts[0][:_SESSION_GOAL_MAX_CHARS]
+
+    if not (result.get(SECTION_DECISIONS) or "").strip() and sources:
+        fallback = _fallback_decisions_from_assistant(sources)
+        if fallback.strip():
+            result[SECTION_DECISIONS] = fallback
 
     return result
 

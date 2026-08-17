@@ -14,6 +14,7 @@ from llgraph.core.user_message_content import (
     StoredImageRef,
     build_image_ref_block,
     extract_text_from_human_content,
+    human_content_has_image_refs,
     human_content_has_inline_images,
     image_ref_block_from_stored,
     strip_inline_image_blocks,
@@ -168,7 +169,10 @@ def canonicalize_messages_image_refs(
     turn_image_refs: list[StoredImageRef] | None,
 ) -> list[BaseMessage]:
     """
-    轮次结束后：最后一条含内联图的 user 消息改为 image_ref；其余去掉残留内联图。
+    轮次结束后：将本轮含内联图的真实用户消息改为 image_ref；其余去掉残留内联图。
+
+    不能用「任意最后一条 Human」——think_nudge / soft_close 等 ephemeral
+    常排在用户图之后，否则会剥光内联图却不写 image_ref。
 
     @param messages Agent 消息列表
     @param turn_image_refs 本轮新保存的附件
@@ -176,22 +180,36 @@ def canonicalize_messages_image_refs(
     """
     if not messages:
         return messages
-    last_human_idx = -1
+
+    from llgraph.context.investigate_harness import is_ephemeral_harness_human
+
+    target_idx = -1
+    # 优先：最后一条含内联图的 Human（真实用户图）
     for idx, msg in enumerate(messages):
-        if isinstance(msg, HumanMessage):
-            last_human_idx = idx
+        if not isinstance(msg, HumanMessage):
+            continue
+        if human_content_has_inline_images(getattr(msg, "content", "")):
+            target_idx = idx
+    # 兜底：内联图已被剥，但仍有本轮 refs → 挂到最后一条非 ephemeral Human
+    if target_idx < 0 and turn_image_refs:
+        for idx, msg in enumerate(messages):
+            if isinstance(msg, HumanMessage) and not is_ephemeral_harness_human(msg):
+                target_idx = idx
+
     out: list[BaseMessage] = []
     for idx, msg in enumerate(messages):
         if not isinstance(msg, HumanMessage):
             out.append(msg)
             continue
         content = getattr(msg, "content", "")
-        if (
-            idx == last_human_idx
-            and turn_image_refs
-            and human_content_has_inline_images(content)
-        ):
-            new_content = replace_human_inline_images_with_refs(content, turn_image_refs)
+        if idx == target_idx and turn_image_refs:
+            if human_content_has_inline_images(content):
+                new_content = replace_human_inline_images_with_refs(content, turn_image_refs)
+            elif not human_content_has_image_refs(content):
+                # 内联已丢：把 image_ref 补回该用户消息
+                new_content = replace_human_inline_images_with_refs(content, turn_image_refs)
+            else:
+                new_content = content
             out.append(msg.model_copy(update={"content": new_content}))
             continue
         if human_content_has_inline_images(content):

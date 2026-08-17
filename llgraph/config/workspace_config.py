@@ -63,13 +63,13 @@ def init_user_llgraph(*, force: bool = False) -> list[str]:
     @param force 为 True 时覆盖已存在的同名文件
     @return 已复制/更新的相对路径列表
     """
-    from llgraph.core.agent_config import USER_LLGRAPH_HOME
+    from llgraph.core.agent_config import user_llgraph_home
 
     src = package_user_config_dir()
     if not src.is_dir():
         raise FileNotFoundError(f"缺少用户配置模板: {src}")
 
-    dest_root = USER_LLGRAPH_HOME
+    dest_root = user_llgraph_home()
     copied: list[str] = []
 
     for src_file in sorted(src.rglob("*")):

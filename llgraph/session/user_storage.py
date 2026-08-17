@@ -1,4 +1,4 @@
-"""用户级存储路径（~/.llgraph/context，按工作区目录隔离）。"""
+"""用户级存储路径（~/.llgraph/context，按工作区目录隔离；可由 LLGRAPH_HOME 覆盖）。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import re
 import shutil
 from pathlib import Path
 
-from llgraph.core.agent_config import USER_LLGRAPH_HOME
+from llgraph.core.agent_config import user_llgraph_home
 
 RULES_DIR_NAME = "rules"
 SKILLS_DIR_NAME = "skills"
@@ -27,27 +27,27 @@ def user_rules_dir() -> Path:
     """
     个人规则目录。
 
-    @return ~/.llgraph/rules/
+    @return ~/.llgraph/rules/（或 $LLGRAPH_HOME/rules/）
     """
-    return USER_LLGRAPH_HOME / RULES_DIR_NAME
+    return user_llgraph_home() / RULES_DIR_NAME
 
 
 def user_skills_dir() -> Path:
     """
     个人技能目录。
 
-    @return ~/.llgraph/skills/
+    @return ~/.llgraph/skills/（或 $LLGRAPH_HOME/skills/）
     """
-    return USER_LLGRAPH_HOME / SKILLS_DIR_NAME
+    return user_llgraph_home() / SKILLS_DIR_NAME
 
 
 def user_context_root() -> Path:
     """
     用户级上下文根目录。
 
-    @return ~/.llgraph/context/
+    @return ~/.llgraph/context/（或 $LLGRAPH_HOME/context/）
     """
-    return USER_LLGRAPH_HOME / CONTEXT_DIR_NAME
+    return user_llgraph_home() / CONTEXT_DIR_NAME
 
 
 def is_ephemeral_workspace_path(resolved: str) -> bool:

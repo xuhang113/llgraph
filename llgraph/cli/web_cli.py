@@ -84,5 +84,5 @@ def main(argv: list[str] | None = None) -> None:
         host=args.host,
         port=args.port,
         reload=False,
-        timeout_graceful_shutdown=5,
+        timeout_graceful_shutdown=15,
     )

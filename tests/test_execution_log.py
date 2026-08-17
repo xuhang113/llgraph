@@ -94,3 +94,29 @@ def test_format_execution_record_ts_local_display() -> None:
 
     # UTC 08:09 = 北京时间 16:09（UTC+8）
     assert _format_ts_display("2026-06-28T08:09:13Z").endswith("16:09:13")
+
+
+def test_format_react_phase_signal_and_noise() -> None:
+    end = format_execution_record(
+        {
+            "ts": "2026-07-23T09:48:33Z",
+            "event": "react_phase",
+            "thread_id": "cli-bd757710",
+            "phase": "stream_end",
+            "duration_sec": 568.059,
+            "reason": "complete",
+            "step_count": 14,
+        },
+    )
+    assert "回合结束" in end
+    assert "reason=complete" in end
+    assert "steps=14" in end
+    noise = format_execution_record(
+        {
+            "ts": "2026-07-23T09:47:49Z",
+            "event": "react_phase",
+            "thread_id": "cli-bd757710",
+            "phase": "compress_skip",
+        },
+    )
+    assert noise == ""

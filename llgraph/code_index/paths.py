@@ -9,6 +9,7 @@ TABLE_NAME = "code_chunks"
 MANIFEST_FILENAME = "manifest.json"
 EMBED_CACHE_FILENAME = "embed_cache.db"
 META_FILENAME = "index_meta.json"
+LIVE_PROGRESS_FILENAME = "live_progress.json"
 
 DEFAULT_VECTOR_DIM = 1536
 # 索引存储与检索展示：Cursor 风格极短摘要（路径+行号为主，正文靠 read_file）
@@ -45,6 +46,11 @@ def embed_cache_path(workspace: Path) -> Path:
 def meta_path(workspace: Path) -> Path:
     """索引元信息路径。"""
     return index_root(workspace) / META_FILENAME
+
+
+def live_progress_path(workspace: Path) -> Path:
+    """索引进度实时快照路径（Web 轮询用）。"""
+    return index_root(workspace) / LIVE_PROGRESS_FILENAME
 
 
 def ensure_index_dirs(workspace: Path) -> Path:

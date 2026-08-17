@@ -44,14 +44,54 @@ def load_capabilities(workspace: Path, *, allow_write: bool = False) -> dict[str
     rules = discover_rules(workspace)
     commands = discover_commands(workspace)
 
+    load_errors = list(getattr(rt.mcp_registry, "load_errors", []) or [])
+    error_by_name: dict[str, str] = {}
+    for err in load_errors:
+        if ":" in err:
+            name, _, rest = err.partition(":")
+            error_by_name[name.strip()] = rest.strip()
+        else:
+            error_by_name[err] = err
+    active_servers = set()
+    if rt.mcp_registry is not None:
+        active_servers = set(getattr(rt.mcp_registry, "_runtimes", {}) or {})
+    tool_count_by_server: dict[str, int] = {}
+    for t in rt.mcp_tools:
+        tname = getattr(t, "name", "") or ""
+        # mcp__<server>__<tool>
+        parts = tname.split("__")
+        if len(parts) >= 3 and parts[0] == "mcp":
+            srv = parts[1]
+            tool_count_by_server[srv] = tool_count_by_server.get(srv, 0) + 1
+
+    mcp_servers_out: list[dict[str, Any]] = []
+    for s in mcp_cfg.servers if mcp_cfg else []:
+        if s.name in active_servers:
+            status = "ok"
+        elif s.name in error_by_name:
+            status = "error"
+        elif not getattr(rt, "mcp_ready", None) or not rt.mcp_ready.is_set():
+            status = "loading"
+        else:
+            status = "error" if load_errors else "idle"
+        mcp_servers_out.append(
+            {
+                "name": s.name,
+                "command": s.command,
+                "enabled": s.enabled,
+                "status": status,
+                "error": error_by_name.get(s.name),
+                "tool_count": tool_count_by_server.get(s.name, 0),
+            }
+        )
+
     return {
         "builtin_tools": [_tool_info(t) for t in builtin],
         "mcp_tools": [_tool_info(t) for t in rt.mcp_tools],
         "mcp_summary": rt.mcp_summary,
-        "mcp_servers": [
-            {"name": s.name, "command": s.command, "enabled": s.enabled}
-            for s in (mcp_cfg.servers if mcp_cfg else [])
-        ],
+        "mcp_errors": load_errors,
+        "mcp_loading": not (getattr(rt, "mcp_ready", None) and rt.mcp_ready.is_set()),
+        "mcp_servers": mcp_servers_out,
         "skills": [
             {
                 "name": s.name,

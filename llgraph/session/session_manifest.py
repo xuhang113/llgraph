@@ -556,11 +556,15 @@ def sync_session_manifest_after_compress(
     )
     manifest_rel = write_session_manifest_json(workspace, thread_id, payload)
     config = {"configurable": {"thread_id": thread_id}}
-    try:
-        state = agent.get_state(config)
-        messages = list((state.values or {}).get("messages") or [])
-    except Exception:
-        return manifest_rel
+    from llgraph.session.session_file_store import load_session_messages
+
+    messages = load_session_messages(workspace, thread_id)
+    if not messages:
+        try:
+            state = agent.get_state(config)
+            messages = list((state.values or {}).get("messages") or [])
+        except Exception:
+            return manifest_rel
 
     manifest_msg = build_session_manifest_message(
         workspace,
@@ -583,7 +587,9 @@ def sync_session_manifest_after_compress(
         new_messages,
     )
     try:
-        agent.update_state(config, {"messages": new_messages})
+        from llgraph.context.context_compressor import replace_agent_messages
+
+        replace_agent_messages(agent, config, new_messages)
         from llgraph.session.session_file_store import save_agent_session_messages
 
         save_agent_session_messages(workspace, thread_id, new_messages, sync_pool=True)

@@ -2,20 +2,21 @@ import { useCallback, useRef, useState } from 'react';
 import { api, type MessageItem, type PlanDetail, type TreeNode } from '../api/client';
 import type { ChatMessage } from '../components/console/ChatThread';
 import type { TraceStep } from '../types/trace';
-import { stepsToPanelLogLines } from '../types/trace';
+import { mergeTraceStepsUnique, stepsToPanelLogLines } from '../types/trace';
 import {
   clearPendingUserMessage,
   loadPendingUserMessage,
 } from '../utils/pendingUserMessage';
 import { loadTracePanelCache } from '../utils/tracePanelStore';
 import { getSessionChatCache, setSessionChatCache } from '../utils/sessionChatCache';
+import { hydrateChatMessageImages } from '../utils/chatAttachmentUrl';
+import { preferRicherAgentChat } from '../utils/fetchEnrichedAgentChat';
 import {
   dedupeConsecutiveUserMessages,
   dedupeUserMessages,
-  mergeChatWithPendingUserMessages,
+  finalizeAgentHistoryChat,
   parseAgentHistoryMessages,
   mergeRunningSessionMessages,
-  enrichChatWithTraceReplies,
   userMessageAlreadyInChat,
 } from '../utils/messageText';
 import { buildPlanChatMessages } from '../utils/planChat';
@@ -27,6 +28,7 @@ import {
   loadTraceTurnsFromRemote,
   panelLinesFromTexts,
   parseTraceStep,
+  parseTraceSteps,
   parseTraceTurnsFromRemote,
   preferRicherTraceCache,
   releaseTurnOpen,
@@ -121,8 +123,9 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
       setHistoryLoading(true);
 
       try {
-      if (node.kind === 'agent') {
-        const sessionAllowWrite = readStoredAllowWrite();
+      if (node.kind === 'agent' || node.kind === 'subagent') {
+        const sessionAllowWrite =
+          node.kind === 'subagent' ? false : readStoredAllowWrite();
         if (!isCurrent()) {
           return;
         }
@@ -138,6 +141,7 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
             }
             setCaps(capsData);
             if (
+              node.kind === 'agent' &&
               readStoredSandboxEnabled() &&
               capsData.sandbox &&
               !capsData.sandbox.enabled &&
@@ -178,8 +182,9 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
         let panelLines: TraceLine[] = [];
         let panelSteps: TraceStep[] = [];
         let panelTurns: import('../types/trace').TraceTurn[] = [];
+        let enrichSteps: TraceStep[] = [];
         try {
-          const remote = await api.lastTrace(slug, node.thread_id);
+          const remote = await api.sessionTrace(slug, node.thread_id);
           const loaded = loadTraceTurnsFromRemote(remote);
           panelTurns = loaded.completed;
           panelSteps = loaded.currentSteps;
@@ -188,6 +193,11 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
           } else if (panelSteps.length > 0) {
             panelLines = stepsToPanelLogLines(panelSteps);
           }
+          // enrich 专用：合并视图 steps + 各轮 steps（勿写回 panelSteps，否则 idle 会把历史步塞进「当前轮」）
+          enrichSteps = mergeTraceStepsUnique(
+            mergeTraceStepsUnique(panelSteps, parseTraceSteps(remote.steps)),
+            panelTurns.flatMap((t) => t.steps),
+          );
         } catch {
           /* 无落盘 trace 时走缓存 */
         }
@@ -217,22 +227,18 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
           }
         }
         let traceTurnsForEnrich = panelTurns;
-        let traceStepsForEnrich = panelSteps;
+        let traceStepsForEnrich = mergeTraceStepsUnique(enrichSteps, panelSteps);
         if (traceTurnsForEnrich.length === 0 && traceStepsForEnrich.length > 0) {
           traceTurnsForEnrich = parseTraceTurnsFromRemote(undefined, traceStepsForEnrich);
-          traceStepsForEnrich = [];
         }
         const chatMerged = dedupeUserMessages(
           dedupeConsecutiveUserMessages(
-            enrichChatWithTraceReplies(
-              mergeChatWithPendingUserMessages(parsed, {
-                traceLines: sessionRunning ? panelLines.map((l) => l.text) : [],
-                pendingText: pendingUser,
-                allowTraceUser: sessionRunning,
-              }),
-              traceStepsForEnrich,
-              traceTurnsForEnrich,
-            ),
+            finalizeAgentHistoryChat(parsed, {
+              traceLines: panelLines.map((l) => l.text),
+              traceTurns: traceTurnsForEnrich,
+              traceSteps: traceStepsForEnrich,
+              pendingText: pendingUser,
+            }),
           ),
         );
         if (pendingUser && userMessageAlreadyInChat(chatMerged, pendingUser)) {
@@ -252,15 +258,21 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
         traceStepsRef.current = [];
         if (sessionRunning) {
           const cached = getSessionChatCache(slug, node.thread_id);
-          const finalMessages = mergeRunningSessionMessages(cached, chatMerged);
-          setMessages(finalMessages);
+          const finalMessages = hydrateChatMessageImages(
+            mergeRunningSessionMessages(cached, chatMerged),
+            slug,
+            node.thread_id,
+          );
+          setMessages((prev) => preferRicherAgentChat(prev, finalMessages));
           setSessionChatCache(slug, node.thread_id, finalMessages);
         } else {
-          setMessages(chatMerged);
-          setSessionChatCache(slug, node.thread_id, chatMerged);
+          const hydrated = hydrateChatMessageImages(chatMerged, slug, node.thread_id);
+          setMessages((prev) => preferRicherAgentChat(prev, hydrated));
+          setSessionChatCache(slug, node.thread_id, hydrated);
         }
         bumpContextRefresh();
-        if (panelTurns.length === 0 && panelSteps.length > 0) {
+        if (panelTurns.length === 0 && panelSteps.length > 0 && !sessionRunning) {
+          // idle：整轮收成 completed turn。running 时保持 currentSteps，避免刷新后被 SSE 短回放盖成「第1轮·几步」
           panelTurns = parseTraceTurnsFromRemote(undefined, panelSteps);
           panelSteps = [];
         }
@@ -273,6 +285,10 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
         if (sessionRunning) {
           runningThreadsRef.current.add(node.thread_id);
           turnOpenRef.current.add(node.thread_id);
+          if (panelSteps.length > 0) {
+            setTraceSteps(panelSteps);
+            traceStepsRef.current = panelSteps;
+          }
         }
         setBusy(sessionRunning);
         ensureSessionSubscription(node.thread_id);
@@ -349,7 +365,7 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
         const plannerVer = planPlannerVersion(detail);
         const plannerThread = planPlannerSubThread(node.thread_id, plannerVer);
         try {
-          const remote = await api.lastTrace(slug, plannerThread);
+          const remote = await api.sessionTrace(slug, plannerThread);
           if (remote.steps?.length) {
             panelSteps = remote.steps.map((s) => parseTraceStep(s));
           }
@@ -366,7 +382,7 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
         panelSteps = pickedPlanner.steps;
         if (panelLines.length === 0 && panelSteps.length === 0) {
           try {
-            const remote = await api.lastTrace(slug, node.thread_id);
+            const remote = await api.sessionTrace(slug, node.thread_id);
             if (remote.steps?.length) {
               panelSteps = remote.steps.map((s) => parseTraceStep(s));
             }
@@ -442,7 +458,7 @@ export function useSessionHistory(deps: SessionHistoryDeps) {
         let panelLines = traces;
         let panelSteps = traceSteps;
         try {
-          const remote = await api.lastTrace(slug, node.thread_id);
+          const remote = await api.sessionTrace(slug, node.thread_id);
           if (remote.steps?.length) {
             panelSteps = remote.steps.map((s) => parseTraceStep(s));
           }
