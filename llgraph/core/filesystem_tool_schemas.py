@@ -71,3 +71,39 @@ class ReadFilesInput(BaseModel):
     )
     start_line: int = Field(default=1, description="每个文件的起始行号，从 1 开始")
     end_line: int = Field(default=0, description="每个文件的结束行号（含）；0 表示到末尾")
+
+
+class SearchReplaceHunkInput(BaseModel):
+    """search_replace.replacements 中的单个 hunk。"""
+
+    old_string: str = Field(description="待替换片段")
+    new_string: str = Field(default="", description="替换后文本；空字符串表示删除该片段")
+    replace_all: bool = Field(default=False, description="是否替换该 hunk 的全部命中")
+
+
+class SearchReplaceInput(BaseModel):
+    """search_replace 入参。"""
+
+    path: str = Field(description="相对工作区的文件路径")
+    old_string: str = Field(
+        default="",
+        description="待替换片段；可与 replacements 同时提供（作为第一 hunk）",
+    )
+    new_string: str = Field(default="", description="替换后文本")
+    replace_all: bool = Field(
+        default=False,
+        description="是否替换 old_string 的全部命中；多处且未设 true 时若要求唯一则失败",
+    )
+    replacements: list[SearchReplaceHunkInput] = Field(
+        default_factory=list,
+        description=(
+            "同一文件多个 hunk，按顺序应用（对齐 Codex apply_patch / Cursor 多处编辑）。"
+            "可避免对同一 path 并行多次 search_replace。"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def require_hunk(self) -> SearchReplaceInput:
+        if not (self.old_string or "").strip() and not self.replacements:
+            raise ValueError("必须提供 old_string 或 replacements")
+        return self

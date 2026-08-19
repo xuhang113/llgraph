@@ -36,7 +36,8 @@ tool_selection_summary: |
   - 彼此独立的工具在同一条回复里并行；有依赖的再串行。
 
 edit_hint: |
-  改已有文件优先 `search_replace`。先读使 `old_string` 对齐。新文件用 `write_file`。避免一次写入巨型文档。
+  改已有文件优先 `search_replace`。先读再改。CRLF/缩进/行尾空白/误贴行号前缀会自动对齐。
+  同一文件多处修改用 `replacements=[{old_string,new_string},...]` 一次提交（按顺序）。新文件用 `write_file`。
 
 web_search_hint: |
   公开新鲜信息用 `web_search`；本工作区事实优先本地工具。

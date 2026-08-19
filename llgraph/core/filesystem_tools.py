@@ -12,6 +12,14 @@ from llgraph.core.filesystem_tool_schemas import (
     ListDirectoryInput,
     ReadFileInput,
     ReadFilesInput,
+    SearchReplaceInput,
+)
+from llgraph.core.edit_apply import (
+    EditHunk,
+    apply_edit_hunks,
+    format_apply_failure,
+    format_apply_success,
+    parse_replacements_arg,
 )
 
 from llgraph.config.catalog_paths import resolve_catalog_read_path
@@ -253,8 +261,11 @@ def _read_file_content(
 
 
 SEARCH_REPLACE_TOOL_DESC = (
-    "局部替换工作区文本文件内容（需 -w）。修改已有代码或 Markdown 某一节时优先使用。"
-    "old_string 必须与磁盘完全一致（含缩进）；默认要求唯一匹配。"
+    "局部替换工作区文本文件内容（需 -w）。修改已有代码时优先使用。"
+    "old_string 尽量与磁盘一致；CRLF、行尾空白、缩进偏差、误贴 read_file 行号前缀会自动对齐"
+    "（对齐 Cursor / Claude Code / Codex 改码命中）。"
+    "默认同文件多处须唯一，或 replace_all=true。"
+    "同一文件多处修改优先 replacements=[{old_string,new_string},...] 一次提交，按顺序应用。"
 )
 
 WRITE_FILE_TOOL_DESC = (
@@ -314,31 +325,6 @@ def _chunk_size_hint(content: str, chunk_max_chars: int) -> str:
         f" 提示: 本次 content 长度 {len(content)} 超过建议 {chunk_max_chars}，"
         "后续请用 append_file 或 search_replace 分节写入。"
     )
-
-
-def _hint_lines_for_needle(text: str, needle: str, limit: int = 5) -> str:
-    """
-    old_string 未命中时给出相近行提示。
-
-    @param text 文件全文
-    @param needle 待匹配片段
-    @param limit 最多行数
-    @return 提示文本
-    """
-    if not needle.strip():
-        return ""
-    first_line = needle.split("\n")[0].strip()
-    if len(first_line) < 4:
-        first_line = needle[:40].strip()
-    hints: list[str] = []
-    for idx, line in enumerate(text.splitlines(), 1):
-        if first_line and first_line in line:
-            hints.append(f"  L{idx}: {line[:100]}")
-            if len(hints) >= limit:
-                break
-    if not hints:
-        return ""
-    return "相近行:\n" + "\n".join(hints)
 
 
 def _count_lines(chunk: str) -> int:
@@ -915,17 +901,19 @@ def create_filesystem_tools(
 
     def search_replace(
         path: str,
-        old_string: str,
-        new_string: str,
+        old_string: str = "",
+        new_string: str = "",
         replace_all: bool = False,
+        replacements: list | None = None,
     ) -> str:
         """
         局部替换文件内容（需要 -w）；修改已有代码时优先于 write_file。
 
         @param path 相对工作区的文件路径
-        @param old_string 必须与文件中片段完全一致（含缩进与换行）
+        @param old_string 待替换片段（容错匹配 CRLF/缩进/行尾空白）
         @param new_string 替换后的文本
         @param replace_all 是否替换全部匹配项
+        @param replacements 同一文件多个 hunk，按顺序应用
         """
         ctx.ensure_write_allowed()
         rel = path.strip().lstrip("/")
@@ -939,37 +927,40 @@ def create_filesystem_tools(
             text = target.read_text(encoding="utf-8")
         except OSError as exc:
             return f"读取失败: {exc}"
-        count = text.count(old_string)
-        if count == 0:
-            hint = _hint_lines_for_needle(text, old_string)
-            msg = f"未找到 old_string（0 处匹配）: {rel}"
-            if hint:
-                msg += f"\n{hint}\n请先 read_file 核对缩进与换行。"
-            return msg
-        if edit_cfg.require_unique_match and not replace_all and count != 1:
-            return (
-                f"old_string 在 {rel} 中出现 {count} 次，不唯一。"
-                "请扩大上下文使片段唯一，或设置 replace_all=true。"
+        hunks: list[EditHunk] = []
+        if old_string:
+            hunks.append(
+                EditHunk(
+                    old_string=old_string,
+                    new_string=new_string,
+                    replace_all=replace_all,
+                )
             )
+        hunks.extend(parse_replacements_arg(replacements))
+        if not hunks:
+            return "错误: search_replace 必须提供 old_string 或 replacements"
+        applied = apply_edit_hunks(
+            text,
+            hunks,
+            require_unique=edit_cfg.require_unique_match,
+        )
+        if not applied.ok:
+            return format_apply_failure(rel, applied)
         if edit_tracker is not None:
             edit_tracker.ensure_snapshot(rel)
-        if replace_all:
-            new_text = text.replace(old_string, new_string)
-            replacements = count
-        else:
-            new_text = text.replace(old_string, new_string, 1)
-            replacements = 1
-        target.write_text(new_text, encoding="utf-8")
+        target.write_text(applied.new_text, encoding="utf-8")
+        old_part = "\n".join(h.old_string for h in hunks)
+        new_part = "\n".join(h.new_string for h in hunks)
         _after_write(
             rel,
             "search_replace",
-            replacements=replacements,
-            old_part=old_string,
-            new_part=new_string,
+            replacements=applied.replacements,
+            old_part=old_part,
+            new_part=new_part,
         )
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
-        return f"已替换 {rel}（{replacements} 处）"
+        return format_apply_success(rel, applied)
 
     tools: list = [
         StructuredTool.from_function(
@@ -1025,6 +1016,7 @@ def create_filesystem_tools(
                 func=search_replace,
                 name="search_replace",
                 description=SEARCH_REPLACE_TOOL_DESC,
+                args_schema=SearchReplaceInput,
             ),
             StructuredTool.from_function(
                 func=append_file,

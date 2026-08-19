@@ -12,7 +12,7 @@ react_loop: |
      - **禁止猜 path**；不确定时用 path="." 或 list_directory(".") 核对仓库名；
      - 读代码用 **read_files / read_file 宽段**，禁止同一文件多轮窄 read。
   4. **执行与验证**（{mode}）：
-     - 可写：改前 read_file 局部；已有文件优先 **search_replace**；新建用 write_file。
+     - 可写：改前 read_file 局部；已有文件优先 **search_replace**（同一文件多 hunk 用 replacements 一次提交）；新建用 write_file。
      - 只读：禁止 write_file、append_file、search_replace。
   5. **结束 turn**：最后一轮必须输出**用户可见正文 text**；仅 thinking 或仅 tool_calls 不算完成。
 

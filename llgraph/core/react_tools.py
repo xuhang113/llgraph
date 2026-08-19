@@ -19,6 +19,11 @@ from llgraph.core.tool_invoke_timing import (
     reset_tool_timings,
     wrap_tool_node_with_timing,
 )
+from llgraph.core.write_serialize import (
+    clear_write_serialize_gate,
+    install_write_serialize_gate,
+    wrap_tool_node_with_write_serialize,
+)
 
 _PARALLEL_SEARCH_TOOL = "search_code_parallel"
 
@@ -212,7 +217,8 @@ def build_tool_node(
     workspace: Path | None = None,
 ) -> Callable[..., dict[str, Any]]:
     """
-    包装 LangGraph ToolNode：并行执行 tool_calls，拦截重复 search_code_parallel。
+    包装 LangGraph ToolNode：并行执行 tool_calls，拦截重复 search_code_parallel；
+    同 path 的写工具按 tool_calls 顺序串行，避免并行 search_replace 互相覆盖。
 
     @param tools 工具列表
     @param workspace 工作区根（保留参数以兼容调用方）
@@ -220,6 +226,7 @@ def build_tool_node(
     """
     inner = ToolNode(tools)
     wrap_tool_node_with_timing(inner)
+    wrap_tool_node_with_write_serialize(inner)
 
     def invoke(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
         from llgraph.context.investigate_harness import (
@@ -256,7 +263,11 @@ def build_tool_node(
             remaining = ai_message_tool_calls(last_ai) if last_ai is not None else []
             if not remaining:
                 return {"messages": blocked} if blocked else {"messages": []}
-            out = attach_tool_timings_to_output(inner.invoke(state, config))
+            install_write_serialize_gate(inner, remaining)
+            try:
+                out = attach_tool_timings_to_output(inner.invoke(state, config))
+            finally:
+                clear_write_serialize_gate(inner)
             out = maybe_append_batch_tools_hint(
                 out,
                 prior_messages=list(state.get("messages") or prior),
@@ -300,7 +311,11 @@ def build_tool_node(
             remaining = ai_message_tool_calls(last_ai) if last_ai is not None else []
             if not remaining:
                 return {"messages": blocked} if blocked else {"messages": []}
-            out = attach_tool_timings_to_output(await inner.ainvoke(state, config))
+            install_write_serialize_gate(inner, remaining)
+            try:
+                out = attach_tool_timings_to_output(await inner.ainvoke(state, config))
+            finally:
+                clear_write_serialize_gate(inner)
             out = maybe_append_batch_tools_hint(
                 out,
                 prior_messages=list(state.get("messages") or prior),

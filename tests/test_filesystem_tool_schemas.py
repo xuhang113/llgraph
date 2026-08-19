@@ -58,6 +58,16 @@ def test_grep_files_input_rejects_empty_pattern() -> None:
     assert parsed.pattern == "UserEntity"
 
 
+def test_search_replace_schema_includes_replacements() -> None:
+    ctx = WorkspaceContext(Path(".").resolve(), allow_write=True)
+    tools = create_filesystem_tools(ctx)
+    schema = convert_to_openai_tool(next(t for t in tools if t.name == "search_replace"))
+    props = schema["function"]["parameters"]["properties"]
+    assert "old_string" in props
+    assert "replacements" in props
+    assert "replace_all" in props
+
+
 def _tools(root: Path | None = None):
     ws = root or Path(".").resolve()
     ctx = WorkspaceContext(ws, allow_write=False)
