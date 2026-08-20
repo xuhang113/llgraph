@@ -1,4 +1,4 @@
-"""ReAct 工具节点：并行执行 + search_code_parallel 去重 + 单工具轮次批量提示。"""
+"""ReAct 工具节点：并行执行 + 重复工具短路径 + 单工具轮次批量提示。"""
 
 from __future__ import annotations
 
@@ -12,12 +12,20 @@ from langgraph.prebuilt.tool_node import ToolNode
 
 from llgraph.context.chat_history_repair import ai_message_tool_calls
 from llgraph.core.code_index_tools import _DUPLICATE_PARALLEL_MSG
-from llgraph.core.react_limits import resolve_batch_tools_nudge_after
+from llgraph.core.react_limits import (
+    resolve_batch_tools_nudge_after,
+    resolve_identical_tool_guard,
+)
 from llgraph.core.tool_execution_context import set_tool_execution_messages
 from llgraph.core.tool_invoke_timing import (
     attach_tool_timings_to_output,
     reset_tool_timings,
     wrap_tool_node_with_timing,
+)
+from llgraph.core.tool_loop_guard import (
+    clear_tool_loop_guard,
+    install_tool_loop_guard,
+    wrap_tool_node_with_loop_guard,
 )
 from llgraph.core.write_serialize import (
     clear_write_serialize_gate,
@@ -218,13 +226,14 @@ def build_tool_node(
 ) -> Callable[..., dict[str, Any]]:
     """
     包装 LangGraph ToolNode：并行执行 tool_calls，拦截重复 search_code_parallel；
-    同 path 的写工具按 tool_calls 顺序串行，避免并行 search_replace 互相覆盖。
+    本问内相同参数的 read/grep/失败写短路径返回；同 path 写工具按顺序串行。
 
     @param tools 工具列表
     @param workspace 工作区根（保留参数以兼容调用方）
     @return 图节点可调用对象
     """
     inner = ToolNode(tools)
+    wrap_tool_node_with_loop_guard(inner)
     wrap_tool_node_with_timing(inner)
     wrap_tool_node_with_write_serialize(inner)
 
@@ -264,10 +273,17 @@ def build_tool_node(
             if not remaining:
                 return {"messages": blocked} if blocked else {"messages": []}
             install_write_serialize_gate(inner, remaining)
+            install_tool_loop_guard(
+                inner,
+                list(state.get("messages") or prior),
+                remaining,
+                enabled=resolve_identical_tool_guard(workspace),
+            )
             try:
                 out = attach_tool_timings_to_output(inner.invoke(state, config))
             finally:
                 clear_write_serialize_gate(inner)
+                clear_tool_loop_guard(inner)
             out = maybe_append_batch_tools_hint(
                 out,
                 prior_messages=list(state.get("messages") or prior),
@@ -312,10 +328,17 @@ def build_tool_node(
             if not remaining:
                 return {"messages": blocked} if blocked else {"messages": []}
             install_write_serialize_gate(inner, remaining)
+            install_tool_loop_guard(
+                inner,
+                list(state.get("messages") or prior),
+                remaining,
+                enabled=resolve_identical_tool_guard(workspace),
+            )
             try:
                 out = attach_tool_timings_to_output(await inner.ainvoke(state, config))
             finally:
                 clear_write_serialize_gate(inner)
+                clear_tool_loop_guard(inner)
             out = maybe_append_batch_tools_hint(
                 out,
                 prior_messages=list(state.get("messages") or prior),

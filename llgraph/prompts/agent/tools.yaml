@@ -34,6 +34,7 @@ tool_selection_summary: |
   - **针点**有字面量 → 优先 `grep_files`；不知位置且**未**走 spawn → 每用户问题最多一次 `search_code_parallel`。
   - 会话情节细节 → `search_session_history`；可复用偏好 → `manage_memory` / `search_memory`。
   - 彼此独立的工具在同一条回复里并行；有依赖的再串行。
+  - 相同参数的重复 read/grep 会被框架拦截并返回短指针（结果已在上下文中）；失败的 search_replace 禁止原样重试。
 
 edit_hint: |
   改已有文件优先 `search_replace`。先读再改。CRLF/缩进/行尾空白/误贴行号前缀会自动对齐。

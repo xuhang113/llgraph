@@ -21,6 +21,7 @@
   "agent": {
     "max_turns": 100,
     "batch_tools_nudge_after": 3,
+    "identical_tool_guard": true,
     "investigate": {
       "guard_parallel_when_literals": true,
       "outline_gate": false,
