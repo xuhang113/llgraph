@@ -147,9 +147,13 @@ def prepare_messages_for_llm_dispatch(
             dedupe_read_tool_messages_for_dispatch,
             prune_tool_messages_for_dispatch,
         )
+        from llgraph.context.stale_read_after_write import (
+            invalidate_reads_after_writes_for_dispatch,
+        )
 
         ctx_settings = resolve_context_settings(workspace)
         cleaned = prune_tool_messages_for_dispatch(cleaned, workspace, ctx_settings)
+        cleaned = invalidate_reads_after_writes_for_dispatch(cleaned)
         cleaned = dedupe_read_tool_messages_for_dispatch(cleaned, ctx_settings)
     ordered = reorder_pinned_session_messages(cleaned)
     normalized = normalize_messages_for_llm(

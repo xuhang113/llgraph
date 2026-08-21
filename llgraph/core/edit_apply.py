@@ -12,7 +12,7 @@ from difflib import SequenceMatcher
 
 _READ_LINE_PREFIX = re.compile(r"^\d+\| ")
 _READ_HEADER = re.compile(
-    r"^---\s+.+\s+\(行\s+\d+-\d+\s+/ 共\s+\d+\s+行\)(?:\s+---)?\s*\n?",
+    r"^---\s+.+\s+\(行\s+\d+-\d+\s+/ 共\s+\d+\s+行\)(?:\s+\[[^\]]+\])?(?:\s+---)?\s*\n?",
 )
 _WS_RUN = re.compile(r"[^\S\n]+")
 
@@ -157,12 +157,137 @@ def format_apply_failure(rel: str, result: ApplyEditResult) -> str:
     return "\n".join(lines)
 
 
-def format_apply_success(rel: str, result: ApplyEditResult) -> str:
+_SNIPPET_CONTEXT_LINES = 8
+_SNIPPET_MAX_LINES = 48
+_SNIPPET_MAX_CHARS = 3500
+_SNIPPET_HEAD_LINES = 40
+
+
+def _changed_span(old_text: str, new_text: str) -> tuple[int, int] | None:
     """
-    成功替换后的工具返回文案。
+    用公共前后缀定位 new_text 中的改动行区间（0-based, end 不含）。
+
+    @param old_text 写入前
+    @param new_text 写入后
+    @return (start, end)；无改动则为 None
+    """
+    old_lines = old_text.splitlines()
+    new_lines = new_text.splitlines()
+    if old_lines == new_lines:
+        return None
+    prefix = 0
+    limit = min(len(old_lines), len(new_lines))
+    while prefix < limit and old_lines[prefix] == new_lines[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < (len(old_lines) - prefix)
+        and suffix < (len(new_lines) - prefix)
+        and old_lines[len(old_lines) - 1 - suffix] == new_lines[len(new_lines) - 1 - suffix]
+    ):
+        suffix += 1
+    start = prefix
+    end = len(new_lines) - suffix
+    if end < start:
+        end = start
+    if start >= len(new_lines):
+        if not new_lines:
+            return None
+        start = max(0, len(new_lines) - 1)
+        end = len(new_lines)
+    return (start, max(end, start + 1))
+
+
+def format_write_snapshot(
+    rel: str,
+    text: str,
+    *,
+    start_line: int = 1,
+    end_line: int = 0,
+    label: str = "写入后快照",
+) -> str:
+    """
+    把文件片段格式化成带行号的快照（与 read_file 同类，便于模型接着改）。
+
+    @param rel 相对路径
+    @param text 当前文件全文
+    @param start_line 起始行（1-based）
+    @param end_line 结束行（含）；0 表示到末尾
+    @param label 快照标记
+    @return 快照正文；空文件给一行说明
+    """
+    lines = text.splitlines()
+    total = len(lines)
+    if total == 0:
+        return f"--- {rel} (空文件，0 行) [{label}] ---"
+    start = max(1, start_line)
+    end = total if end_line <= 0 else min(end_line, total)
+    if start > total:
+        start = 1
+        end = min(total, _SNIPPET_HEAD_LINES)
+    selected = lines[start - 1 : end]
+    if len(selected) > _SNIPPET_MAX_LINES:
+        head_n = _SNIPPET_MAX_LINES // 2
+        tail_n = _SNIPPET_MAX_LINES - head_n
+        head = selected[:head_n]
+        tail = selected[-tail_n:]
+        skip = len(selected) - head_n - tail_n
+        numbered: list[str] = [
+            f"{start + i}| {line}" for i, line in enumerate(head)
+        ]
+        numbered.append(f"…（省略 {skip} 行）")
+        tail_start = end - tail_n + 1
+        numbered.extend(f"{tail_start + i}| {line}" for i, line in enumerate(tail))
+        body = "\n".join(numbered)
+        shown_end = end
+    else:
+        body = "\n".join(f"{start + i}| {line}" for i, line in enumerate(selected))
+        shown_end = start + len(selected) - 1
+    if len(body) > _SNIPPET_MAX_CHARS:
+        body = body[: _SNIPPET_MAX_CHARS - 20].rstrip() + "\n…（快照已截断）"
+    return (
+        f"--- {rel} (行 {start}-{shown_end} / 共 {total} 行) [{label}] ---\n"
+        f"{body}\n"
+        "后续 search_replace 请以此快照为准，勿使用写入前的 read。"
+    )
+
+
+def format_post_edit_snapshot(rel: str, old_text: str, new_text: str) -> str:
+    """
+    根据改动区间生成写入后快照。
+
+    @param rel 相对路径
+    @param old_text 写入前
+    @param new_text 写入后
+    @return 快照；无法定位时退回文件头部
+    """
+    span = _changed_span(old_text, new_text)
+    lines = new_text.splitlines()
+    total = len(lines)
+    if not span or total == 0:
+        return format_write_snapshot(
+            rel, new_text, start_line=1, end_line=min(total, _SNIPPET_HEAD_LINES) or 0
+        )
+    start, end = span
+    ctx_start = max(0, start - _SNIPPET_CONTEXT_LINES)
+    ctx_end = min(total, end + _SNIPPET_CONTEXT_LINES)
+    return format_write_snapshot(
+        rel, new_text, start_line=ctx_start + 1, end_line=ctx_end
+    )
+
+
+def format_apply_success(
+    rel: str,
+    result: ApplyEditResult,
+    *,
+    old_text: str = "",
+) -> str:
+    """
+    成功替换后的工具返回文案（首行前缀供失败追踪识别）。
 
     @param rel 相对路径
     @param result 成功结果
+    @param old_text 写入前全文，用于生成当前片段
     @return 工具成功文本
     """
     hunk_bit = ""
@@ -175,7 +300,11 @@ def format_apply_success(rel: str, result: ApplyEditResult) -> str:
         parts = result.strategy.split("+")
         if any(p != "exact" for p in parts):
             strategy_bit = f"，匹配策略={result.strategy}"
-    return f"已替换 {rel}（{result.replacements} 处{hunk_bit}{strategy_bit}）"
+    header = f"已替换 {rel}（{result.replacements} 处{hunk_bit}{strategy_bit}）"
+    if not result.new_text and not old_text:
+        return header
+    snapshot = format_post_edit_snapshot(rel, old_text, result.new_text)
+    return f"{header}\n{snapshot}"
 
 
 def strip_read_file_artifacts(text: str) -> str:

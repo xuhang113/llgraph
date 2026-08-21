@@ -19,6 +19,7 @@ from llgraph.core.edit_apply import (
     apply_edit_hunks,
     format_apply_failure,
     format_apply_success,
+    format_write_snapshot,
     parse_replacements_arg,
 )
 
@@ -266,17 +267,20 @@ SEARCH_REPLACE_TOOL_DESC = (
     "（对齐 Cursor / Claude Code / Codex 改码命中）。"
     "默认同文件多处须唯一，或 replace_all=true。"
     "同一文件多处修改优先 replacements=[{old_string,new_string},...] 一次提交，按顺序应用。"
+    "成功后返回带行号的写入后快照；继续改同一文件须用该快照，勿用写入前的 read。"
 )
 
 WRITE_FILE_TOOL_DESC = (
     "创建新文件或整文件覆盖（需 -w）。每次调用必须同时提供 path 与 content，禁止只传 path。"
     "长文档（超过约 8000 字符）勿一次写全：先写标题与目录骨架，再用 append_file 或 search_replace 分节追加。"
     "Markdown 路径可直接使用 .md 后缀。"
+    "成功后返回文件头部快照；后续局部修改请 search_replace 并引用该快照。"
 )
 
 APPEND_FILE_TOOL_DESC = (
     "向工作区文件末尾追加文本（需 -w）；文件不存在则创建。每次必须提供 path 与 content。"
     "长文档分块写入时，第一节用 write_file，后续各节用 append_file（单次 content 建议 <8000 字符）。"
+    "成功后返回文件末尾快照。"
 )
 
 
@@ -866,7 +870,14 @@ def create_filesystem_tools(
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
         hint = _chunk_size_hint(content, chunk_max)
-        return f"已写入 {rel}（{len(content)} 字符）{hint}"
+        total_lines = len(content.splitlines())
+        snapshot = format_write_snapshot(
+            rel,
+            content,
+            start_line=1,
+            end_line=min(total_lines, 40) if total_lines else 0,
+        )
+        return f"已写入 {rel}（{len(content)} 字符）{hint}\n{snapshot}"
 
     def append_file(path: str, content: str = "") -> str:
         """
@@ -897,7 +908,12 @@ def create_filesystem_tools(
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
         hint = _chunk_size_hint(content, chunk_max)
-        return f"已追加 {rel}（+{len(content)} 字符，共 {len(new_text)} 字符）{hint}"
+        total_lines = len(new_text.splitlines()) or (1 if new_text else 0)
+        tail_start = max(1, total_lines - 39) if total_lines else 1
+        snapshot = format_write_snapshot(
+            rel, new_text, start_line=tail_start, end_line=total_lines
+        )
+        return f"已追加 {rel}（+{len(content)} 字符，共 {len(new_text)} 字符）{hint}\n{snapshot}"
 
     def search_replace(
         path: str,
@@ -960,7 +976,7 @@ def create_filesystem_tools(
         )
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
-        return format_apply_success(rel, applied)
+        return format_apply_success(rel, applied, old_text=text)
 
     tools: list = [
         StructuredTool.from_function(

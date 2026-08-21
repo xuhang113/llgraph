@@ -176,6 +176,8 @@ def test_search_replace_tool_tolerant_and_multi(tmp_path: Path) -> None:
         }
     )
     assert str(out).startswith("已替换")
+    assert "return 2" in str(out)
+    assert "[写入后快照]" in str(out)
     assert "return 2" in target.read_text(encoding="utf-8")
 
     out2 = tool.invoke(

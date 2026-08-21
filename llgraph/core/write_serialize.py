@@ -1,7 +1,9 @@
-"""同 path 写工具串行：并行 tool_calls 时按声明顺序落地，避免互相覆盖。
+"""同 path 文件工具串行：并行 tool_calls 时按声明顺序落地。
 
-对标 Claude Code / Cursor：读类工具仍并行；write_file / append_file / search_replace
-若指向同一相对路径，则按 assistant.tool_calls 顺序排队执行。
+对标 Claude Code / Cursor：
+- 不同文件的读仍并行；
+- 同一相对路径上的 write_file / append_file / search_replace 按 tool_calls 顺序排队；
+- 同一路径上的 read_file 与写工具也按声明顺序排队，避免读到半写入内容或用过期快照去改。
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from typing import Any
 from llgraph.core.write_failure_tracker import WRITE_TOOL_NAMES
 
 _WRITE_WAIT_TIMEOUT_SEC = 180.0
+_PATH_SERIAL_READ_TOOLS = frozenset({"read_file"})
 
 
 def normalize_write_path(raw: object) -> str:
@@ -32,6 +35,17 @@ def normalize_write_path(raw: object) -> str:
     return text or "."
 
 
+def _call_as_dict(call: Any) -> dict[str, Any]:
+    if isinstance(call, dict):
+        return call
+    args = getattr(call, "args", None)
+    return {
+        "name": getattr(call, "name", None),
+        "id": getattr(call, "id", None),
+        "args": args if isinstance(args, dict) else {},
+    }
+
+
 def write_path_from_call(call: dict[str, Any]) -> str | None:
     """
     若该 tool_call 是写工具则返回归一化 path，否则 None。
@@ -46,8 +60,28 @@ def write_path_from_call(call: dict[str, Any]) -> str | None:
     return path or None
 
 
+def touched_path_from_call(call: dict[str, Any]) -> str | None:
+    """
+    写工具或同文件 read_file 的归一化 path。
+
+    @param call tool_call dict
+    @return 路径；无关调用为 None
+    """
+    written = write_path_from_call(call)
+    if written:
+        return written
+    name = str(call.get("name") or "").strip()
+    if name not in _PATH_SERIAL_READ_TOOLS:
+        return None
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    path = normalize_write_path(args.get("path"))
+    if not path or path == ".":
+        return None
+    return path
+
+
 class _WritePathGate:
-    """按 path 把写调用排成队：后者等待前者 mark_done。"""
+    """按 path 把冲突调用排成队：后者等待前者 mark_done。"""
 
     def __init__(self, path_ids: dict[str, list[str]]) -> None:
         self._order = {path: list(ids) for path, ids in path_ids.items() if len(ids) > 1}
@@ -90,24 +124,17 @@ class _WritePathGate:
 
 def gate_from_tool_calls(calls: list[Any]) -> _WritePathGate:
     """
-    根据本批 tool_calls 构建同 path 写串行门闩。
+    根据本批 tool_calls 构建同 path 读写串行门闩。
+
+    仅当同一 path 上出现 2+ 次写或「读+写」时才排队；互不冲突的读仍并行。
 
     @param calls assistant 消息中的 tool_calls
     @return 门闩（无冲突时 wait 为 no-op）
     """
     path_ids: dict[str, list[str]] = {}
     for call in calls:
-        item = dict(call) if isinstance(call, dict) else None
-        if item is None:
-            name = getattr(call, "name", None)
-            cid = getattr(call, "id", None)
-            args = getattr(call, "args", None)
-            item = {
-                "name": name,
-                "id": cid,
-                "args": args if isinstance(args, dict) else {},
-            }
-        path = write_path_from_call(item)
+        item = _call_as_dict(call)
+        path = touched_path_from_call(item)
         if not path:
             continue
         cid = str(item.get("id") or "").strip()
@@ -129,7 +156,7 @@ def clear_write_serialize_gate(inner: Any) -> None:
 
 def wrap_tool_node_with_write_serialize(inner: Any) -> None:
     """
-    包装 ToolNode._run_one / _arun_one：同 path 写调用按 tool_calls 顺序执行。
+    包装 ToolNode._run_one / _arun_one：同 path 写/read_file 按 tool_calls 顺序执行。
 
     应在 wrap_tool_node_with_timing 之后调用，使等待时间不计入单工具耗时。
     门闩挂在 ToolNode 实例上，避免 ContextVar 在未 copy_context 的线程里丢失。

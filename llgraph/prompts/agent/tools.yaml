@@ -39,6 +39,8 @@ tool_selection_summary: |
 edit_hint: |
   改已有文件优先 `search_replace`。先读再改。CRLF/缩进/行尾空白/误贴行号前缀会自动对齐。
   同一文件多处修改用 `replacements=[{old_string,new_string},...]` 一次提交（按顺序）。新文件用 `write_file`。
+  写入成功后工具返回含「写入后快照」（带行号）；此前对该文件的 read 出站会作废。
+  继续改同一文件时，old_string 必须来自该快照或写入后再 read，禁止用写入前的全文。
 
 web_search_hint: |
   公开新鲜信息用 `web_search`；本工作区事实优先本地工具。

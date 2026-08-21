@@ -226,7 +226,7 @@ def build_tool_node(
 ) -> Callable[..., dict[str, Any]]:
     """
     包装 LangGraph ToolNode：并行执行 tool_calls，拦截重复 search_code_parallel；
-    本问内相同参数的 read/grep/失败写短路径返回；同 path 写工具按顺序串行。
+    本问内相同参数的 read/grep/失败写短路径返回；同 path 写工具与 read_file 按顺序串行。
 
     @param tools 工具列表
     @param workspace 工作区根（保留参数以兼容调用方）
