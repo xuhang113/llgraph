@@ -1,6 +1,8 @@
 """search_replace 容错匹配：对齐 Cursor / Claude Code / Codex 的改码命中路径。
 
 优先 exact；失败则依次尝试换行符、读文件行号前缀、行尾空白、缩进对齐、行内空白折叠。
+仍 0 命中时，若全文件有**唯一**高相似行窗（old_string 笔误、中间多/少一行），
+按该窗落地——对标 Cursor Fast Apply / Codex apply_patch 的 fuzzy 命中，避免再空转一轮 LLM。
 同一文件多个 hunk 按顺序作用在内存文本上，全部成功后再落盘。
 """
 
@@ -24,6 +26,13 @@ _STRATEGY_ORDER = (
     "whitespace",
 )
 
+# unique fuzzy：仅在精确族全部失败后启用；replace_all 不用（误伤面太大）
+_FUZZY_MAX_NEEDLE_LINES = 80
+_FUZZY_FULL_SCAN_LINES = 8000
+_FUZZY_MIN_GAP = 0.12
+_FUZZY_MIN_FIRST_LINE_RATIO = 0.70
+_FUZZY_MIN_SINGLE_LINE_CHARS = 12
+
 
 @dataclass(frozen=True)
 class EditHunk:
@@ -44,6 +53,7 @@ class EditHit:
     strategy: str
     indent_kind: str = ""
     indent_ws: str = ""
+    ratio: float = 0.0
 
 
 @dataclass
@@ -58,6 +68,7 @@ class ApplyEditResult:
     error: str = ""
     hint: str = ""
     tried: tuple[str, ...] = field(default_factory=tuple)
+    fuzzy_ratio: float = 0.0
 
 
 def apply_search_replace(
@@ -67,6 +78,7 @@ def apply_search_replace(
     *,
     replace_all: bool = False,
     require_unique: bool = True,
+    allow_fuzzy: bool = True,
 ) -> ApplyEditResult:
     """
     对单段文本做一次容错替换。
@@ -76,12 +88,14 @@ def apply_search_replace(
     @param new_string 替换文本
     @param replace_all 是否替换全部命中
     @param require_unique 非 replace_all 时是否要求唯一命中
+    @param allow_fuzzy 精确族失败后是否尝试 unique fuzzy 窗口
     @return 应用结果（失败时不改原文）
     """
     return apply_edit_hunks(
         text,
         [EditHunk(old_string, new_string, replace_all=replace_all)],
         require_unique=require_unique,
+        allow_fuzzy=allow_fuzzy,
     )
 
 
@@ -90,6 +104,7 @@ def apply_edit_hunks(
     hunks: list[EditHunk],
     *,
     require_unique: bool = True,
+    allow_fuzzy: bool = True,
 ) -> ApplyEditResult:
     """
     按顺序应用多个 hunk；任一失败则整体失败。
@@ -97,6 +112,7 @@ def apply_edit_hunks(
     @param text 当前文件内容
     @param hunks 替换列表
     @param require_unique 非 replace_all 时是否要求唯一命中
+    @param allow_fuzzy 精确族失败后是否尝试 unique fuzzy 窗口
     @return 应用结果
     """
     cleaned = [h for h in hunks if (h.old_string or "").strip() or h.old_string == ""]
@@ -106,8 +122,14 @@ def apply_edit_hunks(
     total = 0
     strategies: list[str] = []
     all_tried: list[str] = []
+    fuzzy_ratio = 0.0
     for idx, hunk in enumerate(cleaned, start=1):
-        one = _apply_one_hunk(current, hunk, require_unique=require_unique)
+        one = _apply_one_hunk(
+            current,
+            hunk,
+            require_unique=require_unique,
+            allow_fuzzy=allow_fuzzy,
+        )
         all_tried.extend(one.tried)
         if not one.ok:
             prefix = f"hunk {idx}/{len(cleaned)}: " if len(cleaned) > 1 else ""
@@ -120,6 +142,8 @@ def apply_edit_hunks(
         current = one.new_text
         total += one.replacements
         strategies.append(one.strategy)
+        if one.fuzzy_ratio > fuzzy_ratio:
+            fuzzy_ratio = one.fuzzy_ratio
     strategy = strategies[0] if len(set(strategies)) == 1 else "+".join(strategies)
     return ApplyEditResult(
         ok=True,
@@ -128,6 +152,7 @@ def apply_edit_hunks(
         hunks_applied=len(cleaned),
         strategy=strategy,
         tried=tuple(dict.fromkeys(all_tried)),
+        fuzzy_ratio=fuzzy_ratio,
     )
 
 
@@ -196,6 +221,21 @@ def _changed_span(old_text: str, new_text: str) -> tuple[int, int] | None:
         start = max(0, len(new_lines) - 1)
         end = len(new_lines)
     return (start, max(end, start + 1))
+
+
+def changed_line_span(old_text: str, new_text: str) -> tuple[int, int] | None:
+    """
+    改动行区间（1-based，两端包含），供写入后诊断定位。
+
+    @param old_text 写入前
+    @param new_text 写入后
+    @return (start, end)；无改动则为 None
+    """
+    span = _changed_span(old_text, new_text)
+    if span is None:
+        return None
+    start, end = span
+    return (start + 1, max(start + 1, end))
 
 
 def format_write_snapshot(
@@ -294,7 +334,10 @@ def format_apply_success(
     if result.hunks_applied > 1:
         hunk_bit = f" / {result.hunks_applied} hunk"
     strategy_bit = ""
-    if result.strategy and result.strategy != "exact" and "exact" not in result.strategy.split("+"):
+    if result.strategy == "fuzzy":
+        pct = f"{result.fuzzy_ratio:.0%}" if result.fuzzy_ratio else ""
+        strategy_bit = f"，匹配策略=fuzzy{f'({pct})' if pct else ''}"
+    elif result.strategy and result.strategy != "exact" and "exact" not in result.strategy.split("+"):
         strategy_bit = f"，匹配策略={result.strategy}"
     elif result.strategy and "+" in result.strategy and result.strategy != "exact":
         parts = result.strategy.split("+")
@@ -365,6 +408,7 @@ def _apply_one_hunk(
     hunk: EditHunk,
     *,
     require_unique: bool,
+    allow_fuzzy: bool = True,
 ) -> ApplyEditResult:
     needle = hunk.old_string
     if needle == "":
@@ -375,14 +419,12 @@ def _apply_one_hunk(
         needles.append(stripped)
 
     tried: list[str] = []
-    last_hits: list[EditHit] = []
     for candidate in needles:
         for strategy in _STRATEGY_ORDER:
             tried.append(strategy)
             hits = _find_hits(text, candidate, strategy)
             if not hits:
                 continue
-            last_hits = hits
             if not hunk.replace_all and require_unique and len(hits) != 1:
                 return ApplyEditResult(
                     ok=False,
@@ -403,6 +445,24 @@ def _apply_one_hunk(
                 strategy=strategy,
                 tried=tuple(dict.fromkeys(tried)),
             )
+
+    if allow_fuzzy and not hunk.replace_all:
+        tried.append("fuzzy")
+        for candidate in reversed(needles):
+            fuzzy_hit = find_fuzzy_unique_hit(text, candidate)
+            if fuzzy_hit is None:
+                continue
+            new_text = _replace_hits(text, [fuzzy_hit], hunk.new_string)
+            return ApplyEditResult(
+                ok=True,
+                new_text=new_text,
+                replacements=1,
+                hunks_applied=1,
+                strategy="fuzzy",
+                tried=tuple(dict.fromkeys(tried)),
+                fuzzy_ratio=fuzzy_hit.ratio,
+            )
+
     return ApplyEditResult(
         ok=False,
         error="未找到 old_string（0 处匹配）",
@@ -628,14 +688,11 @@ def _apply_indent_to_line(line: str, kind: str, ws: str) -> str:
 
 
 def _adjust_new_string(new_string: str, hit: EditHit) -> str:
-    if hit.strategy != "indent" or not hit.indent_ws:
+    if not hit.indent_ws:
         return _adapt_newlines(new_string, hit.matched)
     lines = _file_lines(new_string)
     shifted = [_apply_indent_to_line(ln, hit.indent_kind, hit.indent_ws) for ln in lines]
-    adjusted = "".join(shifted) if new_string.endswith(("\n", "\r")) else "".join(shifted)
-    if not new_string.endswith(("\n", "\r")) and shifted:
-        # join via original splitlines keepends already includes endings except possibly last
-        adjusted = "".join(shifted)
+    adjusted = "".join(shifted)
     return _adapt_newlines(adjusted, hit.matched)
 
 
@@ -659,45 +716,146 @@ def _replace_hits(text: str, hits: list[EditHit], new_string: str) -> str:
     return "".join(pieces)
 
 
+def _fuzzy_min_ratio(nonempty_lines: int, needle_chars: int) -> float:
+    if nonempty_lines <= 1:
+        if needle_chars < 24:
+            return 0.92
+        return 0.88
+    if nonempty_lines <= 3:
+        return 0.82
+    return 0.76
+
+
+def _line_match_ratio(left: str, right: str) -> float:
+    a = _norm_whitespace(left)
+    b = _norm_whitespace(right)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    return SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+
+def _fuzzy_scan_indices(file_lines: list[str], needle_lines: list[str], window: int) -> list[int]:
+    max_i = max(1, len(file_lines) - window + 1)
+    anchor_raw = ""
+    for line in needle_lines:
+        body = _rstrip_nl(line).strip()
+        if body:
+            anchor_raw = body[:80]
+            break
+    if len(file_lines) <= _FUZZY_FULL_SCAN_LINES:
+        return list(range(max_i))
+    if not anchor_raw:
+        return list(range(0, max_i, max(1, max_i // 400)))
+    prefix = anchor_raw[:24]
+    hits = [
+        i
+        for i in range(max_i)
+        if prefix in file_lines[i] or _collapse_ws(prefix) in _collapse_ws(file_lines[i])
+    ]
+    if hits:
+        return hits
+    return list(range(0, max_i, max(1, max_i // 400)))
+
+
+def _rank_fuzzy_windows(text: str, needle: str) -> list[EditHit]:
+    needle_lines = _file_lines(needle)
+    file_lines = _file_lines(text)
+    window = len(needle_lines)
+    if window <= 0 or window > _FUZZY_MAX_NEEDLE_LINES or window > len(file_lines):
+        return []
+    nonempty = sum(1 for ln in needle_lines if _rstrip_nl(ln).strip())
+    if nonempty <= 0:
+        return []
+    if nonempty == 1 and len(_norm_whitespace(needle)) < _FUZZY_MIN_SINGLE_LINE_CHARS:
+        return []
+    n_idx = _first_nonempty_index(needle_lines)
+    needle_join = "\n".join(_norm_trailing_ws(ln) for ln in needle_lines)
+    min_ratio = _fuzzy_min_ratio(nonempty, len(needle_join))
+    offsets = _line_offsets(file_lines)
+    ranked: list[EditHit] = []
+    for i in _fuzzy_scan_indices(file_lines, needle_lines, window):
+        chunk_lines = file_lines[i : i + window]
+        if len(chunk_lines) < window:
+            continue
+        first_ratio = _line_match_ratio(needle_lines[n_idx], chunk_lines[min(n_idx, len(chunk_lines) - 1)])
+        if first_ratio < _FUZZY_MIN_FIRST_LINE_RATIO:
+            continue
+        chunk_join = "\n".join(_norm_trailing_ws(ln) for ln in chunk_lines)
+        quick = SequenceMatcher(None, needle_join, chunk_join, autojunk=False).quick_ratio()
+        if quick < min_ratio - 0.08:
+            continue
+        ratio = SequenceMatcher(None, needle_join, chunk_join, autojunk=False).ratio()
+        if ratio < 0.35:
+            continue
+        start = offsets[i]
+        end = offsets[i + window]
+        if not needle.endswith(("\n", "\r")):
+            last = chunk_lines[-1]
+            end -= len(last) - len(_rstrip_nl(last))
+        file_lead = _leading_ws(chunk_lines[min(n_idx, len(chunk_lines) - 1)])
+        needle_lead = _leading_ws(needle_lines[n_idx])
+        kind, ws = _indent_delta(file_lead, needle_lead)
+        ranked.append(
+            EditHit(
+                start=start,
+                end=end,
+                matched=text[start:end],
+                strategy="fuzzy",
+                indent_kind=kind,
+                indent_ws=ws,
+                ratio=ratio,
+            )
+        )
+    ranked.sort(key=lambda hit: hit.ratio, reverse=True)
+    return ranked
+
+
+def find_fuzzy_unique_hit(text: str, needle: str) -> EditHit | None:
+    """
+    精确族失败后：若存在唯一高相似行窗则返回该命中。
+
+    门槛：相似度过线，且第一行也够像；若有第二候选，差距须 ≥ 0.12。
+    replace_all 场景不要调用。
+
+    @param text 文件全文
+    @param needle old_string（可已剥行号前缀）
+    @return 唯一 fuzzy 命中；不够自信则为 None
+    """
+    cleaned = strip_read_file_artifacts(needle)
+    ranked = _rank_fuzzy_windows(text, cleaned)
+    if not ranked:
+        return None
+    nonempty = sum(1 for ln in cleaned.splitlines() if ln.strip())
+    min_ratio = _fuzzy_min_ratio(nonempty, len(cleaned.strip()))
+    best = ranked[0]
+    if best.ratio < min_ratio:
+        return None
+    if len(ranked) > 1 and (best.ratio - ranked[1].ratio) < _FUZZY_MIN_GAP:
+        return None
+    return best
+
+
 def _best_window_hint(text: str, needle: str, *, limit: int) -> str:
-    needle_lines = [ln.rstrip() for ln in needle.splitlines() if ln.strip()]
-    if not needle_lines:
+    ranked = _rank_fuzzy_windows(text, needle)
+    if not ranked:
+        return ""
+    best = ranked[0]
+    if best.ratio < 0.35:
         return ""
     file_lines = text.splitlines()
-    window = max(len(needle.splitlines()), 1)
-    if window > 40:
-        window = 40
-    needle_join = "\n".join(needle_lines[:window])
-    best_ratio = 0.0
-    best_i = 0
-    max_i = max(1, len(file_lines) - window + 1)
-    # 大文件：只在首行近似命中附近扫描
-    scan_range: list[int]
-    anchor = needle_lines[0][:80] if needle_lines else ""
-    if len(file_lines) > 8000 and anchor:
-        scan_range = [
-            i
-            for i in range(max_i)
-            if anchor[:24] in file_lines[i] or _collapse_ws(anchor[:24]) in _collapse_ws(file_lines[i])
-        ]
-        if not scan_range:
-            scan_range = list(range(0, max_i, max(1, max_i // 400)))
-    else:
-        scan_range = list(range(max_i))
-    for i in scan_range:
-        chunk = "\n".join(ln.rstrip() for ln in file_lines[i : i + window])
-        ratio = SequenceMatcher(None, needle_join, chunk).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_i = i
-    if best_ratio < 0.35:
-        return ""
-    end = min(len(file_lines), best_i + min(window, limit))
+    start_line = text[: best.start].count("\n")
+    window = max(1, min(limit, len(_file_lines(needle)) or 1))
+    end = min(len(file_lines), start_line + window)
     shown = [
-        f"  L{best_i + j + 1}: {file_lines[best_i + j][:120]}"
-        for j in range(end - best_i)
+        f"  L{start_line + j + 1}: {file_lines[start_line + j][:120]}"
+        for j in range(end - start_line)
+        if start_line + j < len(file_lines)
     ]
-    return f"最相近片段（相似度 {best_ratio:.0%}）:\n" + "\n".join(shown)
+    if not shown:
+        return ""
+    return f"最相近片段（相似度 {best.ratio:.0%}）:\n" + "\n".join(shown)
 
 
 def parse_replacements_arg(raw: object) -> list[EditHunk]:

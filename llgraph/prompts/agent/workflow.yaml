@@ -50,6 +50,7 @@ investigation: |
   - path 不存在：**只纠正一次**（path="." 或 list_directory 核对），勿连猜多个仓库目录名。
   - grep 结果已落盘：对落盘路径 read 行段，**禁止**对全库重复同一 pattern。
   - 框架会拦截本问内相同参数的重复 read/grep/glob，以及相同 search_replace 失败重试；勿原样再调，换参数或基于已有结果作答。
+  - 写工具返回 `[语法诊断]`：文件已改但解析失败，须立刻 search_replace 修好；不要当成功结束。
   - 用户错误文案 **grep 0 命中**：在正文说明「仓库内无此字面量」，列可能来源即可；**禁止**为此再开 10+ 轮检索。
   - 至少 **2 种不同手段**（如 grep + read）仍无线索后，才可说「找不到」。
   - 远早对话：search_session_history + read 归档；业务归属先读 markdowns/docs 索引。

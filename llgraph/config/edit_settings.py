@@ -58,6 +58,8 @@ class EditSettings:
     snapshot_on_first_edit: bool
     write_chunk_max_chars: int
     write_failures_before_hint: int
+    fuzzy_apply: bool
+    syntax_diagnostics: bool
 
 
 def resolve_edit_settings(workspace: Path) -> EditSettings:
@@ -98,4 +100,6 @@ def resolve_edit_settings(workspace: Path) -> EditSettings:
         snapshot_on_first_edit=_parse_bool(edits.get("snapshot_on_first_edit"), True),
         write_chunk_max_chars=chunk_max,
         write_failures_before_hint=fail_hint,
+        fuzzy_apply=_parse_bool(edits.get("fuzzy_apply"), True),
+        syntax_diagnostics=_parse_bool(edits.get("syntax_diagnostics"), True),
     )

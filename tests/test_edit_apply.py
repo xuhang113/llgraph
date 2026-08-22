@@ -19,6 +19,7 @@ from llgraph.core.edit_apply import (
     parse_replacements_arg,
     strip_read_file_artifacts,
 )
+from llgraph.core.edit_diagnostics import DIAGNOSTIC_MARKER
 from llgraph.core.filesystem_tools import create_filesystem_tools
 from llgraph.core.tool_invoke_timing import wrap_tool_node_with_timing
 from llgraph.core.workspace import WorkspaceContext
@@ -145,12 +146,90 @@ def test_multi_hunk_second_fails_does_not_partial_apply() -> None:
 
 def test_not_found_hint_contains_nearby_line() -> None:
     text = "def authentic_token():\n    return True\n"
-    result = apply_search_replace(text, "def authentic_tokn():", "x")
+    result = apply_search_replace(
+        text, "class CompletelyDifferent:\n    pass\n", "x", allow_fuzzy=True
+    )
     assert not result.ok
     msg = format_apply_failure("mod.py", result)
     assert "未找到 old_string" in msg
     assert "已尝试匹配" in msg
-    assert "authentic_token" in msg
+    assert "fuzzy" in msg
+
+
+def test_fuzzy_unique_typo_applies() -> None:
+    text = (
+        "def load_user(user_id: str) -> User:\n"
+        "    row = db.fetch(user_id)\n"
+        "    if not row:\n"
+        "        raise NotFound(\"user\")\n"
+        "    return User.from_row(row)\n"
+    )
+    needle = (
+        "def load_user(user_id: str) -> User:\n"
+        "    row = db.fetch(user_id)\n"
+        "    if not row:\n"
+        "        raise NotFound(\"missing\")\n"
+        "    return User.from_row(row)\n"
+    )
+    new = (
+        "def load_user(user_id: str) -> User:\n"
+        "    row = db.fetch(user_id)\n"
+        "    if not row:\n"
+        "        raise NotFound(\"user\")\n"
+        "    return User.from_row(row, strict=True)\n"
+    )
+    result = apply_search_replace(text, needle, new)
+    assert result.ok
+    assert result.strategy == "fuzzy"
+    assert result.fuzzy_ratio >= 0.76
+    assert "strict=True" in result.new_text
+    assert "raise NotFound(\"user\")" in result.new_text
+    msg = format_apply_success("user.py", result, old_text=text)
+    assert "fuzzy" in msg
+
+
+def test_fuzzy_unique_identifier_typo_applies() -> None:
+    text = "def authentic_token():\n    return True\n"
+    result = apply_search_replace(
+        text,
+        "def authentic_tokn():\n    return True\n",
+        "def authentic_token():\n    return False\n",
+    )
+    assert result.ok
+    assert result.strategy == "fuzzy"
+    assert "return False" in result.new_text
+
+
+def test_fuzzy_not_unique_does_not_apply() -> None:
+    text = "def helper():\n    return 1\n\ndef helper():\n    return 1\n"
+    result = apply_search_replace(
+        text,
+        "def helppr():\n    return 1\n",
+        "def helper():\n    return 2\n",
+    )
+    assert not result.ok
+    assert "未找到 old_string" in result.error
+
+
+def test_fuzzy_disabled_falls_back_to_hint() -> None:
+    text = (
+        "def load_user(user_id: str) -> User:\n"
+        "    row = db.fetch(user_id)\n"
+        "    if not row:\n"
+        "        raise NotFound(\"user\")\n"
+        "    return User.from_row(row)\n"
+    )
+    needle = (
+        "def load_user(user_id: str) -> User:\n"
+        "    row = db.fetch(user_id)\n"
+        "    if not row:\n"
+        "        raise NotFound(\"missing\")\n"
+        "    return User.from_row(row)\n"
+    )
+    result = apply_search_replace(text, needle, "x", allow_fuzzy=False)
+    assert not result.ok
+    assert "fuzzy" not in result.tried
+    assert "user" in (result.hint or "") or "load_user" in (result.hint or "")
 
 
 def test_parse_replacements_arg_aliases() -> None:
@@ -193,6 +272,45 @@ def test_search_replace_tool_tolerant_and_multi(tmp_path: Path) -> None:
     body = target.read_text(encoding="utf-8")
     assert "def bar" in body
     assert "return 3" in body
+
+
+def test_search_replace_tool_fuzzy_typo(tmp_path: Path) -> None:
+    target = tmp_path / "user.py"
+    target.write_text(
+        "def load_user(user_id: str) -> User:\n"
+        "    row = db.fetch(user_id)\n"
+        "    if not row:\n"
+        "        raise NotFound(\"user\")\n"
+        "    return User.from_row(row)\n",
+        encoding="utf-8",
+    )
+    ctx = WorkspaceContext(tmp_path, allow_write=True)
+    tool = next(t for t in create_filesystem_tools(ctx) if t.name == "search_replace")
+    out = str(
+        tool.invoke(
+            {
+                "path": "user.py",
+                "old_string": (
+                    "def load_user(user_id: str) -> User:\n"
+                    "    row = db.fetch(user_id)\n"
+                    "    if not row:\n"
+                    "        raise NotFound(\"missing\")\n"
+                    "    return User.from_row(row)\n"
+                ),
+                "new_string": (
+                    "def load_user(user_id: str) -> User:\n"
+                    "    row = db.fetch(user_id)\n"
+                    "    if not row:\n"
+                    "        raise NotFound(\"user\")\n"
+                    "    return User.from_row(row, strict=True)\n"
+                ),
+            }
+        )
+    )
+    assert out.startswith("已替换")
+    assert "fuzzy" in out
+    assert "strict=True" in target.read_text(encoding="utf-8")
+    assert DIAGNOSTIC_MARKER not in out
 
 
 def test_search_replace_schema_requires_hunk() -> None:

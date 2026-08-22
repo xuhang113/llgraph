@@ -22,6 +22,7 @@ from llgraph.core.edit_apply import (
     format_write_snapshot,
     parse_replacements_arg,
 )
+from llgraph.core.edit_diagnostics import format_edit_diagnostics
 
 from llgraph.config.catalog_paths import resolve_catalog_read_path
 from llgraph.config.edit_settings import resolve_edit_settings
@@ -263,24 +264,25 @@ def _read_file_content(
 
 SEARCH_REPLACE_TOOL_DESC = (
     "局部替换工作区文本文件内容（需 -w）。修改已有代码时优先使用。"
-    "old_string 尽量与磁盘一致；CRLF、行尾空白、缩进偏差、误贴 read_file 行号前缀会自动对齐"
-    "（对齐 Cursor / Claude Code / Codex 改码命中）。"
+    "old_string 尽量与磁盘一致；CRLF、行尾空白、缩进偏差、误贴 read_file 行号前缀会自动对齐；"
+    "仍 0 命中且全文件有唯一高相似行窗时会 fuzzy 落地（对齐 Cursor Fast Apply / Codex apply_patch）。"
     "默认同文件多处须唯一，或 replace_all=true。"
     "同一文件多处修改优先 replacements=[{old_string,new_string},...] 一次提交，按顺序应用。"
-    "成功后返回带行号的写入后快照；继续改同一文件须用该快照，勿用写入前的 read。"
+    "成功后返回带行号的写入后快照；若引入语法错误会附 [语法诊断]，须在本轮修复。"
+    "继续改同一文件须用该快照，勿用写入前的 read。"
 )
 
 WRITE_FILE_TOOL_DESC = (
     "创建新文件或整文件覆盖（需 -w）。每次调用必须同时提供 path 与 content，禁止只传 path。"
     "长文档（超过约 8000 字符）勿一次写全：先写标题与目录骨架，再用 append_file 或 search_replace 分节追加。"
     "Markdown 路径可直接使用 .md 后缀。"
-    "成功后返回文件头部快照；后续局部修改请 search_replace 并引用该快照。"
+    "成功后返回文件头部快照；若引入语法错误会附 [语法诊断]。后续局部修改请 search_replace 并引用该快照。"
 )
 
 APPEND_FILE_TOOL_DESC = (
     "向工作区文件末尾追加文本（需 -w）；文件不存在则创建。每次必须提供 path 与 content。"
     "长文档分块写入时，第一节用 write_file，后续各节用 append_file（单次 content 建议 <8000 字符）。"
-    "成功后返回文件末尾快照。"
+    "成功后返回文件末尾快照；若引入语法错误会附 [语法诊断]。"
 )
 
 
@@ -384,6 +386,14 @@ def create_filesystem_tools(
         if on_file_changed is not None:
             on_file_changed(rel)
         return rel
+
+    def _with_diagnostics(rel: str, body: str, new_text: str, *, old_text: str = "") -> str:
+        if not edit_cfg.syntax_diagnostics:
+            return body
+        extra = format_edit_diagnostics(rel, new_text, old_text=old_text)
+        if not extra:
+            return body
+        return f"{body.rstrip()}\n{extra}"
 
     def list_directory(path: str = ".") -> str:
         """
@@ -862,6 +872,12 @@ def create_filesystem_tools(
             target = ctx.resolve_path(rel, for_write=True)
         except PermissionError as exc:
             return str(exc)
+        old_text = ""
+        if target.is_file():
+            try:
+                old_text = target.read_text(encoding="utf-8")
+            except OSError:
+                old_text = ""
         if edit_tracker is not None and target.is_file():
             edit_tracker.ensure_snapshot(rel)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -877,7 +893,12 @@ def create_filesystem_tools(
             start_line=1,
             end_line=min(total_lines, 40) if total_lines else 0,
         )
-        return f"已写入 {rel}（{len(content)} 字符）{hint}\n{snapshot}"
+        return _with_diagnostics(
+            rel,
+            f"已写入 {rel}（{len(content)} 字符）{hint}\n{snapshot}",
+            content,
+            old_text=old_text,
+        )
 
     def append_file(path: str, content: str = "") -> str:
         """
@@ -895,11 +916,12 @@ def create_filesystem_tools(
             target = ctx.resolve_path(rel, for_write=True)
         except PermissionError as exc:
             return str(exc)
+        old_text = ""
         if target.is_file():
             if edit_tracker is not None:
                 edit_tracker.ensure_snapshot(rel)
-            existing = target.read_text(encoding="utf-8")
-            new_text = existing + content
+            old_text = target.read_text(encoding="utf-8")
+            new_text = old_text + content
         else:
             new_text = content
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -913,7 +935,12 @@ def create_filesystem_tools(
         snapshot = format_write_snapshot(
             rel, new_text, start_line=tail_start, end_line=total_lines
         )
-        return f"已追加 {rel}（+{len(content)} 字符，共 {len(new_text)} 字符）{hint}\n{snapshot}"
+        return _with_diagnostics(
+            rel,
+            f"已追加 {rel}（+{len(content)} 字符，共 {len(new_text)} 字符）{hint}\n{snapshot}",
+            new_text,
+            old_text=old_text,
+        )
 
     def search_replace(
         path: str,
@@ -959,6 +986,7 @@ def create_filesystem_tools(
             text,
             hunks,
             require_unique=edit_cfg.require_unique_match,
+            allow_fuzzy=edit_cfg.fuzzy_apply,
         )
         if not applied.ok:
             return format_apply_failure(rel, applied)
@@ -976,7 +1004,12 @@ def create_filesystem_tools(
         )
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
-        return format_apply_success(rel, applied, old_text=text)
+        return _with_diagnostics(
+            rel,
+            format_apply_success(rel, applied, old_text=text),
+            applied.new_text,
+            old_text=text,
+        )
 
     tools: list = [
         StructuredTool.from_function(
