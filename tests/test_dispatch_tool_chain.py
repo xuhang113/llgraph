@@ -390,7 +390,8 @@ def test_prune_skipped_when_context_pressure_low() -> None:
     assert pruned[1].content == long_body
 
 
-def test_dispatch_prune_skipped_when_context_pressure_low() -> None:
+def test_dispatch_prunes_even_when_context_pressure_low() -> None:
+    """出站裁剪不对齐满窗压力：低占用也要把较早 grep 换成指针。"""
     messages = [
         HumanMessage(content="q"),
         ToolMessage(content="grep-old-" + "x" * 5000, tool_call_id="1", name="grep_files"),
@@ -399,9 +400,151 @@ def test_dispatch_prune_skipped_when_context_pressure_low() -> None:
     out = prune_tool_messages_for_dispatch(
         messages,
         Path("/tmp/ws"),
-        _settings(tool_prune_token_ratio=0.7),
+        _settings(tool_prune_token_ratio=0.7, dispatch_keep_full_tool_messages=1),
     )
     tools = [m for m in out if isinstance(m, ToolMessage)]
-    assert tools[0].content.startswith("grep-old")
+    assert "grep-old" not in tools[0].content
+    assert "[历史" in tools[0].content
     assert tools[1].content == "grep-new"
+
+
+def test_dispatch_pins_latest_write_snapshot_outside_recency() -> None:
+    """写入快照在 recency 窗口外仍保留，避免模型拿过期 read 继续改。"""
+    snapshot = (
+        "已替换 src/Foo.java（1 处）\n"
+        "--- src/Foo.java (行 1-2 / 共 2 行) [写入后快照] ---\n"
+        "1| new line\n"
+        "后续 search_replace 请以此快照为准，勿使用写入前的 read。"
+    )
+    greps = [
+        ToolMessage(content=f"grep-{i}-" + "x" * 2000, tool_call_id=f"g{i}", name="grep_files")
+        for i in range(4)
+    ]
+    messages = [
+        HumanMessage(content="改 Foo"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "search_replace", "args": {"path": "src/Foo.java"}, "id": "w1"}],
+        ),
+        ToolMessage(content=snapshot, tool_call_id="w1", name="search_replace"),
+        *[
+            item
+            for i, grep in enumerate(greps)
+            for item in (
+                AIMessage(content="", tool_calls=[{"name": "grep_files", "args": {}, "id": f"g{i}"}]),
+                grep,
+            )
+        ],
+    ]
+    out = prune_tool_messages_for_dispatch(
+        messages,
+        Path("/tmp/ws"),
+        _settings(dispatch_keep_full_tool_messages=2, tool_prune_token_ratio=0.7),
+    )
+    tools = [m for m in out if isinstance(m, ToolMessage)]
+    assert tools[0].content == snapshot
+    assert "grep-0" not in tools[1].content
+    assert "grep-1" not in tools[2].content
+    assert "grep-2-" in tools[3].content
+    assert "grep-3-" in tools[4].content
+
+
+def test_dispatch_compacts_older_write_to_same_path() -> None:
+    old_snap = (
+        "已替换 src/Foo.java（1 处）\n"
+        "--- src/Foo.java (行 1-1 / 共 1 行) [写入后快照] ---\n"
+        "1| first"
+    )
+    new_snap = (
+        "已替换 src/Foo.java（1 处）\n"
+        "--- src/Foo.java (行 1-1 / 共 1 行) [写入后快照] ---\n"
+        "1| second"
+    )
+    messages = [
+        HumanMessage(content="改"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "search_replace", "args": {"path": "src/Foo.java"}, "id": "w1"}],
+        ),
+        ToolMessage(content=old_snap, tool_call_id="w1", name="search_replace"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "search_replace", "args": {"path": "src/Foo.java"}, "id": "w2"}],
+        ),
+        ToolMessage(content=new_snap, tool_call_id="w2", name="search_replace"),
+        ToolMessage(content="grep-a-" + "x" * 2000, tool_call_id="g1", name="grep_files"),
+        ToolMessage(content="grep-b-" + "x" * 2000, tool_call_id="g2", name="grep_files"),
+        ToolMessage(content="grep-c-" + "x" * 2000, tool_call_id="g3", name="grep_files"),
+    ]
+    out = prune_tool_messages_for_dispatch(
+        messages,
+        Path("/tmp/ws"),
+        _settings(dispatch_keep_full_tool_messages=2),
+    )
+    tools = [m for m in out if isinstance(m, ToolMessage)]
+    assert "[历史 search_replace 已归档]" in tools[0].content
+    assert "1| first" not in tools[0].content
+    assert tools[1].content == new_snap
+
+
+def test_mask_write_snapshot_is_not_treated_as_read() -> None:
+    from llgraph.context.context_spill import mask_tool_message_to_dispatch_pointer
+
+    snapshot = (
+        "已替换 src/Foo.java（1 处）\n"
+        "--- src/Foo.java (行 1-2 / 共 2 行) [写入后快照] ---\n"
+        "1| new line"
+    )
+    msg = ToolMessage(content=snapshot, tool_call_id="w1", name="search_replace")
+    out = mask_tool_message_to_dispatch_pointer(msg)
+    assert "[历史 read" not in out.content
+    assert "search_replace" in out.content
+    assert "src/Foo.java" in out.content
+
+
+def test_dispatch_compact_intercept_does_not_consume_keep_slots() -> None:
+    intercept = (
+        "[llgraph] 重复工具已拦截\n"
+        "read_file 已在本问先前工具结果执行过。\n"
+        "上次返回摘录:\n1| already"
+    )
+    messages = [
+        HumanMessage(content="q"),
+        ToolMessage(content="grep-old-" + "x" * 3000, tool_call_id="1", name="grep_files"),
+        ToolMessage(content=intercept, tool_call_id="2", name="read_file"),
+        ToolMessage(content="grep-new-" + "y" * 100, tool_call_id="3", name="grep_files"),
+    ]
+    out = prune_tool_messages_for_dispatch(
+        messages,
+        Path("/tmp/ws"),
+        _settings(dispatch_keep_full_tool_messages=1),
+    )
+    tools = [m for m in out if isinstance(m, ToolMessage)]
+    assert "grep-old" not in tools[0].content
+    assert tools[1].content == intercept
+    assert "grep-new" in tools[2].content
+
+
+def test_dispatch_protects_cited_grep_outside_recency() -> None:
+    cited = "--- src/Foo.java:167 ---\n>>> 167| throw new BizException()\n" + ("x" * 2000)
+    messages = [
+        HumanMessage(content="q"),
+        AIMessage(content="", tool_calls=[{"name": "grep_files", "args": {}, "id": "1"}]),
+        ToolMessage(content=cited, tool_call_id="1", name="grep_files"),
+        AIMessage(content="", tool_calls=[{"name": "grep_files", "args": {}, "id": "2"}]),
+        ToolMessage(content="grep-mid-" + "y" * 2000, tool_call_id="2", name="grep_files"),
+        AIMessage(content="", tool_calls=[{"name": "grep_files", "args": {}, "id": "3"}]),
+        ToolMessage(content="grep-new", tool_call_id="3", name="grep_files"),
+        AIMessage(content="结论：Foo.java:167 处 BizException。"),
+    ]
+    out = prune_tool_messages_for_dispatch(
+        messages,
+        Path("/tmp/ws"),
+        _settings(dispatch_keep_full_tool_messages=1),
+    )
+    tools = [m for m in out if isinstance(m, ToolMessage)]
+    assert "BizException" in tools[0].content
+    assert "grep-mid" not in tools[1].content
+    assert tools[2].content == "grep-new"
+
 

@@ -96,10 +96,12 @@ CONTEXT_CONFIG_DOCS: dict[str, str] = {
     "incremental_tool_prune": "是否将较早 ToolMessage 超长输出替换为指针（默认 true）。",
     "keep_recent_tool_messages": "incremental_tool_prune 落盘会话时保留全文 ToolMessage 条数（auto 默认 6）。",
     "dispatch_tool_chain_compress": (
-        "发往模型前是否压缩 tool 链：较早 ToolMessage 替换为指针，仅最近 N 条保留全文（默认 true）。"
+        "发往模型前是否压缩 tool 链：较早 grep/read 替换为指针，仅最近 N 条重结果保留全文（默认 true）。"
+        "出站始终按 recency 压缩（不对齐满窗压力）；写入成功快照按路径钉住最新一份。"
     ),
     "dispatch_keep_full_tool_messages": (
-        "dispatch_tool_chain_compress 时出站保留全文的 ToolMessage 条数（auto 默认 6）。"
+        "dispatch_tool_chain_compress 时出站保留全文的**重** ToolMessage 条数（auto 默认 6）；"
+        "短指针/重复拦截不占名额。"
     ),
     "spill_exempt_tools": "不参与落盘的工具名；默认空（read_file/read_files 超长也会落盘+指针）。",
     "tool_result_max_chars": "grep/shell 等工具 spill 阈值（auto 默认 12000）。",
@@ -137,8 +139,8 @@ CONTEXT_CONFIG_DOCS: dict[str, str] = {
     ),
     "spill_hit_context_lines": "read 落盘时，对历史 grep/parallel 命中行在源文件 ±N 行嵌入预览（auto 默认 100）。",
     "tool_prune_token_ratio": (
-        "历史 ToolMessage mask 起始比例（相对 LLM 压缩阈值，auto 默认 0.7）；"
-        "低于该比例时不 mask 历史 tool，仅对超大单次结果 spill。"
+        "历史 ToolMessage **checkpoint/落盘** mask 起始比例（相对 LLM 压缩阈值，auto 默认 0.7）；"
+        "低于该比例时不改写会话里的历史 tool。出站 dispatch 裁剪不受此项门控。"
     ),
 }
 

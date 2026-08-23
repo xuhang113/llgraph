@@ -34,6 +34,9 @@ _ERROR_PREFIXES = (
 
 _READ_TOOLS = frozenset({"read_file", "read_files"})
 _READ_PATH_HDR = re.compile(r"^---\s+(.+?)\s+\(行\s+\d+", re.MULTILINE)
+_WRITE_PATH_RE = re.compile(
+    r"^(?:已写入|已追加|已替换)\s+(.+?)(?:（|\s+\(|$)",
+)
 _ARCHIVE_READ_HEAD_LINES = 15
 _ARCHIVE_READ_TAIL_LINES = 15
 _ARCHIVE_SEARCH_HIT_BLOCKS = 8
@@ -386,6 +389,25 @@ def build_read_tool_archive_pointer(
     return "\n".join(parts)
 
 
+def _mask_write_tool_message(msg: ToolMessage, content: str) -> ToolMessage:
+    """旧写入压成指针；最新快照由 dispatch 钉住，不走本函数。"""
+    tool_name = str(getattr(msg, "name", "") or "write")
+    rel = ""
+    match = _WRITE_PATH_RE.match(content.strip())
+    if match:
+        rel = match.group(1).strip()
+    target = f"`{rel}`" if rel else "该文件"
+    short = (
+        f"[历史 {tool_name} 已归档] {target} 较早写入结果（{len(content)} 字符）；"
+        f"以该路径后续写入快照为准，或再 read_file。"
+    )
+    return ToolMessage(
+        content=short,
+        tool_call_id=msg.tool_call_id,
+        name=getattr(msg, "name", None),
+    )
+
+
 def _mask_search_tool_message(msg: ToolMessage, content: str) -> ToolMessage:
     tool_name = str(getattr(msg, "name", "") or "search")
     archived = build_search_tool_archive_pointer(content, tool_name)
@@ -464,14 +486,23 @@ def mask_tool_message_to_dispatch_pointer(msg: ToolMessage) -> ToolMessage:
     @param msg 工具消息
     @return 指针或原样（已是指针时）
     """
+    from llgraph.core.write_failure_tracker import WRITE_TOOL_NAMES
+
+    name = str(getattr(msg, "name", "") or "")
     content = msg.content if isinstance(msg.content, str) else str(msg.content)
     if (
         "[历史工具输出已归档]" in content
         or "[历史工具输出已省略" in content
         or "[历史 read 已归档]" in content
         or "[工具结果已落盘" in content
+        or "[llgraph] 重复工具已拦截" in content
+        or "[llgraph] 重复失败已拦截" in content
     ):
         return msg
+
+    # 写入快照与 read 共用「--- path (行 …)」表头；旧写入压成指针，勿当 read 归档
+    if name in WRITE_TOOL_NAMES:
+        return _mask_write_tool_message(msg, content)
 
     path_match = re.search(r"全文路径[^:]*:\s*(\S+)", content)
     if path_match:
@@ -480,9 +511,9 @@ def mask_tool_message_to_dispatch_pointer(msg: ToolMessage) -> ToolMessage:
             f"[历史工具输出已归档] 详见 {rel}；"
             f"需要时用 read_file 或 grep_files 读取。"
         )
-    elif _READ_PATH_HDR.search(content) or getattr(msg, "name", None) in _READ_TOOLS:
+    elif _READ_PATH_HDR.search(content) or name in _READ_TOOLS:
         return _mask_read_tool_message(msg, content)
-    elif is_search_tool(str(getattr(msg, "name", "") or "")):
+    elif is_search_tool(name):
         return _mask_search_tool_message(msg, content)
     else:
         tool_name = getattr(msg, "name", None) or "tool"

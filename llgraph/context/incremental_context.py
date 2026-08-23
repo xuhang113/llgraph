@@ -33,6 +33,14 @@ _ARCHIVED_MARKERS = (
     "已 superseded",
     "已替换",
 )
+# 出站已压缩/拦截短文案：不占 recency 名额，也不再二次归档
+_COMPACT_TOOL_MARKERS = (
+    "[历史",
+    "[工具结果已落盘",
+    "[llgraph] 重复工具已拦截",
+    "[llgraph] 重复失败已拦截",
+    "已 superseded",
+)
 
 
 def _tool_content_is_archived(content: str) -> bool:
@@ -304,15 +312,92 @@ def maybe_prune_tools_during_react(
     return report
 
 
+def _tool_content_is_compact(content: str) -> bool:
+    """@param content 工具正文 @return 是否已是短指针/拦截文案"""
+    return any(marker in content for marker in _COMPACT_TOOL_MARKERS)
+
+
+def pinned_write_success_indices(
+    messages: list[BaseMessage],
+    *,
+    cap: int,
+) -> set[int]:
+    """
+    每个已写路径保留最新一次成功写入（含写入后快照）。
+
+    旧 read 出站作废后，快照是继续 search_replace 的原文；不能按 recency 丢掉。
+
+    @param messages 出站消息
+    @param cap 最多钉住的不同路径数
+    @return 消息下标集合
+    """
+    if cap <= 0:
+        return set()
+    from llgraph.context.stale_read_after_write import collect_write_success_paths
+
+    latest_by_path: dict[str, int] = {}
+    for idx, path in collect_write_success_paths(messages):
+        key = path or f"#{idx}"
+        latest_by_path[key] = idx
+    ranked = sorted(latest_by_path.values(), reverse=True)
+    return set(ranked[:cap])
+
+
+def dispatch_keep_tool_indices(
+    messages: list[BaseMessage],
+    settings: ContextSettings,
+) -> set[int]:
+    """
+    出站应保留全文的 ToolMessage 下标。
+
+    始终按 recency 保留最近 N 条**重**工具结果（不等满窗压力），再钉住
+    写入快照与被引用项。轻量指针/拦截文案不占 N。
+
+    @param messages 出站消息
+    @param settings 上下文配置
+    @return 保留下标
+    """
+    tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
+    if not tool_indices:
+        return set()
+
+    heavy: list[int] = []
+    light: set[int] = set()
+    for idx in tool_indices:
+        msg = messages[idx]
+        content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+        if _tool_content_is_compact(content):
+            light.add(idx)
+        else:
+            heavy.append(idx)
+
+    keep_n = max(1, settings.dispatch_keep_full_tool_messages)
+    keep_indices = set(heavy[-keep_n:]) if heavy else set()
+    keep_indices |= light
+    keep_indices |= pinned_write_success_indices(
+        messages,
+        cap=max(4, keep_n),
+    )
+    keep_indices |= _protected_cited_indices(
+        messages,
+        settings,
+        pressure=0.0,
+        already_kept=keep_indices,
+    )
+    return keep_indices
+
+
 def prune_tool_messages_for_dispatch(
     messages: list[BaseMessage],
     workspace: Path,
     settings: ContextSettings,
 ) -> list[BaseMessage]:
     """
-    发往模型前裁剪 tool 链（不修改 MemorySaver / 落盘）：仅最近 N 条 ToolMessage 保留全文。
+    发往模型前裁剪 tool 链（不修改 MemorySaver / 落盘）。
 
-    对齐 Cursor 动态上下文：grep/read 结果落盘或指针，模型按需 read_file 行段。
+    对标 Cursor / Claude Code 动态上下文：本问内旧 grep/read 出站改指针，
+    **不等** token 窗口压力；最近 N 条重结果 + 写入快照 + 被引用项保留全文。
+    模型若再调相同 read/grep，由 tool_loop_guard 短路径返回摘录。
 
     @param messages 已 canonical / repair 后的消息
     @param workspace 工作区根
@@ -326,17 +411,7 @@ def prune_tool_messages_for_dispatch(
     if not tool_indices:
         return messages
 
-    pressure = compute_tool_prune_pressure(messages, settings)
-    keep = effective_tool_keep_count(
-        len(tool_indices),
-        settings,
-        pressure,
-        min_keep=settings.dispatch_keep_full_tool_messages,
-    )
-    keep_indices = set(tool_indices[-keep:]) if keep > 0 else set()
-    keep_indices |= _protected_cited_indices(
-        messages, settings, pressure, already_kept=keep_indices
-    )
+    keep_indices = dispatch_keep_tool_indices(messages, settings)
     if keep_indices.issuperset(tool_indices):
         return messages
 
