@@ -44,6 +44,18 @@ class GrepFilesInput(BaseModel):
         default="",
         description='可选文件名限制，如 *.java、*.md；空表示不限制扩展名',
     )
+    output_mode: str = Field(
+        default="auto",
+        description=(
+            "结果形态：auto（默认，命中过多时折叠为文件统计+样例，对齐 Cursor/Claude Code）；"
+            "content 逐行命中；files / files_with_matches 仅路径+命中数；"
+            "count / count_matches 仅统计。"
+        ),
+    )
+    head_limit: int = Field(
+        default=0,
+        description="content 模式最多返回的命中条数；0 表示默认 40",
+    )
 
 
 class ListDirectoryInput(BaseModel):

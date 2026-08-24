@@ -17,7 +17,7 @@ anti_patterns: |
   ## 禁止
   1. 同一用户问题里第二次 `search_code_parallel`
   2. 循环猜仓库目录名
-  3. 同一 pattern 反复全仓 grep
+  3. 同一宽 pattern 反复全仓 grep（已折叠结果已含真实总数，勿再用同一 pattern 硬刷）
   4. 用列目录代替内容检索
   5. 串行单词 grep / 窄段反复 read
   6. 未整理提纲就原文硬搜并第一命中结案；或验证时无限新开线
@@ -33,6 +33,9 @@ batch_read: |
 
 batch_search: |
   多关键词 → 一条 `pattern="A|B|C"`。表名 + DO + Mapper + 字段名可合并。
+  grep_files 默认 auto：命中过多会折叠为「真实总数 + 按文件计数 + 少量样例」，
+  请收窄 path/file_glob 后再搜，或对候选文件 read_files；禁止同一宽 pattern 再全仓 grep。
+  明确要逐行时用 output_mode=content 且缩小范围；只要路径用 files；只要总数用 count。
 
 search_index_ready: |
   代码索引可用。不知位置时可选用 `search_code_parallel`（每问 ≤1）。发现文件勿用 shell ls/find/grep/cat。
@@ -44,4 +47,4 @@ glob_grep_miss_tail: |
   0 命中：放宽到 `path="."` 或文档；若已用过 parallel，只改 grep pattern——不要再 parallel。
 
 tool_invoke_params: |
-  参数：glob_files→glob_pattern+path；grep_files→pattern+path；read_files→paths；read_file→path[+行段]；list_directory→path。
+  参数：glob_files→glob_pattern+path；grep_files→pattern+path[+file_glob][+output_mode][+head_limit]；read_files→paths；read_file→path[+行段]；list_directory→path。

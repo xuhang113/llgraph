@@ -56,6 +56,18 @@ def test_glob_files_tool_invoke_with_glob_pattern(tmp_path: Path) -> None:
 def test_grep_files_input_rejects_empty_pattern() -> None:
     parsed = GrepFilesInput.model_validate({"pattern": "UserEntity"})
     assert parsed.pattern == "UserEntity"
+    assert parsed.output_mode == "auto"
+    assert parsed.head_limit == 0
+
+
+def test_grep_files_schema_includes_output_mode() -> None:
+    schema = convert_to_openai_tool(
+        next(t for t in _tools() if t.name == "grep_files")
+    )
+    props = schema["function"]["parameters"]["properties"]
+    assert "output_mode" in props
+    assert "head_limit" in props
+    assert "auto" in props["output_mode"]["description"]
 
 
 def test_search_replace_schema_includes_replacements() -> None:

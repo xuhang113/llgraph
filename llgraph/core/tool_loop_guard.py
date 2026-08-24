@@ -257,8 +257,10 @@ def shape_from_call(call: Any) -> ToolShape | None:
         pattern = str(args.get("pattern") or "").strip()
         path = _norm_path(args.get("path"))
         file_glob = str(args.get("file_glob") or "").strip()
+        output_mode = str(args.get("output_mode") or "auto").strip().lower() or "auto"
+        head_limit = _int_arg(args, "head_limit", 0)
         return ToolShape(
-            fp=ToolFp(name, ("grep", pattern, path, file_glob)),
+            fp=ToolFp(name, ("grep", pattern, path, file_glob, output_mode, head_limit)),
             name=name,
             kind="grep",
             path=path,

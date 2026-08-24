@@ -29,7 +29,18 @@ from llgraph.config.edit_settings import resolve_edit_settings
 from llgraph.cli.search_terms import build_search_terms
 from llgraph.code_index.index_ready import code_index_is_ready
 from llgraph.code_index.path_hits import match_paths_by_keyword
-from llgraph.core.ripgrep_search import ripgrep_available, ripgrep_content, ripgrep_files
+from llgraph.core.ripgrep_search import (
+    ripgrep_available,
+    ripgrep_content_in_files,
+    ripgrep_count,
+    ripgrep_files,
+)
+from llgraph.core.grep_collapse import (
+    FileMatchCount,
+    format_grep_result,
+    format_hit_block,
+    plan_grep,
+)
 from llgraph.core.text_file_types import is_probably_text_path, read_path_rejection_reason
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.core.write_failure_tracker import WriteFailureTracker
@@ -658,6 +669,8 @@ def create_filesystem_tools(
         pattern: str,
         path: str = ".",
         file_glob: str = "",
+        output_mode: str = "auto",
+        head_limit: int = 0,
     ) -> str:
         """
         在工作区文本文件中搜索内容（ripgrep）。
@@ -669,102 +682,169 @@ def create_filesystem_tools(
         path 是**搜索根**，须为工作区内**已存在**的目录；**禁止猜**仓库名。
         不确定时用 path=\".\" 搜全工作区。
 
+        默认 output_mode=auto：命中过多时折叠为「真实总数 + 文件统计 + 样例」
+        （对齐 Cursor / Claude Code 的 files_with_matches），避免 ±上下文把下一轮打满。
+        需要逐行时再收窄范围并设 output_mode=content。
+
         @param pattern 搜索模式（优先正则；非法则按字面量）
         @param path 搜索根相对目录，默认 .
         @param file_glob 可选文件名 glob 限制，如 *.md
+        @param output_mode auto|content|files|count（兼容 files_with_matches / count_matches）
+        @param head_limit content 最多条数；0 表示默认 40
         """
-        if ripgrep_available():
-            from llgraph.context.context_settings import resolve_context_settings
-
-            grep_ctx = resolve_context_settings(ctx.root).grep_context_lines
-            hits, err = ripgrep_content(
-                ctx.root,
-                pattern,
-                path_prefix=path,
-                file_glob=file_glob,
-                limit=MAX_GREP_MATCHES,
-                context_lines=grep_ctx,
-                skip_dirs=skip_dirs,
-            )
-            if err:
-                if "路径不存在" in err:
-                    return (
-                        f"grep_files 失败: {err}\n"
-                        "提示: path 须为已存在目录；不确定时用 path=\".\"，"
-                        "或 list_directory(path=\".\") 核对顶层仓库名后再 grep。"
-                    )
-                return f"grep_files 失败: {err}"
-            if not hits:
-                return _format_empty_grep_message(
-                    path, pattern, index_ready=index_ready
-                )
-            ctx_note = f"（含上下文 ±{grep_ctx} 行）" if grep_ctx > 0 else ""
-            header = f"匹配结果（ripgrep{ctx_note}）:\n"
-            if len(hits) >= MAX_GREP_MATCHES:
-                header = f"匹配结果（已达上限{ctx_note}）:\n"
-            return header + "\n\n".join(hits)
-
-        # 无 rg 时降级：Python 逐文件（仅小目录）
         from llgraph.context.context_settings import resolve_context_settings
 
         grep_ctx = resolve_context_settings(ctx.root).grep_context_lines
         try:
-            regex = re.compile(pattern)
-        except re.error:
-            regex = re.compile(re.escape(pattern))
+            head = int(head_limit or 0)
+        except (TypeError, ValueError):
+            head = 0
+        if head <= 0:
+            head = min(40, MAX_GREP_MATCHES)
+        else:
+            head = max(1, min(head, MAX_GREP_MATCHES))
 
-        results: list[str] = []
-        match_count = 0
-        for rel in ctx.iter_files(path, name_glob=file_glob or None):
-            full = ctx.resolve_path(rel)
-            if not full.is_file() or not is_probably_text_path(full, ctx.root):
-                continue
+        def _empty() -> str:
+            return _format_empty_grep_message(
+                path, pattern, index_ready=index_ready
+            )
+
+        def _path_error(err: str) -> str:
+            return (
+                f"grep_files 失败: {err}\n"
+                "提示: path 须为已存在目录；不确定时用 path=\".\"，"
+                "或 list_directory(path=\".\") 核对顶层仓库名后再 grep。"
+            )
+
+        def _render(counts: list[FileMatchCount], blocks: list[str], engine: str) -> str:
+            if not counts:
+                extra = ""
+                if engine == "python":
+                    extra = "（未安装 rg，遍历范围受限；建议安装 ripgrep。）"
+                    if index_ready:
+                        return _empty() + extra
+                    return _format_empty_grep_message(
+                        path, pattern, index_ready=False
+                    ) + extra
+                return _empty()
+            planned = plan_grep(
+                counts,
+                output_mode=output_mode,
+                head_limit=head,
+                context_lines=grep_ctx,
+            )
+            return format_grep_result(
+                plan=planned,
+                pattern=pattern,
+                path=path,
+                file_glob=file_glob,
+                content_blocks=blocks,
+                context_lines=grep_ctx,
+                engine=engine,
+            )
+
+        def _python_scan() -> tuple[list[FileMatchCount], list[str]]:
             try:
-                if full.stat().st_size > ctx.max_read_bytes:
+                regex = re.compile(pattern)
+            except re.error:
+                regex = re.compile(re.escape(pattern))
+            counts: list[FileMatchCount] = []
+            stored: dict[str, list[str]] = {}
+            for rel in ctx.iter_files(path, name_glob=file_glob or None):
+                full = ctx.resolve_path(rel)
+                if not full.is_file() or not is_probably_text_path(full, ctx.root):
                     continue
-                text = full.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-
-            file_lines = text.splitlines()
-            for line_no, line in enumerate(file_lines, start=1):
-                if not regex.search(line):
+                try:
+                    if full.stat().st_size > ctx.max_read_bytes:
+                        continue
+                    text = full.read_text(encoding="utf-8", errors="replace")
+                except OSError:
                     continue
-                match_count += 1
-                if grep_ctx > 0:
-                    start = max(1, line_no - grep_ctx)
-                    end = min(len(file_lines), line_no + grep_ctx)
-                    block_lines: list[str] = []
-                    for ln in range(start, end + 1):
-                        snippet = file_lines[ln - 1].strip()
-                        if len(snippet) > 200:
-                            snippet = snippet[:200] + "..."
-                        prefix = ">>>" if ln == line_no else "   "
-                        block_lines.append(f"{prefix} {ln}| {snippet}")
-                    results.append(
-                        f"--- {rel}:{line_no} ---\n" + "\n".join(block_lines)
-                    )
-                else:
-                    snippet = line.strip()
-                    if len(snippet) > 200:
-                        snippet = snippet[:200] + "..."
-                    results.append(f"{rel}:{line_no}: {snippet}")
-                if match_count >= MAX_GREP_MATCHES:
-                    note = f"（含上下文 ±{grep_ctx} 行）" if grep_ctx > 0 else ""
-                    return (
-                        f"匹配结果（已达上限{note}，建议安装 ripgrep）:\n\n"
-                        + "\n\n".join(results)
-                    )
+                file_lines = text.splitlines()
+                n = 0
+                file_blocks: list[str] = []
+                for line_no, line in enumerate(file_lines, start=1):
+                    if not regex.search(line):
+                        continue
+                    n += 1
+                    if len(file_blocks) < 8:
+                        file_blocks.append(
+                            format_hit_block(
+                                rel,
+                                line_no,
+                                file_lines,
+                                context_lines=grep_ctx,
+                            )
+                        )
+                if n:
+                    counts.append(FileMatchCount(rel, n))
+                    stored[rel] = file_blocks
+            planned = plan_grep(
+                counts,
+                output_mode=output_mode,
+                head_limit=head,
+                context_lines=grep_ctx,
+            )
+            blocks: list[str] = []
+            if planned.needs_content:
+                for rel_path in planned.content_paths:
+                    for block in stored.get(rel_path, [])[: planned.max_per_file]:
+                        blocks.append(block)
+                        if len(blocks) >= planned.content_limit:
+                            return counts, blocks
+            return counts, blocks
 
-        if not results:
-            if index_ready:
-                return (
-                    _format_empty_grep_message(path, pattern, index_ready=True)
-                    + "（未安装 rg，遍历范围受限；建议安装 ripgrep。）"
+        if ripgrep_available():
+            try:
+                raw_counts, err = ripgrep_count(
+                    ctx.root,
+                    pattern,
+                    path_prefix=path,
+                    file_glob=file_glob,
+                    skip_dirs=skip_dirs,
                 )
-            return _format_empty_grep_message(path, pattern, index_ready=False)
-        note = f"（含上下文 ±{grep_ctx} 行）" if grep_ctx > 0 else ""
-        return f"匹配结果{note}:\n\n" + "\n\n".join(results)
+            except Exception as exc:
+                raw_counts, err = [], f"ripgrep_count 异常: {exc}"
+            if err:
+                if "路径不存在" in err or "超出工作区" in err:
+                    return _path_error(err)
+                counts, blocks = _python_scan()
+                return _render(counts, blocks, "python")
+            if not raw_counts:
+                return _empty()
+            counts = [FileMatchCount(rel, n) for rel, n in raw_counts]
+            planned = plan_grep(
+                counts,
+                output_mode=output_mode,
+                head_limit=head,
+                context_lines=grep_ctx,
+            )
+            blocks: list[str] = []
+            if planned.needs_content:
+                try:
+                    blocks, _c_err = ripgrep_content_in_files(
+                        ctx.root,
+                        pattern,
+                        list(planned.content_paths),
+                        limit=planned.content_limit,
+                        context_lines=grep_ctx,
+                        max_per_file=planned.max_per_file,
+                    )
+                except Exception:
+                    counts_py, blocks = _python_scan()
+                    return _render(counts_py, blocks, "python")
+            return format_grep_result(
+                plan=planned,
+                pattern=pattern,
+                path=path,
+                file_glob=file_glob,
+                content_blocks=blocks,
+                context_lines=grep_ctx,
+                engine="ripgrep",
+            )
+
+        counts, blocks = _python_scan()
+        return _render(counts, blocks, "python")
 
     def read_file(
         path: str,
