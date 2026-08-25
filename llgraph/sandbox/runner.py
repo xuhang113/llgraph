@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
-import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from llgraph.sandbox.exec import spawn_sandboxed_shell
 from llgraph.sandbox.policy import SandboxPolicy
 
 
@@ -28,125 +29,43 @@ def run_sandboxed_shell(
     cwd: Path,
     timeout_sec: float,
     env: dict[str, str] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> SandboxShellResult:
     """
-    在 OS 沙箱中执行 shell 命令；未启用沙箱时回退普通 subprocess。
+    在 OS 沙箱中执行 shell 命令；未启用沙箱时回退普通 /bin/sh。
+
+    超时或取消时仍返回已捕获的 stdout/stderr（不再丢空）。
 
     @param policy 沙箱策略
     @param command shell 命令
     @param cwd 工作目录
-    @param timeout_sec 超时秒数
+    @param timeout_sec 超时秒数（到期杀进程组）
     @param env 环境变量
+    @param cancel_check 可选；返回 True 时终止
     @return SandboxShellResult
     """
     run_env = dict(env or os.environ)
-
-    if not policy.enabled:
-        try:
-            completed = subprocess.run(
-                command,
-                shell=True,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-                env=run_env,
-            )
-        except subprocess.TimeoutExpired:
-            return SandboxShellResult("", "", -1, False, error="timeout")
-        except OSError as exc:
-            return SandboxShellResult("", "", -1, False, error=str(exc))
-        return SandboxShellResult(
-            completed.stdout or "",
-            completed.stderr or "",
-            completed.returncode,
-            False,
-        )
-
-    if policy.backend == "macos_seatbelt":
-        return _run_macos(policy, command=command, cwd=cwd, timeout_sec=timeout_sec, env=run_env)
-    if policy.backend == "linux_bwrap":
-        return _run_linux(policy, command=command, cwd=cwd, timeout_sec=timeout_sec, env=run_env)
-    return SandboxShellResult(
-        "",
-        "",
-        -1,
-        False,
-        error="沙箱后端不可用",
+    live, err = spawn_sandboxed_shell(
+        policy,
+        command=command,
+        cwd=cwd,
+        env=run_env,
+        hard_timeout_sec=max(5.0, timeout_sec),
     )
+    if err or live is None:
+        return SandboxShellResult("", "", -1, False, error=err or "启动失败")
 
-
-def _run_macos(
-    policy: SandboxPolicy,
-    *,
-    command: str,
-    cwd: Path,
-    timeout_sec: float,
-    env: dict[str, str],
-) -> SandboxShellResult:
-    profile_path = policy.create_seatbelt_profile_file()
-    try:
-        argv = [
-            "/usr/bin/sandbox-exec",
-            "-f",
-            str(profile_path),
-            "/bin/sh",
-            "-c",
-            command,
-        ]
-        completed = subprocess.run(
-            argv,
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return SandboxShellResult("", "", -1, True, error="timeout")
-    except OSError as exc:
-        return SandboxShellResult("", "", -1, True, error=str(exc))
-    finally:
-        try:
-            profile_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-
+    finished = live.wait(timeout_sec, cancel_check=cancel_check)
+    if not finished:
+        live.kill("timeout")
+    stdout, stderr = live.snapshot_stdio()
+    code = live.returncode()
+    if code is None:
+        code = -1
     return SandboxShellResult(
-        completed.stdout or "",
-        completed.stderr or "",
-        completed.returncode,
-        True,
-    )
-
-
-def _run_linux(
-    policy: SandboxPolicy,
-    *,
-    command: str,
-    cwd: Path,
-    timeout_sec: float,
-    env: dict[str, str],
-) -> SandboxShellResult:
-    from llgraph.sandbox.linux import build_bwrap_command
-
-    argv = build_bwrap_command(policy, command=command, cwd=cwd)
-    try:
-        completed = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout_sec,
-            env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return SandboxShellResult("", "", -1, True, error="timeout")
-    except OSError as exc:
-        return SandboxShellResult("", "", -1, True, error=str(exc))
-
-    return SandboxShellResult(
-        completed.stdout or "",
-        completed.stderr or "",
-        completed.returncode,
-        True,
+        stdout,
+        stderr,
+        code,
+        live.sandboxed,
+        error=live.error,
     )

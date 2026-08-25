@@ -54,7 +54,8 @@ investigation: |
   - 用户错误文案 **grep 0 命中**：在正文说明「仓库内无此字面量」，列可能来源即可；**禁止**为此再开 10+ 轮检索。
   - 至少 **2 种不同手段**（如 grep + read）仍无线索后，才可说「找不到」。
   - 远早对话：search_session_history + read 归档；业务归属先读 markdowns/docs 索引。
-  - 构建/测试：run_shell_command；**禁止** shell 的 ls/find/grep/cat 做文件发现。
+  - 构建/测试：run_shell_command（长任务 `block_until_ms` + `await_shell`）；看输出**末尾**失败信息，禁止没看完就声称通过，禁止对已在跑的同一命令再开一份。
+  - **禁止** shell 的 ls/find/grep/cat 做文件发现。
 
 code_quality: |
   ## 改代码与答复质量（对齐 Cursor）

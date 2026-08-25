@@ -211,6 +211,11 @@ def _short_tool_target(tool_name: str, args: Any) -> str:
                 return _format_trace_path(paths[0].strip())
             return f"{len(paths)} files"
 
+    if name == "await_shell":
+        job_id = args.get("job_id")
+        if isinstance(job_id, str) and job_id.strip():
+            return job_id.strip()
+
     for key in ("query", "pattern", "command", "url", "path"):
         val = args.get(key)
         if not isinstance(val, str) or not val.strip():

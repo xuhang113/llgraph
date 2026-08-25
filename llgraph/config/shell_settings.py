@@ -14,7 +14,9 @@ class ShellSettings:
 
     enabled: bool
     timeout_sec: float
+    background_timeout_sec: float
     max_output_chars: int
+    max_jobs: int
     terminal_log_dir: str
     log_commands: bool
 
@@ -40,10 +42,22 @@ def resolve_shell_settings(workspace: Path) -> ShellSettings:
     timeout_sec = max(5.0, min(timeout_sec, 600.0))
 
     try:
-        max_output_chars = int(shell.get("max_output_chars", 100_000))
+        background_timeout_sec = float(shell.get("background_timeout_sec", 1800))
     except (TypeError, ValueError):
-        max_output_chars = 100_000
+        background_timeout_sec = 1800.0
+    background_timeout_sec = max(timeout_sec, min(background_timeout_sec, 7200.0))
+
+    try:
+        max_output_chars = int(shell.get("max_output_chars", 32_000))
+    except (TypeError, ValueError):
+        max_output_chars = 32_000
     max_output_chars = max(1000, min(max_output_chars, 500_000))
+
+    try:
+        max_jobs = int(shell.get("max_jobs", 4))
+    except (TypeError, ValueError):
+        max_jobs = 4
+    max_jobs = max(1, min(max_jobs, 8))
 
     log_dir = str(shell.get("terminal_log_dir", ".llgraph/context/terminals")).strip()
     if not log_dir:
@@ -56,7 +70,9 @@ def resolve_shell_settings(workspace: Path) -> ShellSettings:
     return ShellSettings(
         enabled=bool(enabled),
         timeout_sec=timeout_sec,
+        background_timeout_sec=background_timeout_sec,
         max_output_chars=max_output_chars,
+        max_jobs=max_jobs,
         terminal_log_dir=log_dir,
         log_commands=bool(log_commands),
     )

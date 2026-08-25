@@ -12,7 +12,7 @@ def shutdown_agent_resources(
     edit_tracker: Any | None = None,
 ) -> None:
     """
-    交互结束或进程退出前释放后台资源，避免 atexit 阶段 join 阻塞。
+    交互结束或进程退出前释放后台资源（watch / MCP / 编辑账本 / 后台 shell），避免残留进程。
 
     @param watch_service IndexWatchService
     @param mcp_registry McpToolRegistry
@@ -39,3 +39,10 @@ def shutdown_agent_resources(
                 emit_report(summary)
         except Exception:
             pass
+
+    try:
+        from llgraph.core.shell_jobs import get_shell_registry
+
+        get_shell_registry().kill_all()
+    except Exception:
+        pass
