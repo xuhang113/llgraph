@@ -26,8 +26,9 @@ _SKIP_DIR_NAMES = frozenset({
 })
 
 # 单文件读取默认上限（字节 / 行）；工作区可在 agent.json context 覆盖
+# 行数对齐 Claude Code 默认截断；无行段的大文件在此之前会先走大纲折叠
 DEFAULT_READ_FILE_MAX_BYTES = 600_000
-DEFAULT_READ_FILE_MAX_LINES = 6000
+DEFAULT_READ_FILE_MAX_LINES = 2000
 
 # 内容检索最多返回条数
 MAX_GREP_MATCHES = 80

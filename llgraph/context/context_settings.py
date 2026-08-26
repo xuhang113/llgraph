@@ -110,12 +110,12 @@ CONTEXT_CONFIG_DOCS: dict[str, str] = {
         "高于 tool_result_max_chars，减少「仅尾部预览→反复 read」。"
     ),
     "read_file_max_bytes": (
-        "read_file/read_files 单文件磁盘读取字节上限（auto 默认 600000，约 6000 行×100 字符）；"
+        "read_file/read_files 单文件磁盘读取字节上限（auto 默认 600000）；"
         "超过需 start_line/end_line 分段。"
     ),
     "read_file_max_lines": (
-        "read_file/read_files 单次返回最大行数（auto 默认 6000，通用推荐区间 4000~8000 的中位）；"
-        "超出截断并提示继续 read。"
+        "read_file/read_files 明确行段时单次返回最大行数（默认 2000，对齐 Claude Code）；"
+        "未指定行段的大文件会先折叠为大纲+命中窗，不走到此上限。"
     ),
     "tool_result_preview_head_lines": "read 落盘/归档时保留的开头预览行数（auto 默认 25，含 package/import）。",
     "tool_result_preview_lines": "read 落盘/归档时保留的末尾预览行数（auto 默认 40）。",
@@ -327,9 +327,7 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     except (TypeError, ValueError):
         read_file_max_bytes = default_read_file_bytes
 
-    default_read_file_lines = (
-        6000 if is_auto_compress_strategy(compress_strategy) else 2000
-    )
+    default_read_file_lines = 2000
     read_file_lines_raw = ctx.get("read_file_max_lines", default_read_file_lines)
     try:
         read_file_max_lines = max(200, int(read_file_lines_raw))

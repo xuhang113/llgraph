@@ -5,7 +5,7 @@ tool_routing: |
   | 信号 | 第一步 | 随后 |
   | 广搜 / 业务链路 / 多模块摸底 / 不知从哪下手 | `spawn_subagent(kind="explore")` | 主会话读摘要后精读/作答 |
   | 字面量（字段/类/表/URL 片段）针点 | `grep_files(pattern="a\|b\|c", path=".")` | 批量 `read_files` |
-  | 已知文件名 glob | `glob_files` | 宽段 `read_file` |
+  | 已知文件名 glob | `glob_files` | 大文件先看大纲，再对符号 `read_file` 行段 |
   | 针点且不知在哪（未 spawn） | `search_code_parallel` ×1 | grep → read |
   | 列仓库（针点定位用） | `list_directory(".")` 一次 | grep |
   | 更早会话细节 | `search_session_history` | 归档 `read_file` |
@@ -26,10 +26,10 @@ path_scope: |
   `path` 是检索子树根（相对工作区）。跨仓默认 `"."`。禁止 `"../"`。
 
 code_search: |
-  并行检索给线索；行级证据靠 grep；深入理解靠 `read_files` / 宽段 `read_file`。
+  并行检索给线索；行级证据靠 grep；深入理解靠 `read_files` / 按符号 `read_file` 行段。大文件未指定行段会折叠为大纲+命中窗。
 
 batch_read: |
-  多路径 → 一次 `read_files`（≤8）。连续区间 → 一次宽段 `read_file`（常 80–300 行）。不连续区间 → 同条消息并行多个 `read_file`。
+  多路径 → 一次 `read_files`（≤8）。连续区间 → 一次 `read_file` 行段（常 80–300 行）。不连续区间 → 同条消息并行多个 `read_file`。大文件无行段时先看大纲，再精读符号。
 
 batch_search: |
   多关键词 → 一条 `pattern="A|B|C"`。表名 + DO + Mapper + 字段名可合并。

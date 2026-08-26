@@ -72,7 +72,14 @@ class ReadFileInput(BaseModel):
 
     path: str = Field(description="单个文件路径，相对工作区或 ~/.llgraph/skills|rules")
     start_line: int = Field(default=1, description="起始行号，从 1 开始")
-    end_line: int = Field(default=0, description="结束行号（含）；0 表示读到文件末尾")
+    end_line: int = Field(
+        default=0,
+        description=(
+            "结束行号（含）；0 表示到末尾。"
+            "大文件且未指定行段时自动返回符号大纲+检索命中窗，而非全文；"
+            "精读请给出完整函数/类的 start_line/end_line"
+        ),
+    )
 
 
 class ReadFilesInput(BaseModel):
@@ -82,7 +89,13 @@ class ReadFilesInput(BaseModel):
         description="多个完整相对路径的数组，如 [\"src/a.java\", \"src/b.java\"]，最多 8 个",
     )
     start_line: int = Field(default=1, description="每个文件的起始行号，从 1 开始")
-    end_line: int = Field(default=0, description="每个文件的结束行号（含）；0 表示到末尾")
+    end_line: int = Field(
+        default=0,
+        description=(
+            "每个文件的结束行号（含）；0 表示到末尾。"
+            "大文件未指定行段时同样折叠为大纲+命中窗"
+        ),
+    )
 
 
 class SearchReplaceHunkInput(BaseModel):

@@ -41,6 +41,12 @@ from llgraph.core.grep_collapse import (
     format_hit_block,
     plan_grep,
 )
+from llgraph.core.read_focus import (
+    format_focus_read,
+    format_numbered_slice,
+    hit_lines_for_path,
+    should_focus_read,
+)
 from llgraph.core.text_file_types import is_probably_text_path, read_path_rejection_reason
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.core.write_failure_tracker import WriteFailureTracker
@@ -253,24 +259,35 @@ def _read_file_content(
         )
 
     start = max(1, start_line)
-    end = len(lines) if end_line <= 0 else min(end_line, len(lines))
     if start > len(lines):
         return None, f"文件共 {len(lines)} 行，start_line 超出范围。"
 
-    selected = lines[start - 1 : end]
+    if should_focus_read(
+        start_line=start,
+        end_line=end_line,
+        total_lines=len(lines),
+    ):
+        return (
+            format_focus_read(
+                path,
+                lines,
+                hit_lines=hit_lines_for_path(path),
+            ),
+            None,
+        )
+
+    end = len(lines) if end_line <= 0 else min(end_line, len(lines))
     truncated = False
-    if len(selected) > max_read_lines:
-        selected = selected[:max_read_lines]
+    if (end - start + 1) > max_read_lines:
         end = start + max_read_lines - 1
         truncated = True
-    header = f"--- {path} (行 {start}-{end} / 共 {len(lines)} 行) ---\n"
-    body = "\n".join(f"{start + i}| {line}" for i, line in enumerate(selected))
+    body = format_numbered_slice(path, lines, start, end, total=len(lines))
     if truncated:
         body += (
             f"\n\n（已截断：单次最多 {max_read_lines} 行；"
             f"继续请 read_file(path, start_line={end + 1}, end_line=...)）"
         )
-    return header + body, None
+    return body, None
 
 
 SEARCH_REPLACE_TOOL_DESC = (
@@ -854,9 +871,10 @@ def create_filesystem_tools(
         """
         读取单个文本文件（可指定行号范围）。
 
-        **对齐 Cursor 高效读法**：
+        **对齐 Cursor / Claude Code**：
         - 多个路径 → **read_files 一次批量**（勿逐个 read_file 各占一轮）；
-        - 单文件需看 import+方法 → **一次宽行段**（如 start_line=1, end_line=180），勿 30 行一段分多轮；
+        - 大文件未指定行段 → 自动返回符号大纲 + 本问检索命中窗，再对目标符号带行段精读；
+        - 已知符号 → **一次取完整函数/类**（约 80–300 行），勿 30 行一段分多轮；
         - 可与 grep_files 在**同一条 assistant 消息内并行** tool_calls。
 
         path 可为工作区相对路径，或 ~/.llgraph/skills|rules 绝对路径；**禁止**含 ../。
@@ -864,7 +882,7 @@ def create_filesystem_tools(
 
         @param path 文件路径
         @param start_line 起始行号，从 1 开始
-        @param end_line 结束行号（含）；0 表示读到文件末尾
+        @param end_line 结束行号（含）；0 表示读到文件末尾（大文件会折叠为大纲）
         """
         body, err = _read_file_content(
             ctx, path, start_line=start_line, end_line=end_line
@@ -884,7 +902,7 @@ def create_filesystem_tools(
         适用：search_code_parallel / glob_files / grep_files 已给出多个**完整相对路径**，
         需要对比或梳理多个类/模块时。**能批量就批量**，单次最多 8 个路径；**禁止** path 含 ../。
         **禁止**每个路径单独占一轮 LLM；与其它只读工具可在**同一条 assistant 消息中并行** tool_calls。
-        优先 **start_line/end_line 读局部**；超长结果会落盘为指针，按需 read_file 行段。
+        大文件未指定行段时每个文件自动折叠为大纲+命中窗；精读请带 start_line/end_line。
 
         @param paths 工作区相对路径列表（完整路径，从检索结果复制）
         @param start_line 每个文件的起始行号，从 1 开始

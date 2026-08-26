@@ -25,7 +25,7 @@ tool_selection_summary: |
 
   ## 其它工具
   - 已有专用工具时，**不要**用 `run_shell_command` 代替（利于审阅）：
-    - 读 → `read_file` / `read_files`（不要 cat/head/tail/sed）
+    - 读 → `read_file` / `read_files`（大文件无行段返回大纲而非全文；不要 cat/head/tail/sed）
     - 改 → 可写时用 `search_replace`（不要 sed/awk）
     - 建 → 可写时用 `write_file`（不要 shell heredoc）
     - 找文件 → `glob_files` / `list_directory`（不要 find/ls）

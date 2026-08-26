@@ -16,7 +16,7 @@ _DUPLICATE_PARALLEL_MSG = (
     "【llgraph 拦截】本用户问题已调用过 search_code_parallel，禁止再次调用（换 query 仍算同一问题）。\n"
     "请改用（不要再 parallel）：\n"
     "1. grep_files(pattern=\"业务词|字段名|类名\", path=\".\") — 不确定仓库时用 path=\".\"；\n"
-    "2. read_files(paths=[...]) 或 read_file(path, start_line, end_line) 宽段精读；\n"
+    "2. read_files(paths=[...]) 或 read_file(path, start_line, end_line) 按符号精读；\n"
     "3. path 须来自 list_directory/parallel/glob 结果，禁止猜目录名。"
 )
 

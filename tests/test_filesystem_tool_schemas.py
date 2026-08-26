@@ -6,7 +6,7 @@ from pathlib import Path
 
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
-from llgraph.core.filesystem_tool_schemas import GlobFilesInput, GrepFilesInput
+from llgraph.core.filesystem_tool_schemas import GlobFilesInput, GrepFilesInput, ReadFileInput
 from llgraph.core.filesystem_tools import create_filesystem_tools
 from llgraph.core.workspace import WorkspaceContext
 
@@ -78,6 +78,17 @@ def test_search_replace_schema_includes_replacements() -> None:
     assert "old_string" in props
     assert "replacements" in props
     assert "replace_all" in props
+
+
+def test_read_file_schema_mentions_outline_fold() -> None:
+    schema = convert_to_openai_tool(
+        next(t for t in _tools() if t.name == "read_file")
+    )
+    props = schema["function"]["parameters"]["properties"]
+    assert "大纲" in props["end_line"]["description"] or "折叠" in props["end_line"]["description"]
+    parsed = ReadFileInput.model_validate({"path": "a.py"})
+    assert parsed.start_line == 1
+    assert parsed.end_line == 0
 
 
 def _tools(root: Path | None = None):

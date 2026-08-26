@@ -259,7 +259,7 @@ def _search_parallel_impl(
         lines.append("\n精读: read_files / read_file。")
     lines.append(
         "勿重复 search_code_parallel（再次调用将被拦截）。"
-        "下一步：grep_files(pattern=\"词A|词B\", path=\".\") 定行号，再 read_files/read_file(宽段)；"
+        "下一步：grep_files(pattern=\"词A|词B\", path=\".\") 定行号，再 read_files/read_file 按符号行段；"
         "path 须从本结果原样复制，禁止猜目录名。"
     )
     return "\n".join(lines)

@@ -55,7 +55,7 @@
     "read_tool_mask_max_chars": 12000,
     "tool_result_max_chars": 12000,
     "read_tool_result_max_chars": 36000,
-    "read_file_max_lines": 6000,
+    "read_file_max_lines": 2000,
     "read_file_max_bytes": 600000,
     "tool_result_preview_lines": 40,
     "tool_result_preview_head_lines": 25,
