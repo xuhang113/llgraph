@@ -222,6 +222,14 @@ def build_react_graph(
             return {}
         return {"messages": [HumanMessage(content=THINK_CONTINUE_NUDGE)]}
 
+    def todo_nudge(state: ReactAgentState) -> dict[str, Any]:
+        from llgraph.core.todo_store import format_todo_nudge, todo_nudge_pending
+
+        messages = list(state.get("messages") or [])
+        if todo_nudge_pending(messages):
+            return {}
+        return {"messages": [HumanMessage(content=format_todo_nudge(ws))]}
+
     def turn_fallback(_state: ReactAgentState) -> dict[str, Any]:
         return {"messages": [AIMessage(content=FALLBACK_INCOMPLETE_TURN)]}
 
@@ -229,12 +237,14 @@ def build_react_graph(
     workflow.add_node("agent", RunnableCallable(call_agent, acall_agent))
     workflow.add_node("tools", tool_node)
     workflow.add_node("think_nudge", think_nudge)
+    workflow.add_node("todo_nudge", todo_nudge)
     workflow.add_node("turn_fallback", turn_fallback)
 
     workflow.set_entry_point("agent")
 
     route_after_agent = make_route_after_agent_for_graph(
         complete_on_thinking_if=complete_on_thinking_if,
+        workspace=ws,
     )
     workflow.add_conditional_edges(
         "agent",
@@ -242,12 +252,14 @@ def build_react_graph(
         {
             "tools": "tools",
             "think_nudge": "think_nudge",
+            "todo_nudge": "todo_nudge",
             "turn_fallback": "turn_fallback",
             END: END,
         },
     )
     workflow.add_edge("tools", "agent")
     workflow.add_edge("think_nudge", "agent")
+    workflow.add_edge("todo_nudge", "agent")
     workflow.add_edge("turn_fallback", END)
 
     return workflow.compile(checkpointer=checkpointer, name=name)

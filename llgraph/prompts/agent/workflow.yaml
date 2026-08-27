@@ -15,6 +15,14 @@ react_loop: |
      - 可写：改前 read_file 局部；已有文件优先 **search_replace**（同一文件多 hunk 用 replacements 一次提交）；新建用 write_file。
      - 只读：禁止 write_file、append_file、search_replace。
   5. **结束 turn**：最后一轮必须输出**用户可见正文 text**；仅 thinking 或仅 tool_calls 不算完成。
+     若本问已 `todo_write` 且清单仍有 pending/in_progress：**禁止声称完成**，先做完或更新清单。
+
+doing_tasks: |
+  # Doing tasks
+  - 两步以上的改码/排查：动手前 `todo_write` 列出步骤（搜 → 改 → 验证），始终最多 1 条 `in_progress`。
+  - 清单落在会话侧，压缩与 tool 裁剪不会丢；`<workspace-context>` 每轮钉住当前表。
+  - 完成或取消一项立刻 `todo_write(merge=true)` 更新。有未完成项时不要结束 turn。
+  - 单步问答不要建清单。这不是 `llgraph plan`；那是多 Agent 编排入口。
 
 batch_tool_calls: |
   ## 批量工具（硬性默认：少往返、多并行）
@@ -75,3 +83,4 @@ code_quality: |
     - **正例**：`public Xxx foo(...) {{ try {{ ... }} catch (Exception e) {{ throw ...; }} }}` 或完整 try-catch 块。
     - 堆栈跟踪（`at com.foo.Bar`）可保持原样；**源码示例**不适用断片规则豁免。
   - **诚实边界**：任务未完成不要声称完成；遇到阻塞说明已做步骤、卡点与可行替代方案。
+    有 `todo_write` 未完成项时先做完或更新清单，再写终答。

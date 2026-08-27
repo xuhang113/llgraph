@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -24,6 +25,7 @@ THINK_CONTINUE_NUDGE = (
 RouteAfterAgent = Literal[
     "tools",
     "think_nudge",
+    "todo_nudge",
     "turn_fallback",
     "__end__",
 ]
@@ -127,6 +129,7 @@ def route_after_agent(
     state: dict,
     *,
     complete_on_thinking_if: Callable[[AIMessage], bool] | None = None,
+    workspace: Path | None = None,
 ) -> RouteAfterAgent:
     """
     agent 节点后的路由：有 tool → tools；有 text → END；否则续跑 agent。
@@ -134,9 +137,12 @@ def route_after_agent(
     thinking-only（无 text、无 tool）不在此 END，由图内再次调用 agent；
     Plan 子图传入 complete_on_thinking_if 时：仅 visible text 含结构化 JSON 才 END
     （thinking 不算交付，与 Chat 语义一致）。
+    本问已 todo_write 且清单未完成时：可见正文先走 todo_nudge，禁止提前结案
+    （对标 Claude Code 未完成 Todo 不结束 turn）。
 
     @param state ReAct 状态
     @param complete_on_thinking_if Plan 子图：visible 结构化交付物判定（不读 thinking）
+    @param workspace 工作区根（读取会话 todos.json）
     @return 下一节点名或 END
     """
     messages = list(state.get("messages") or [])
@@ -147,13 +153,24 @@ def route_after_agent(
     if pending_tool_calls(messages, last_ai=last_ai):
         return "tools"
 
+    remaining = state.get("remaining_steps")
+
     if complete_on_thinking_if is not None:
         if complete_on_thinking_if(last_ai):
             return "__end__"
     elif ai_message_has_visible_text(last_ai):
+        from llgraph.core.todo_store import should_nudge_open_todos
+
+        rem = remaining if isinstance(remaining, int) else None
+        if rem is None and remaining is not None:
+            try:
+                rem = int(remaining)
+            except (TypeError, ValueError):
+                rem = None
+        if should_nudge_open_todos(messages, workspace, remaining_steps=rem):
+            return "todo_nudge"
         return "__end__"
 
-    remaining = state.get("remaining_steps")
     # 预留 1 步给 turn_fallback 节点本身，避免 recursion_limit 前无法 END
     if remaining is not None and remaining <= 2:
         return "turn_fallback"
@@ -164,11 +181,13 @@ def route_after_agent(
 def make_route_after_agent_for_graph(
     *,
     complete_on_thinking_if: Callable[[AIMessage], bool] | None = None,
+    workspace: Path | None = None,
 ) -> Callable[[dict], str]:
     """
     构造 LangGraph conditional edge 路由（可选 Plan 结构化 visible END）。
 
     @param complete_on_thinking_if visible 结构化交付物判定
+    @param workspace 工作区根
     @return state → 下一节点名或 END
     """
 
@@ -176,6 +195,7 @@ def make_route_after_agent_for_graph(
         result = route_after_agent(
             state,
             complete_on_thinking_if=complete_on_thinking_if,
+            workspace=workspace,
         )
         if result == "__end__":
             return END

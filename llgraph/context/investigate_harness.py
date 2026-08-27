@@ -123,6 +123,7 @@ def is_ephemeral_harness_human(msg: BaseMessage) -> bool:
         or text.startswith("[系统·调查重置]")
         or text.startswith("[系统·用户异议]")
         or text.startswith("[系统] 你上一轮仅在 thinking")
+        or text.startswith("[系统·未完成任务]")
     )
 
 

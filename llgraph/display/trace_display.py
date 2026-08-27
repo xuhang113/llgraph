@@ -211,6 +211,12 @@ def _short_tool_target(tool_name: str, args: Any) -> str:
                 return _format_trace_path(paths[0].strip())
             return f"{len(paths)} files"
 
+    if name == "todo_write":
+        todos = args.get("todos")
+        if isinstance(todos, list) and todos:
+            return f"{len(todos)} items"
+        return ""
+
     if name == "await_shell":
         job_id = args.get("job_id")
         if isinstance(job_id, str) and job_id.strip():

@@ -12,6 +12,7 @@ from llgraph.core.code_index_tools import create_code_index_tools
 from llgraph.memory.tools import create_memory_tools
 from llgraph.context.context_spill import ContextSpill, apply_spill_to_tools
 from llgraph.core.filesystem_tools import create_filesystem_tools
+from llgraph.core.todo_tools import create_todo_tools
 from llgraph.session.session_history_tools import create_session_history_tools
 from llgraph.core.shell_tools import create_shell_tools
 from llgraph.core.web_search_tools import create_web_search_tools
@@ -76,6 +77,7 @@ def get_agent_tools(
     index_tools = create_code_index_tools(root)
     history_tools = create_session_history_tools(root)
     memory_tools = create_memory_tools(root)
+    todo_tools = create_todo_tools(root)
     plan_tools = create_plan_tools(root)
     shell_tools = create_shell_tools(ctx, allow_write=allow_write)
     sandbox_blocks_network = (
@@ -92,6 +94,7 @@ def get_agent_tools(
     tools = [
         get_current_utc_time,
         *fs_tools,
+        *todo_tools,
         *shell_tools,
         *index_tools,
         *history_tools,

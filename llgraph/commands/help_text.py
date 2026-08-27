@@ -50,6 +50,7 @@ llgraph 交互帮助
 【上下文】
   /context           上下文占用
   /tools             内置工具与 MCP
+  /todos             本会话任务清单
   /compress          压缩上下文
   /index             索引状态与构建
 
@@ -122,6 +123,7 @@ llgraph 完整帮助
   /log               向量检索日志与执行日志
   /context           上下文分项占用
   /tools             内置工具与 MCP
+  /todos             本会话任务清单
   /config            agent.json 配置路径
   /survey            followup 开关
   /sessions          列出 Agent 会话

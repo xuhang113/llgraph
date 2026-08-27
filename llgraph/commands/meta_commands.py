@@ -1192,6 +1192,9 @@ def handle_meta_command(
         )
         return True
 
+    if lower == "/todos" or lower.startswith("/todos ") or lower == "todos":
+        return _handle_todos_command(stripped, workspace, agent_session)
+
     if lower == "/review" or lower.startswith("/review "):
         return _handle_review(stripped, workspace, edit_tracker, last_user_message)
 
@@ -1404,6 +1407,39 @@ def handle_meta_command(
         return True
 
     return False
+
+
+def _handle_todos_command(
+    line: str,
+    workspace: Path,
+    agent_session: AgentSessionContext | None,
+) -> bool:
+    """处理 /todos [clear]。"""
+    from llgraph.core.todo_store import (
+        empty_todo_state,
+        format_todo_markdown,
+        load_todo_state,
+        save_todo_state,
+    )
+
+    thread_id = ""
+    if agent_session is not None:
+        thread_id = str(agent_session.thread_id or "").strip()
+    if not thread_id:
+        emit("当前无活动会话，无法查看任务清单。", colorize=True)
+        return True
+    tokens = line.strip().split()
+    sub = tokens[1].lower() if len(tokens) > 1 else ""
+    if sub in ("clear", "reset", "empty"):
+        save_todo_state(workspace, thread_id, empty_todo_state())
+        emit_ok("已清空本会话任务清单。")
+        return True
+    if sub in ("help", "?"):
+        emit_report("用法: /todos  |  /todos clear")
+        return True
+    state = load_todo_state(workspace, thread_id)
+    emit_report(format_todo_markdown(state, heading=True))
+    return True
 
 
 def _handle_memory_command(line: str, workspace: Path) -> bool:

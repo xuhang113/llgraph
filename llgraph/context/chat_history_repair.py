@@ -42,6 +42,7 @@ def _is_real_user_turn_boundary(msg: BaseMessage) -> bool:
 
     from llgraph.context.conversation_anchor import is_conversation_anchor_message
     from llgraph.core.agent_turn import THINK_CONTINUE_NUDGE
+    from llgraph.core.todo_store import TODO_NUDGE_MARKER
     from llgraph.session.session_manifest import is_session_manifest_message
 
     if not isinstance(msg, HumanMessage):
@@ -50,6 +51,8 @@ def _is_real_user_turn_boundary(msg: BaseMessage) -> bool:
         return False
     text = _message_text(getattr(msg, "content", "")).strip()
     if not text or text == THINK_CONTINUE_NUDGE.strip():
+        return False
+    if text.startswith(TODO_NUDGE_MARKER):
         return False
     if text.startswith("<session-manifest>") or text.startswith("<workspace-context>"):
         return False

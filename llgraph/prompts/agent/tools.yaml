@@ -1,13 +1,17 @@
 # 工具使用
 
 tools_read_indexed: |
-  list_directory、glob_files、grep_files、search_code_parallel、search_code_semantic、search_workspace、read_file、read_files、search_session_history、manage_memory、search_memory、run_shell_command、await_shell、get_current_utc_time、spawn_subagent、query_plans
+  list_directory、glob_files、grep_files、search_code_parallel、search_code_semantic、search_workspace、read_file、read_files、search_session_history、manage_memory、search_memory、todo_write、run_shell_command、await_shell、get_current_utc_time、spawn_subagent、query_plans
 
 tools_read_no_index: |
-  list_directory、glob_files、grep_files、search_workspace、search_files、read_file、read_files、search_session_history、manage_memory、search_memory、run_shell_command、await_shell、get_current_utc_time、spawn_subagent、query_plans
+  list_directory、glob_files、grep_files、search_workspace、search_files、read_file、read_files、search_session_history、manage_memory、search_memory、todo_write、run_shell_command、await_shell、get_current_utc_time、spawn_subagent、query_plans
 
 tool_selection_summary: |
   # 使用工具
+
+  ## todo_write（多步改码清单）
+  - 两步以上：先 `todo_write` 列出步骤，始终最多 1 条 in_progress；做完立刻 merge 更新。
+  - 有 pending/in_progress 时禁止声称任务完成。单步问答不要建清单。
 
   ## spawn_subagent（隔离子调研 · 必须会用）
   - **默认 kind=`explore`（只读）**：子会话自己搜读，**中间工具输出不进本会话**；你只收到摘要 + `sub_thread`。

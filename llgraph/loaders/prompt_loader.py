@@ -103,6 +103,7 @@ def compose_agent_system_prompt(
         render_prompt(str(identity.get("model_identity_rule", "")), **vars_base),
         render_prompt(str(display.get("terminal_display", "")), **vars_base),
         render_prompt(str(workflow.get("react_loop", "")), **vars_base),
+        render_prompt(str(workflow.get("doing_tasks", "")), **vars_base),
         render_prompt(str(workflow.get("investigation_depth", "")), **vars_base),
         render_prompt(str(workflow.get("investigation", "")), **vars_base),
         render_prompt(str(workflow.get("code_quality", "")), **vars_base),

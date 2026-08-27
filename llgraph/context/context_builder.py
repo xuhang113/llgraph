@@ -191,6 +191,19 @@ def build_workspace_context_block(
     if batch_hint:
         sections.append(batch_hint)
 
+    from llgraph.context.runtime_context import get_active_thread_id
+    from llgraph.core.todo_store import (
+        format_edited_paths_workspace_context,
+        format_todo_workspace_context,
+    )
+
+    edited_block = format_edited_paths_workspace_context(edited_paths)
+    if edited_block:
+        sections.append(edited_block)
+    todo_block = format_todo_workspace_context(workspace, get_active_thread_id())
+    if todo_block:
+        sections.append(todo_block)
+
     return "\n\n".join(sections)
 
 

@@ -16,6 +16,7 @@ CONTEXT_DIR_NAME = "context"
 SESSIONS_DIR_NAME = "sessions"
 MESSAGES_FILENAME = "messages.jsonl"
 EDITS_FILENAME = "edits.jsonl"
+TODOS_FILENAME = "todos.json"
 SNAPSHOTS_DIR_NAME = "snapshots"
 ATTACHMENTS_DIR_NAME = "attachments"
 LEGACY_WORKSPACE_SESSIONS_DIR = ".llgraph/sessions"
@@ -139,6 +140,17 @@ def session_edits_path(workspace: Path, thread_id: str) -> Path:
     @return .../sessions/<thread_id>/edits.jsonl
     """
     return session_thread_dir(workspace, thread_id) / EDITS_FILENAME
+
+
+def session_todos_path(workspace: Path, thread_id: str) -> Path:
+    """
+    本会话任务清单 todos.json（对标 Cursor / Claude Code TodoWrite）。
+
+    @param workspace 工作区根
+    @param thread_id 线程 ID
+    @return .../sessions/<thread_id>/todos.json
+    """
+    return session_thread_dir(workspace, thread_id) / TODOS_FILENAME
 
 
 def session_snapshots_dir(workspace: Path, thread_id: str) -> Path:

@@ -25,6 +25,7 @@ _BUILTIN_GROUPS: tuple[tuple[str, frozenset[str]], ...] = (
             "write_file",
         }),
     ),
+    ("任务", frozenset({"todo_write"})),
     ("Shell", frozenset({"run_shell_command", "await_shell"})),
     (
         "代码索引",

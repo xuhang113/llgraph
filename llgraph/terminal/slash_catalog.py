@@ -30,6 +30,7 @@ _SLASH_META_ITEMS: tuple[tuple[str, str], ...] = (
     ("review", "代码评审（Claude CLI）"),
     ("log", "执行日志"),
     ("tools", "工具列表"),
+    ("todos", "本会话任务清单"),
     ("web", "联网搜索开关"),
     ("write", "写权限说明"),
 )

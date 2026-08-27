@@ -224,6 +224,7 @@ def simplify_message(
     if "human" in msg_type.lower():
         display_text = _strip_user_injected_context(display_text)
         from llgraph.core.agent_turn import THINK_CONTINUE_NUDGE
+        from llgraph.core.todo_store import TODO_NUDGE_MARKER
         from llgraph.context.conversation_anchor import (
             is_conversation_anchor_message,
             is_conversation_summary_message,
@@ -234,6 +235,8 @@ def simplify_message(
 
         if display_text.strip() == THINK_CONTINUE_NUDGE.strip():
             kind = "think_nudge"
+        elif display_text.strip().startswith(TODO_NUDGE_MARKER):
+            kind = "todo_nudge"
         else:
             try:
                 probe = HumanMessage(content=content if isinstance(content, str) else display_text)

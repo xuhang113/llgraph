@@ -47,10 +47,11 @@ def test_compose_agent_system_prompt_non_empty() -> None:
     assert "test-model" in text
     assert hint in text
     assert "grep_files" in text
+    assert "todo_write" in text
     assert "llgraph" in text
     assert "# Doing tasks" in text
-    assert "# Using your tools" in text
-    assert "# Output efficiency" in text
+    assert "# Using your tools" in text or "# 使用工具" in text
+    assert "# Output efficiency" in text or "# 输出效率" in text
     assert "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__" in text
     # 边界前为静态原则，检索路由在动态侧
     static, _, dynamic = text.partition("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__")

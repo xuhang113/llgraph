@@ -47,4 +47,4 @@ glob_grep_miss_tail: |
   0 命中：放宽到 `path="."` 或文档；若已用过 parallel，只改 grep pattern——不要再 parallel。
 
 tool_invoke_params: |
-  参数：glob_files→glob_pattern+path；grep_files→pattern+path[+file_glob][+output_mode][+head_limit]；read_files→paths；read_file→path[+行段]；list_directory→path。
+  参数：glob_files→glob_pattern+path；grep_files→pattern+path[+file_glob][+output_mode][+head_limit]；read_files→paths；read_file→path[+行段]；list_directory→path；todo_write→todos[{id,content,status}]+merge。
