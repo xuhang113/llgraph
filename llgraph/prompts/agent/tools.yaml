@@ -39,6 +39,7 @@ tool_selection_summary: |
   - 会话情节细节 → `search_session_history`；可复用偏好 → `manage_memory` / `search_memory`。
   - 彼此独立的工具在同一条回复里并行；有依赖的再串行。
   - 相同参数的重复 read/grep 会被框架拦截并返回短指针（结果已在上下文中）；失败的 search_replace 禁止原样重试。
+  - path 猜错时工具会唯一解析或给出相近路径；直接用完整相对路径，不要再 list_directory 连猜。
 
 edit_hint: |
   改已有文件优先 `search_replace`。先读再改。CRLF/缩进/行尾空白/误贴行号前缀会自动对齐；
@@ -47,6 +48,7 @@ edit_hint: |
   写入成功后工具返回含「写入后快照」（带行号）；此前对该文件的 read 出站会作废。
   若返回含 `[语法诊断]`：代码已落盘但当前文件无法解析——**必须在本轮 search_replace 修好再结束**，不要声称完成。
   继续改同一文件时，old_string 必须来自该快照或写入后再 read，禁止用写入前的全文。
+  path 漏前缀或只用文件名、且全工作区唯一命中时，search_replace 会自动解析到真实文件。
 
 web_search_hint: |
   公开新鲜信息用 `web_search`；本工作区事实优先本地工具。

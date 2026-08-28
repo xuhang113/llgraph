@@ -1,5 +1,6 @@
 """工作区文件检索、读写的 LangChain 工具（工厂方法按只读/可写模式注册）。"""
 
+import fnmatch
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -29,6 +30,14 @@ from llgraph.config.edit_settings import resolve_edit_settings
 from llgraph.cli.search_terms import build_search_terms
 from llgraph.code_index.index_ready import code_index_is_ready
 from llgraph.code_index.path_hits import match_paths_by_keyword
+from llgraph.core.path_recover import (
+    extract_glob_literal_name,
+    format_auto_resolve_note,
+    invalidate_path_listing_cache,
+    is_external_read_path,
+    resolve_tool_path,
+    suggest_paths,
+)
 from llgraph.core.ripgrep_search import (
     ripgrep_available,
     ripgrep_content_in_files,
@@ -204,6 +213,115 @@ def _reject_unsafe_relative_path(path: str) -> str | None:
     return None
 
 
+def _glob_matches_rel(rel: str, pattern: str) -> bool:
+    """相对路径是否匹配 glob（含 **/name 与仅文件名）。"""
+    pat = (pattern or "").strip()
+    if not pat:
+        return False
+    name = Path(rel).name
+    if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(name, pat):
+        return True
+    if pat.startswith("**/"):
+        rest = pat[3:]
+        if rest and (fnmatch.fnmatch(rel, rest) or fnmatch.fnmatch(name, rest)):
+            return True
+    return False
+
+
+def format_directory_listing(
+    ctx: WorkspaceContext,
+    path: str,
+    *,
+    limit: int = MAX_LIST_ENTRIES,
+) -> str:
+    """
+    列出目录条目（相对工作区路径）。
+
+    @param ctx 工作区
+    @param path 相对目录
+    @param limit 最多条目
+    @return 列表文本；失败时返回错误句
+    """
+    try:
+        target = ctx.resolve_path(path)
+    except ValueError as exc:
+        return str(exc)
+    if not target.exists():
+        return f"路径不存在: {path}"
+    if not target.is_dir():
+        return f"不是目录: {path}"
+    try:
+        entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError as exc:
+        return f"无法列出目录: {exc}"
+    lines: list[str] = []
+    for entry in entries[:limit]:
+        suffix = "/" if entry.is_dir() else ""
+        try:
+            rel = entry.relative_to(ctx.root).as_posix()
+        except ValueError:
+            rel = entry.name
+        if entry.is_dir() and ctx.should_skip_dir(entry.name):
+            lines.append(f"[skip] {rel}{suffix}")
+        else:
+            lines.append(f"{rel}{suffix}")
+    if len(entries) > limit:
+        lines.append(f"... 仅显示前 {limit} 项")
+    return "\n".join(lines) if lines else "(空目录)"
+
+
+def _format_read_directory(ctx: WorkspaceContext, rel: str) -> str:
+    listing = format_directory_listing(ctx, rel)
+    return (
+        f"这是目录，不是文件。已自动列出 {rel}/ "
+        "（对齐 Claude Code 对目录调用 Read）：\n"
+        f"{listing}\n"
+        "需要读文件请给出具体文件路径。"
+    )
+
+
+def _prepend_note(note: str, body: str) -> str:
+    prefix = (note or "").strip()
+    if not prefix:
+        return body
+    if not prefix.endswith("\n"):
+        prefix += "\n"
+    return prefix + body
+
+
+def _glob_literal_workspace_hits(
+    ctx: WorkspaceContext,
+    glob_pattern: str,
+) -> tuple[str, list[str]]:
+    """
+    glob 0 命中时按字面文件名在全工作区找相近文件。
+
+    @param ctx 工作区
+    @param glob_pattern glob
+    @return (字面文件名, 路径列表)；无字面名则名为空
+    """
+    literal = extract_glob_literal_name(glob_pattern)
+    if not literal:
+        return "", []
+    hits = suggest_paths(ctx, literal, want="file", limit=8)
+    exact = [
+        hit.rel
+        for hit in hits
+        if hit.reason in {"exact", "basename", "suffix"} and hit.score >= 0.90
+    ]
+    if len(exact) == 1:
+        return literal, exact
+    named = [
+        hit.rel
+        for hit in hits
+        if Path(hit.rel).name.lower() == literal.lower()
+    ]
+    if named:
+        return literal, named[:5]
+    close = [hit.rel for hit in hits if hit.score >= 0.52]
+    return literal, close[:5]
+
+
 def _read_file_content(
     ctx: WorkspaceContext,
     path: str,
@@ -223,14 +341,40 @@ def _read_file_content(
     unsafe = _reject_unsafe_relative_path(path)
     if unsafe:
         return None, unsafe
-    try:
-        target = resolve_catalog_read_path(
-            ctx.root, path, sandbox=ctx.sandbox_policy
-        )
-    except ValueError as exc:
-        return None, str(exc)
-    if not target.is_file():
-        return None, f"文件不存在: {path}"
+
+    remap_note = ""
+    display_path = path
+    if is_external_read_path(path):
+        try:
+            target = resolve_catalog_read_path(
+                ctx.root, path, sandbox=ctx.sandbox_policy
+            )
+        except ValueError as exc:
+            return None, str(exc)
+        if target.is_dir():
+            try:
+                rel = target.relative_to(ctx.root).as_posix()
+            except ValueError:
+                return None, f"这是目录，不是文件: {path}"
+            return _format_read_directory(ctx, rel), None
+        if not target.is_file():
+            return None, f"文件不存在: {path}"
+    else:
+        resolved = resolve_tool_path(ctx, path, want="file", allow_auto=True)
+        if resolved.kind == "wrong_type" and resolved.is_dir:
+            return _format_read_directory(ctx, resolved.rel or path), None
+        if not resolved.ok:
+            return None, resolved.note or f"文件不存在: {path}"
+        display_path = resolved.rel
+        remap_note = resolved.note if resolved.kind == "auto" else ""
+        try:
+            target = resolve_catalog_read_path(
+                ctx.root, resolved.rel, sandbox=ctx.sandbox_policy
+            )
+        except ValueError as exc:
+            return None, str(exc)
+        if not target.is_file():
+            return None, resolved.note or f"文件不存在: {path}"
 
     read_reject = read_path_rejection_reason(target, ctx.root)
     if read_reject:
@@ -252,11 +396,11 @@ def _read_file_content(
 
     lines = text.splitlines()
     if len(lines) == 0:
-        return (
-            f"--- {path} (空文件，0 行) ---\n"
-            "（文件存在但无内容；请改读 src/ 下业务源码或其它非空文件。）",
-            None,
+        body = (
+            f"--- {display_path} (空文件，0 行) ---\n"
+            "（文件存在但无内容；请改读 src/ 下业务源码或其它非空文件。）"
         )
+        return _prepend_note(remap_note, body), None
 
     start = max(1, start_line)
     if start > len(lines):
@@ -267,27 +411,25 @@ def _read_file_content(
         end_line=end_line,
         total_lines=len(lines),
     ):
-        return (
-            format_focus_read(
-                path,
-                lines,
-                hit_lines=hit_lines_for_path(path),
-            ),
-            None,
+        body = format_focus_read(
+            display_path,
+            lines,
+            hit_lines=hit_lines_for_path(display_path),
         )
+        return _prepend_note(remap_note, body), None
 
     end = len(lines) if end_line <= 0 else min(end_line, len(lines))
     truncated = False
     if (end - start + 1) > max_read_lines:
         end = start + max_read_lines - 1
         truncated = True
-    body = format_numbered_slice(path, lines, start, end, total=len(lines))
+    body = format_numbered_slice(display_path, lines, start, end, total=len(lines))
     if truncated:
         body += (
             f"\n\n（已截断：单次最多 {max_read_lines} 行；"
             f"继续请 read_file(path, start_line={end + 1}, end_line=...)）"
         )
-    return body, None
+    return _prepend_note(remap_note, body), None
 
 
 SEARCH_REPLACE_TOOL_DESC = (
@@ -298,6 +440,7 @@ SEARCH_REPLACE_TOOL_DESC = (
     "同一文件多处修改优先 replacements=[{old_string,new_string},...] 一次提交，按顺序应用。"
     "成功后返回带行号的写入后快照；若引入语法错误会附 [语法诊断]，须在本轮修复。"
     "继续改同一文件须用该快照，勿用写入前的 read。"
+    "path 漏仓库前缀或只用文件名时，若全工作区唯一命中会自动解析到真实文件。"
 )
 
 WRITE_FILE_TOOL_DESC = (
@@ -413,6 +556,7 @@ def create_filesystem_tools(
             )
         if on_file_changed is not None:
             on_file_changed(rel)
+        invalidate_path_listing_cache(ctx.root)
         return rel
 
     def _with_diagnostics(rel: str, body: str, new_text: str, *, old_text: str = "") -> str:
@@ -433,32 +577,27 @@ def create_filesystem_tools(
 
         @param path 相对工作区的目录路径，默认 .
         """
-        target = ctx.resolve_path(path)
-        if not target.exists():
-            return f"路径不存在: {path}"
-        if not target.is_dir():
-            return f"不是目录: {path}"
-
-        lines: list[str] = []
-        try:
-            entries = sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
-        except OSError as exc:
-            return f"无法列出目录: {exc}"
-
-        for entry in entries[:MAX_LIST_ENTRIES]:
-            suffix = "/" if entry.is_dir() else ""
-            try:
-                rel = entry.relative_to(ctx.root).as_posix()
-            except ValueError:
-                rel = entry.name
-            if entry.is_dir() and ctx.should_skip_dir(entry.name):
-                lines.append(f"[skip] {rel}{suffix}")
-            else:
-                lines.append(f"{rel}{suffix}")
-
-        if len(entries) > MAX_LIST_ENTRIES:
-            lines.append(f"... 仅显示前 {MAX_LIST_ENTRIES} 项")
-        return "\n".join(lines) if lines else "(空目录)"
+        unsafe = _reject_unsafe_relative_path(path)
+        if unsafe:
+            return unsafe
+        resolved = resolve_tool_path(ctx, path, want="dir", allow_auto=True)
+        if resolved.kind == "wrong_type" and resolved.is_file:
+            parent = Path(resolved.rel).parent.as_posix()
+            if not parent or parent == ".":
+                parent = "."
+            listing = format_directory_listing(ctx, parent)
+            return (
+                f"{resolved.note}\n"
+                f"父目录 {parent}/:\n"
+                f"{listing}"
+            )
+        if not resolved.ok:
+            return resolved.note or f"路径不存在: {path}"
+        listing = format_directory_listing(ctx, resolved.rel)
+        return _prepend_note(
+            resolved.note if resolved.kind == "auto" else "",
+            listing,
+        )
 
     def _match_paths_by_keyword(
         keyword_lower: str,
@@ -502,26 +641,68 @@ def create_filesystem_tools(
             return (
                 "glob_pattern 必填（glob_files 用 glob_pattern，grep_files 才用 pattern 搜内容）。"
             )
+        if path not in ("", "."):
+            unsafe = _reject_unsafe_relative_path(path)
+            if unsafe:
+                return unsafe
+
+        remap_note = ""
+        search_path = path
+        resolved = resolve_tool_path(ctx, path, want="dir", allow_auto=True)
+        if resolved.kind == "wrong_type" and resolved.is_file:
+            rel = resolved.rel
+            if _glob_matches_rel(rel, effective_pattern):
+                return (
+                    f"匹配 1 个文件（path 指向文件本身，glob={effective_pattern}）:\n"
+                    f"{rel}"
+                )
+            return (
+                f"path={path!r} 是文件且不匹配 glob={effective_pattern!r}。"
+                "请改 path 为父目录或 \".\"。"
+            )
+        if resolved.ok:
+            search_path = resolved.rel
+            if resolved.kind == "auto":
+                remap_note = resolved.note
+        else:
+            literal, hits = _glob_literal_workspace_hits(ctx, effective_pattern)
+            if len(hits) == 1:
+                return (
+                    format_auto_resolve_note(path, hits[0])
+                    + f"在 path={path!r} 下目录不存在；全工作区按文件名 {literal!r} 唯一命中:\n"
+                    f"{hits[0]}\n"
+                    "下次请用 path=\".\" 或上述完整相对路径。"
+                )
+            if hits:
+                shown = "\n".join(f"- {item}" for item in hits)
+                return (
+                    f"{resolved.note}\n"
+                    f"全工作区相近文件（glob 文件名 {literal or effective_pattern!r}）:\n"
+                    f"{shown}"
+                )
+            return resolved.note or f"glob_files 失败: 目录不存在: {path}"
+
         if not ripgrep_available():
             return (
                 "错误: 未安装 ripgrep (rg)。请安装后重试，或改用 search_files / search_code_parallel。"
             )
+
         paths, err = ripgrep_files(
             ctx.root,
             effective_pattern,
-            path_prefix=path,
+            path_prefix=search_path,
             limit=MAX_SEARCH_RESULTS,
             skip_dirs=skip_dirs,
         )
         if err:
             return f"glob_files 失败: {err}"
         if not paths:
-            norm_path = _normalize_path_prefix(path)
-            wider = _repo_root_prefix(path)
+            norm_path = _normalize_path_prefix(search_path)
+            wider = _repo_root_prefix(search_path)
             if (
                 wider != "."
                 and wider != norm_path
-                and _path_depth(path) >= _AUTO_WIDEN_PATH_MIN_DEPTH
+                and _path_depth(search_path) >= _AUTO_WIDEN_PATH_MIN_DEPTH
             ):
                 wider_paths, widen_err = ripgrep_files(
                     ctx.root,
@@ -533,20 +714,41 @@ def create_filesystem_tools(
                 if widen_err:
                     return f"glob_files 失败: {widen_err}"
                 if wider_paths:
-                    return (
-                        f"在 path={path!r} 下未命中；已自动扩大到 path={wider!r}，"
+                    return _prepend_note(
+                        remap_note,
+                        f"在 path={search_path!r} 下未命中；已自动扩大到 path={wider!r}，"
                         f"找到 {len(wider_paths)} 个文件:\n"
                         + "\n".join(wider_paths)
                         + "\n\n"
-                        + _format_path_scope_hint(path, glob_pattern=effective_pattern)
-                        + "\n下次请直接使用更宽的 path，避免先窄后扩。"
+                        + _format_path_scope_hint(search_path, glob_pattern=effective_pattern)
+                        + "\n下次请直接使用更宽的 path，避免先窄后扩。",
                     )
-            return _format_empty_glob_message(
-                path, effective_pattern, index_ready=index_ready
+            literal, hits = _glob_literal_workspace_hits(ctx, effective_pattern)
+            if len(hits) == 1:
+                return _prepend_note(
+                    remap_note,
+                    format_auto_resolve_note(search_path, hits[0])
+                    + f"在 path={search_path!r} 下未命中；全工作区按文件名 {literal!r} 唯一命中:\n"
+                    f"{hits[0]}\n"
+                    "下次请用 path=\".\" 或该完整相对路径。",
+                )
+            extra = ""
+            if hits:
+                extra = (
+                    "\n相近文件:\n"
+                    + "\n".join(f"- {item}" for item in hits)
+                )
+            return _prepend_note(
+                remap_note,
+                _format_empty_glob_message(
+                    search_path, effective_pattern, index_ready=index_ready
+                )
+                + extra,
             )
-        return (
-            f"匹配 {len(paths)} 个文件（glob={effective_pattern}, path={path}）:\n"
-            + "\n".join(paths)
+        return _prepend_note(
+            remap_note,
+            f"匹配 {len(paths)} 个文件（glob={effective_pattern}, path={search_path}）:\n"
+            + "\n".join(paths),
         )
 
     def search_files(
@@ -696,7 +898,7 @@ def create_filesystem_tools(
         `pattern="tb_foo|FooDO|FooMapper|biz_id"`，**禁止**多轮各搜一个词（表名一轮、类名一轮是反模式）。
         可与 read_files **同一条 assistant 消息内并行**。
 
-        path 是**搜索根**，须为工作区内**已存在**的目录；**禁止猜**仓库名。
+        path 是**搜索根**，可为目录或单个文件；漏前缀时若全工作区唯一命中会自动解析。
         不确定时用 path=\".\" 搜全工作区。
 
         默认 output_mode=auto：命中过多时折叠为「真实总数 + 文件统计 + 样例」
@@ -709,6 +911,21 @@ def create_filesystem_tools(
         @param output_mode auto|content|files|count（兼容 files_with_matches / count_matches）
         @param head_limit content 最多条数；0 表示默认 40
         """
+        if path not in ("", "."):
+            unsafe = _reject_unsafe_relative_path(path)
+            if unsafe:
+                return unsafe
+        remap_note = ""
+        resolved = resolve_tool_path(ctx, path, want="any", allow_auto=True)
+        if not resolved.ok:
+            return resolved.note or (
+                f"路径不存在: {path}\n"
+                "不确定时用 path=\".\"。"
+            )
+        path = resolved.rel
+        if resolved.kind == "auto":
+            remap_note = resolved.note
+
         from llgraph.context.context_settings import resolve_context_settings
 
         grep_ctx = resolve_context_settings(ctx.root).grep_context_lines
@@ -722,16 +939,22 @@ def create_filesystem_tools(
             head = max(1, min(head, MAX_GREP_MATCHES))
 
         def _empty() -> str:
-            return _format_empty_grep_message(
-                path, pattern, index_ready=index_ready
+            return _prepend_note(
+                remap_note,
+                _format_empty_grep_message(
+                    path, pattern, index_ready=index_ready
+                ),
             )
 
         def _path_error(err: str) -> str:
-            return (
+            return _prepend_note(
+                remap_note,
                 f"grep_files 失败: {err}\n"
-                "提示: path 须为已存在目录；不确定时用 path=\".\"，"
-                "或 list_directory(path=\".\") 核对顶层仓库名后再 grep。"
+                "不确定时用 path=\".\"，或改用工具返回的完整相对路径。",
             )
+
+        def _finish(text: str) -> str:
+            return _prepend_note(remap_note, text)
 
         def _render(counts: list[FileMatchCount], blocks: list[str], engine: str) -> str:
             if not counts:
@@ -740,9 +963,12 @@ def create_filesystem_tools(
                     extra = "（未安装 rg，遍历范围受限；建议安装 ripgrep。）"
                     if index_ready:
                         return _empty() + extra
-                    return _format_empty_grep_message(
-                        path, pattern, index_ready=False
-                    ) + extra
+                    return _finish(
+                        _format_empty_grep_message(
+                            path, pattern, index_ready=False
+                        )
+                        + extra
+                    )
                 return _empty()
             planned = plan_grep(
                 counts,
@@ -750,14 +976,16 @@ def create_filesystem_tools(
                 head_limit=head,
                 context_lines=grep_ctx,
             )
-            return format_grep_result(
-                plan=planned,
-                pattern=pattern,
-                path=path,
-                file_glob=file_glob,
-                content_blocks=blocks,
-                context_lines=grep_ctx,
-                engine=engine,
+            return _finish(
+                format_grep_result(
+                    plan=planned,
+                    pattern=pattern,
+                    path=path,
+                    file_glob=file_glob,
+                    content_blocks=blocks,
+                    context_lines=grep_ctx,
+                    engine=engine,
+                )
             )
 
         def _python_scan() -> tuple[list[FileMatchCount], list[str]]:
@@ -767,7 +995,15 @@ def create_filesystem_tools(
                 regex = re.compile(re.escape(pattern))
             counts: list[FileMatchCount] = []
             stored: dict[str, list[str]] = {}
-            for rel in ctx.iter_files(path, name_glob=file_glob or None):
+            try:
+                scan_root = ctx.resolve_path(path)
+            except ValueError:
+                scan_root = None
+            if scan_root is not None and scan_root.is_file():
+                rel_iter = [path]
+            else:
+                rel_iter = list(ctx.iter_files(path, name_glob=file_glob or None))
+            for rel in rel_iter:
                 full = ctx.resolve_path(rel)
                 if not full.is_file() or not is_probably_text_path(full, ctx.root):
                     continue
@@ -850,14 +1086,16 @@ def create_filesystem_tools(
                 except Exception:
                     counts_py, blocks = _python_scan()
                     return _render(counts_py, blocks, "python")
-            return format_grep_result(
-                plan=planned,
-                pattern=pattern,
-                path=path,
-                file_glob=file_glob,
-                content_blocks=blocks,
-                context_lines=grep_ctx,
-                engine="ripgrep",
+            return _finish(
+                format_grep_result(
+                    plan=planned,
+                    pattern=pattern,
+                    path=path,
+                    file_glob=file_glob,
+                    content_blocks=blocks,
+                    context_lines=grep_ctx,
+                    engine="ripgrep",
+                )
             )
 
         counts, blocks = _python_scan()
@@ -878,6 +1116,7 @@ def create_filesystem_tools(
         - 可与 grep_files 在**同一条 assistant 消息内并行** tool_calls。
 
         path 可为工作区相对路径，或 ~/.llgraph/skills|rules 绝对路径；**禁止**含 ../。
+        漏仓库前缀或只用文件名时，若全工作区唯一命中会自动打开真实文件；传入目录则自动列出内容。
         仅读源码/配置/文档；**不支持** lib/、target/、.so/.jar 等库与二进制文件。
 
         @param path 文件路径
@@ -1010,10 +1249,22 @@ def create_filesystem_tools(
             return err
         ctx.ensure_write_allowed()
         rel = path.strip().lstrip("/")
+        remap_note = ""
         try:
             target = ctx.resolve_path(rel, for_write=True)
         except PermissionError as exc:
             return str(exc)
+        except ValueError as exc:
+            return str(exc)
+        if not target.is_file():
+            recovered = resolve_tool_path(ctx, rel, want="file", allow_auto=True)
+            if recovered.ok and recovered.kind == "auto":
+                rel = recovered.rel
+                remap_note = recovered.note
+                try:
+                    target = ctx.resolve_path(rel, for_write=True)
+                except PermissionError as exc:
+                    return str(exc)
         old_text = ""
         if target.is_file():
             if edit_tracker is not None:
@@ -1035,7 +1286,10 @@ def create_filesystem_tools(
         )
         return _with_diagnostics(
             rel,
-            f"已追加 {rel}（+{len(content)} 字符，共 {len(new_text)} 字符）{hint}\n{snapshot}",
+            _prepend_note(
+                remap_note,
+                f"已追加 {rel}（+{len(content)} 字符，共 {len(new_text)} 字符）{hint}\n{snapshot}",
+            ),
             new_text,
             old_text=old_text,
         )
@@ -1058,12 +1312,25 @@ def create_filesystem_tools(
         """
         ctx.ensure_write_allowed()
         rel = path.strip().lstrip("/")
+        remap_note = ""
         try:
             target = ctx.resolve_path(rel, for_write=True)
         except PermissionError as exc:
             return str(exc)
+        except ValueError as exc:
+            return str(exc)
         if not target.is_file():
-            return f"文件不存在: {rel}"
+            recovered = resolve_tool_path(ctx, rel, want="file", allow_auto=True)
+            if not recovered.ok:
+                return recovered.note or f"文件不存在: {rel}"
+            rel = recovered.rel
+            remap_note = recovered.note if recovered.kind == "auto" else ""
+            try:
+                target = ctx.resolve_path(rel, for_write=True)
+            except PermissionError as exc:
+                return str(exc)
+        if not target.is_file():
+            return remap_note + f"文件不存在: {rel}" if remap_note else f"文件不存在: {rel}"
         try:
             text = target.read_text(encoding="utf-8")
         except OSError as exc:
@@ -1087,7 +1354,7 @@ def create_filesystem_tools(
             allow_fuzzy=edit_cfg.fuzzy_apply,
         )
         if not applied.ok:
-            return format_apply_failure(rel, applied)
+            return _prepend_note(remap_note, format_apply_failure(rel, applied))
         if edit_tracker is not None:
             edit_tracker.ensure_snapshot(rel)
         target.write_text(applied.new_text, encoding="utf-8")
@@ -1104,7 +1371,7 @@ def create_filesystem_tools(
             write_failure_tracker.note_success()
         return _with_diagnostics(
             rel,
-            format_apply_success(rel, applied, old_text=text),
+            _prepend_note(remap_note, format_apply_success(rel, applied, old_text=text)),
             applied.new_text,
             old_text=text,
         )

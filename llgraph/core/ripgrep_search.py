@@ -94,6 +94,8 @@ def ripgrep_files(
     path_prefix: str = ".",
     limit: int = 100,
     skip_dirs: frozenset[str] | tuple[str, ...] | None = None,
+    timeout: float = 30.0,
+    all_files: bool = False,
 ) -> tuple[list[str], str]:
     """
     按 glob 列出工作区内文件（rg --files）。
@@ -103,6 +105,8 @@ def ripgrep_files(
     @param path_prefix 起始相对目录
     @param limit 最多返回条数
     @param skip_dirs 额外跳过目录
+    @param timeout 子进程超时秒数
+    @param all_files True 时不加 --iglob，列出全部文件（供路径恢复扫描）
     @return (相对路径列表, 错误/说明文案)
     """
     root = workspace.expanduser().resolve()
@@ -113,23 +117,24 @@ def ripgrep_files(
         return [], f"目录不存在: {path_prefix}"
 
     pattern = (glob_pattern or "**/*").strip()
+    wait = max(0.5, float(timeout or 30.0))
     cmd = [
         _rg_executable(),
         "--files",
-        "--iglob",
-        pattern,
         *_rg_skip_glob_args(_merge_skip_dirs(skip_dirs)),
-        str(search_root),
     ]
+    if not all_files:
+        cmd.extend(["--iglob", pattern])
+    cmd.append(str(search_root))
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
-            timeout=30,
+            timeout=wait,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return [], "ripgrep 超时（>30s）"
+        return [], f"ripgrep 超时（>{wait:g}s）"
     except OSError as exc:
         return [], f"ripgrep 启动失败: {exc}"
 

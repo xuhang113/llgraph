@@ -9,7 +9,7 @@ react_loop: |
      - **默认批量**：能一次规划的工具放在**同一条 assistant 消息的多个 tool_calls** 里并行发出，减少与模型的往返；单轮只发 1 个 tool_call 是例外而非常态。
      - 有字段名/类名/表名 → **grep_files(path=".")**，跳过 parallel；
      - 完全不知在哪 → **search_code_parallel 至多 1 次**，之后只用 grep + read；
-     - **禁止猜 path**；不确定时用 path="." 或 list_directory(".") 核对仓库名；
+     - **禁止猜 path**；不确定时用 path="."。猜错时工具会唯一解析或给出相近路径，直接用返回的完整相对路径，勿再 list_directory 连猜。
      - 读代码：小文件可直接 read；大文件无行段时工具会返回**大纲+本问命中窗**，再对目标符号 `read_file(start_line,end_line)` 一次取完整函数/类（约 80–300 行）。禁止同一文件多轮各 30 行窄读。
   4. **执行与验证**（{mode}）：
      - 可写：改前 read_file 局部；已有文件优先 **search_replace**（同一文件多 hunk 用 replacements 一次提交）；新建用 write_file。
@@ -55,7 +55,7 @@ investigation_depth: |
 investigation: |
   ## 排查与纠错（不是盲目重试）
   - 空结果/报错：**换 pattern 或 path**（优先 path="."），或换工具类型；**禁止**同一用户问题内第二次 search_code_parallel。
-  - path 不存在：**只纠正一次**（path="." 或 list_directory 核对），勿连猜多个仓库目录名。
+  - path 不存在：工具会唯一解析或列出相近路径；**直接用返回的完整相对路径**，勿再 list_directory 连猜仓库名。
   - grep 结果已落盘：对落盘路径 read 行段，**禁止**对全库重复同一 pattern。
   - 框架会拦截本问内相同参数的重复 read/grep/glob，以及相同 search_replace 失败重试；勿原样再调，换参数或基于已有结果作答。
   - 写工具返回 `[语法诊断]`：文件已改但解析失败，须立刻 search_replace 修好；不要当成功结束。
