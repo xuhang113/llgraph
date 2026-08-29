@@ -867,6 +867,10 @@ def parse_replacements_arg(raw: object) -> list[EditHunk]:
     """
     if not raw:
         return []
+    if isinstance(raw, str):
+        from llgraph.core.tool_arg_coerce import maybe_parse_json
+
+        raw = maybe_parse_json(raw)
     if not isinstance(raw, list):
         return []
     out: list[EditHunk] = []

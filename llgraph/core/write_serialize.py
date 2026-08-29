@@ -56,6 +56,10 @@ def write_path_from_call(call: dict[str, Any]) -> str | None:
     if name not in WRITE_TOOL_NAMES:
         return None
     args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    if name:
+        from llgraph.core.tool_arg_coerce import coerce_tool_args
+
+        args = coerce_tool_args(name, args)
     path = normalize_write_path(args.get("path"))
     return path or None
 
@@ -74,6 +78,10 @@ def touched_path_from_call(call: dict[str, Any]) -> str | None:
     if name not in _PATH_SERIAL_READ_TOOLS:
         return None
     args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    if name:
+        from llgraph.core.tool_arg_coerce import coerce_tool_args
+
+        args = coerce_tool_args(name, args)
     path = normalize_write_path(args.get("path"))
     if not path or path == ".":
         return None

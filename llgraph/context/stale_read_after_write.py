@@ -65,8 +65,16 @@ def _path_from_call_args(call: Any) -> str:
         cid_name = str(getattr(call, "name", "") or "")
     if cid_name not in WRITE_TOOL_NAMES:
         return ""
+    if isinstance(args, str):
+        from llgraph.core.tool_arg_coerce import maybe_parse_json
+
+        args = maybe_parse_json(args)
     if not isinstance(args, dict):
         return ""
+    if cid_name:
+        from llgraph.core.tool_arg_coerce import coerce_tool_args
+
+        args = coerce_tool_args(cid_name, args)
     return normalize_write_path(args.get("path"))
 
 

@@ -8,12 +8,14 @@ from pathlib import Path
 from langchain_core.tools import StructuredTool
 
 from llgraph.core.filesystem_tool_schemas import (
+    AppendFileInput,
     GlobFilesInput,
     GrepFilesInput,
     ListDirectoryInput,
     ReadFileInput,
     ReadFilesInput,
     SearchReplaceInput,
+    WriteFileInput,
 )
 from llgraph.core.edit_apply import (
     EditHunk,
@@ -24,6 +26,7 @@ from llgraph.core.edit_apply import (
     parse_replacements_arg,
 )
 from llgraph.core.edit_diagnostics import format_edit_diagnostics
+from llgraph.core.tool_arg_coerce import format_tool_validation_error
 
 from llgraph.config.catalog_paths import resolve_catalog_read_path
 from llgraph.config.edit_settings import resolve_edit_settings
@@ -1382,17 +1385,20 @@ def create_filesystem_tools(
             name="list_directory",
             description=list_directory.__doc__ or "",
             args_schema=ListDirectoryInput,
+            handle_validation_error=format_tool_validation_error,
         ),
         StructuredTool.from_function(
             func=glob_files,
             name="glob_files",
             description=glob_files.__doc__ or "",
             args_schema=GlobFilesInput,
+            handle_validation_error=format_tool_validation_error,
         ),
         StructuredTool.from_function(
             func=search_workspace,
             name="search_workspace",
             description=search_workspace.__doc__ or "",
+            handle_validation_error=format_tool_validation_error,
         ),
     ]
     if not index_ready:
@@ -1401,6 +1407,7 @@ def create_filesystem_tools(
                 func=search_files,
                 name="search_files",
                 description=search_files.__doc__ or "",
+                handle_validation_error=format_tool_validation_error,
             ),
         )
     tools.extend([
@@ -1409,18 +1416,21 @@ def create_filesystem_tools(
             name="grep_files",
             description=grep_files.__doc__ or "",
             args_schema=GrepFilesInput,
+            handle_validation_error=format_tool_validation_error,
         ),
         StructuredTool.from_function(
             func=read_file,
             name="read_file",
             description=read_file.__doc__ or "",
             args_schema=ReadFileInput,
+            handle_validation_error=format_tool_validation_error,
         ),
         StructuredTool.from_function(
             func=read_files,
             name="read_files",
             description=read_files.__doc__ or "",
             args_schema=ReadFilesInput,
+            handle_validation_error=format_tool_validation_error,
         ),
     ])
 
@@ -1431,16 +1441,21 @@ def create_filesystem_tools(
                 name="search_replace",
                 description=SEARCH_REPLACE_TOOL_DESC,
                 args_schema=SearchReplaceInput,
+                handle_validation_error=format_tool_validation_error,
             ),
             StructuredTool.from_function(
                 func=append_file,
                 name="append_file",
                 description=APPEND_FILE_TOOL_DESC,
+                args_schema=AppendFileInput,
+                handle_validation_error=format_tool_validation_error,
             ),
             StructuredTool.from_function(
                 func=write_file,
                 name="write_file",
                 description=WRITE_FILE_TOOL_DESC,
+                args_schema=WriteFileInput,
+                handle_validation_error=format_tool_validation_error,
             ),
         ])
 

@@ -27,6 +27,7 @@ from llgraph.core.tool_loop_guard import (
     install_tool_loop_guard,
     wrap_tool_node_with_loop_guard,
 )
+from llgraph.core.tool_arg_coerce import wrap_tool_node_with_arg_coerce
 from llgraph.core.write_serialize import (
     clear_write_serialize_gate,
     install_write_serialize_gate,
@@ -226,7 +227,8 @@ def build_tool_node(
 ) -> Callable[..., dict[str, Any]]:
     """
     包装 LangGraph ToolNode：并行执行 tool_calls，拦截重复 search_code_parallel；
-    本问内相同参数的 read/grep/失败写短路径返回；同 path 写工具与 read_file 按顺序串行。
+    本问内相同参数的 read/grep/失败写短路径返回；同 path 写工具与 read_file 按顺序串行；
+    执行前纠偏 Claude Code / Cursor 字段名与宽松类型。
 
     @param tools 工具列表
     @param workspace 工作区根（保留参数以兼容调用方）
@@ -236,6 +238,7 @@ def build_tool_node(
     wrap_tool_node_with_loop_guard(inner)
     wrap_tool_node_with_timing(inner)
     wrap_tool_node_with_write_serialize(inner)
+    wrap_tool_node_with_arg_coerce(inner)
 
     def invoke(state: dict[str, Any], config: RunnableConfig) -> dict[str, Any]:
         from llgraph.context.investigate_harness import (

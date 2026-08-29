@@ -220,7 +220,15 @@ def parse_todo_inputs(raw: object) -> list[dict[str, str]]:
     @return 规范化条目（可能仍缺 id）
     """
     if not isinstance(raw, list):
-        return []
+        from llgraph.core.tool_arg_coerce import maybe_parse_json
+
+        parsed = maybe_parse_json(raw)
+        if isinstance(parsed, dict):
+            raw = [parsed]
+        elif isinstance(parsed, list):
+            raw = parsed
+        else:
+            return []
     out: list[dict[str, str]] = []
     for row in raw:
         if hasattr(row, "model_dump"):

@@ -126,7 +126,14 @@ def call_args(call: Any) -> dict[str, Any]:
             raw = json.loads(raw)
         except json.JSONDecodeError:
             return {}
-    return raw if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    name = call_name(call)
+    if name:
+        from llgraph.core.tool_arg_coerce import coerce_tool_args
+
+        return coerce_tool_args(name, raw)
+    return raw
 
 
 def call_name(call: Any) -> str:
@@ -157,11 +164,11 @@ def _norm_path(raw: object) -> str:
 
 
 def _norm_paths(raw: object) -> tuple[str, ...]:
-    if not isinstance(raw, list):
-        return ()
+    from llgraph.core.tool_arg_coerce import coerce_path_list
+
     seen: set[str] = set()
     out: list[str] = []
-    for item in raw:
+    for item in coerce_path_list(raw):
         path = _norm_path(item)
         if path in seen:
             continue

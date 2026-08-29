@@ -7,8 +7,10 @@ import sys
 import time
 from pathlib import Path
 
+from typing import Any, ClassVar
+
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from llgraph.config.web_search_settings import (
     infer_tavily_search_extras,
@@ -16,12 +18,23 @@ from llgraph.config.web_search_settings import (
     resolve_web_search_settings,
     validate_web_search_ready,
 )
+from llgraph.core.tool_arg_coerce import coerce_tool_args, format_tool_validation_error
 
 _log = logging.getLogger(__name__)
 
 
 class WebSearchInput(BaseModel):
     """web_search 入参。"""
+
+    _tool_name: ClassVar[str] = "web_search"
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_commercial_args(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return coerce_tool_args("web_search", data)
+        return data
+
 
     query: str = Field(description="搜索查询，使用自然语言描述要查的内容")
     max_results: int | None = Field(
@@ -178,5 +191,6 @@ def create_web_search_tools(workspace: Path) -> list[StructuredTool]:
             "问「今日/现在/最新」时先调用 get_current_utc_time 确认日期，query 勿编造未来日期。"
         ),
         args_schema=WebSearchInput,
+        handle_validation_error=format_tool_validation_error,
     )
     return [tool]

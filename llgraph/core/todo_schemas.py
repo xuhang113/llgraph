@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Any, ClassVar
+
+from pydantic import BaseModel, Field, model_validator
+
+from llgraph.core.tool_arg_coerce import coerce_tool_args
 
 
 class TodoItemInput(BaseModel):
@@ -23,6 +27,16 @@ class TodoItemInput(BaseModel):
 
 class TodoWriteInput(BaseModel):
     """todo_write 入参。"""
+
+    _tool_name: ClassVar[str] = "todo_write"
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_commercial_args(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return coerce_tool_args("todo_write", data)
+        return data
+
 
     todos: list[TodoItemInput] = Field(
         default_factory=list,

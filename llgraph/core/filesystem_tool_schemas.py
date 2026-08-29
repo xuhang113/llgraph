@@ -1,12 +1,32 @@
-"""内置文件工具 Pydantic 入参（字段 description + glob pattern 别名兼容）。"""
+"""内置文件工具 Pydantic 入参（字段 description + 商用 Agent 别名纠偏）。"""
 
 from __future__ import annotations
 
+from typing import Any, ClassVar
+
 from pydantic import BaseModel, Field, model_validator
 
+from llgraph.core.tool_arg_coerce import coerce_tool_args
 
-class GlobFilesInput(BaseModel):
+
+class _AliasedToolInput(BaseModel):
+    """校验前把 Claude Code / Cursor 字段名纠成 llgraph schema。"""
+
+    _tool_name: ClassVar[str] = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_commercial_args(cls, data: Any) -> Any:
+        name = str(getattr(cls, "_tool_name", "") or "")
+        if name and isinstance(data, dict):
+            return coerce_tool_args(name, data)
+        return data
+
+
+class GlobFilesInput(_AliasedToolInput):
     """glob_files 入参。"""
+
+    _tool_name = "glob_files"
 
     glob_pattern: str = Field(
         default="",
@@ -30,8 +50,10 @@ class GlobFilesInput(BaseModel):
         return self.model_copy(update={"glob_pattern": effective})
 
 
-class GrepFilesInput(BaseModel):
+class GrepFilesInput(_AliasedToolInput):
     """grep_files 入参。"""
+
+    _tool_name = "grep_files"
 
     pattern: str = Field(
         description="内容搜索模式（正则或字面量）；glob_files 找文件名用 glob_pattern",
@@ -58,8 +80,10 @@ class GrepFilesInput(BaseModel):
     )
 
 
-class ListDirectoryInput(BaseModel):
+class ListDirectoryInput(_AliasedToolInput):
     """list_directory 入参。"""
+
+    _tool_name = "list_directory"
 
     path: str = Field(
         default=".",
@@ -67,8 +91,10 @@ class ListDirectoryInput(BaseModel):
     )
 
 
-class ReadFileInput(BaseModel):
+class ReadFileInput(_AliasedToolInput):
     """read_file 入参。"""
+
+    _tool_name = "read_file"
 
     path: str = Field(description="单个文件路径，相对工作区或 ~/.llgraph/skills|rules")
     start_line: int = Field(default=1, description="起始行号，从 1 开始")
@@ -82,8 +108,10 @@ class ReadFileInput(BaseModel):
     )
 
 
-class ReadFilesInput(BaseModel):
+class ReadFilesInput(_AliasedToolInput):
     """read_files 入参。"""
+
+    _tool_name = "read_files"
 
     paths: list[str] = Field(
         description="多个完整相对路径的数组，如 [\"src/a.java\", \"src/b.java\"]，最多 8 个",
@@ -105,9 +133,20 @@ class SearchReplaceHunkInput(BaseModel):
     new_string: str = Field(default="", description="替换后文本；空字符串表示删除该片段")
     replace_all: bool = Field(default=False, description="是否替换该 hunk 的全部命中")
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_hunk_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        coerced = coerce_tool_args("search_replace", {"path": "_", **data})
+        coerced.pop("path", None)
+        return coerced
 
-class SearchReplaceInput(BaseModel):
+
+class SearchReplaceInput(_AliasedToolInput):
     """search_replace 入参。"""
+
+    _tool_name = "search_replace"
 
     path: str = Field(description="相对工作区的文件路径")
     old_string: str = Field(
@@ -132,3 +171,21 @@ class SearchReplaceInput(BaseModel):
         if not (self.old_string or "").strip() and not self.replacements:
             raise ValueError("必须提供 old_string 或 replacements")
         return self
+
+
+class WriteFileInput(_AliasedToolInput):
+    """write_file 入参。"""
+
+    _tool_name = "write_file"
+
+    path: str = Field(description="相对工作区的文件路径")
+    content: str = Field(default="", description="完整文件内容")
+
+
+class AppendFileInput(_AliasedToolInput):
+    """append_file 入参。"""
+
+    _tool_name = "append_file"
+
+    path: str = Field(description="相对工作区的文件路径")
+    content: str = Field(default="", description="追加的正文")

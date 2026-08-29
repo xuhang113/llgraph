@@ -22,6 +22,7 @@ from llgraph.core.shell_jobs import (
 )
 from llgraph.core.shell_output import clip_shell_output, combine_stdio
 from llgraph.core.shell_schemas import AwaitShellInput, RunShellCommandInput
+from llgraph.core.tool_arg_coerce import format_tool_validation_error
 from llgraph.core.workspace import WorkspaceContext
 from llgraph.permissions.shell import check_shell_command
 from llgraph.sandbox.exec import LiveShellProcess, spawn_sandboxed_shell
@@ -486,11 +487,13 @@ def create_shell_tools(
             name="run_shell_command",
             description=run_shell_command.__doc__ or "",
             args_schema=RunShellCommandInput,
+            handle_validation_error=format_tool_validation_error,
         ),
         StructuredTool.from_function(
             func=await_shell,
             name="await_shell",
             description=await_shell.__doc__ or "",
             args_schema=AwaitShellInput,
+            handle_validation_error=format_tool_validation_error,
         ),
     ]

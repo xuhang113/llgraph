@@ -2,11 +2,31 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import Any, ClassVar
+
+from pydantic import BaseModel, Field, model_validator
+
+from llgraph.core.tool_arg_coerce import coerce_tool_args
 
 
-class RunShellCommandInput(BaseModel):
+class _AliasedShellInput(BaseModel):
+    """校验前兼容 Claude Code Bash / Cursor run_terminal_cmd 字段。"""
+
+    _tool_name: ClassVar[str] = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_commercial_args(cls, data: Any) -> Any:
+        name = str(getattr(cls, "_tool_name", "") or "")
+        if name and isinstance(data, dict):
+            return coerce_tool_args(name, data)
+        return data
+
+
+class RunShellCommandInput(_AliasedShellInput):
     """run_shell_command 入参。"""
+
+    _tool_name = "run_shell_command"
 
     command: str = Field(description="要执行的 shell 命令（单条）")
     working_directory: str = Field(
@@ -26,8 +46,10 @@ class RunShellCommandInput(BaseModel):
     )
 
 
-class AwaitShellInput(BaseModel):
+class AwaitShellInput(_AliasedShellInput):
     """await_shell 入参。"""
+
+    _tool_name = "await_shell"
 
     job_id: str = Field(description='后台任务 id，如 sh-a1b2c3（run_shell_command 返回）')
     block_until_ms: int = Field(

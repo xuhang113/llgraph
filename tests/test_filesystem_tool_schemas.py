@@ -38,6 +38,12 @@ def test_glob_files_input_accepts_pattern_alias() -> None:
     assert parsed.path == "."
 
 
+def test_glob_files_input_accepts_claude_glob_alias() -> None:
+    parsed = GlobFilesInput.model_validate({"glob": "**/*.py", "path": "src"})
+    assert parsed.glob_pattern == "**/*.py"
+    assert parsed.path == "src"
+
+
 def test_glob_files_tool_invoke_with_pattern_alias(tmp_path: Path) -> None:
     (tmp_path / "UserEntity.java").write_text("class UserEntity {}", encoding="utf-8")
     tool = next(t for t in _tools(tmp_path) if t.name == "glob_files")

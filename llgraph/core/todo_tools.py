@@ -17,6 +17,7 @@ from llgraph.core.todo_store import (
     parse_todo_inputs,
     save_todo_state,
 )
+from llgraph.core.tool_arg_coerce import format_tool_validation_error
 
 
 def create_todo_tools(workspace_root: Path) -> list:
@@ -60,5 +61,6 @@ def create_todo_tools(workspace_root: Path) -> list:
             name=TODO_TOOL_NAME,
             description=todo_write.__doc__ or "",
             args_schema=TodoWriteInput,
+            handle_validation_error=format_tool_validation_error,
         )
     ]
