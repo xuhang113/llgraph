@@ -47,7 +47,7 @@ jobs:
 
           # 用量页上的 claude-opus-5-thinking-high / extra-high / max 是结算名，不能当 model.id。
           # Create Agent 只接受 GET /v1/models 里某一条 variants 的完整 id+params。
-          # Ultra：优先 Opus 5 Max（effort=max）。
+          # 省 token：优先 Opus 5 High（effort=high），不要 Max / Extra High。
           model = {"id": "claude-opus-5"}
           catalog_raw = call("GET", "/v1/models", fatal=False)
           catalog_item = None
@@ -89,24 +89,22 @@ jobs:
               name = (variant.get("displayName") or "").lower()
               score = 0
               effort = (params.get("effort") or "").lower()
-              if effort == "max":
+              if effort == "high":
                   score += 24
               elif effort in ("xhigh", "extra-high", "extra_high", "extrahigh"):
-                  score += 16
-              elif effort == "high":
-                  score += 8
+                  score += 4
+              elif effort == "max":
+                  score -= 8
               if params.get("thinking") == "true":
                   score += 4
               if params.get("context") == "1m":
                   score += 3
               if params.get("fast") in (None, "false"):
                   score += 2
-              if "max" in name:
-                  score += 10
-              elif any(k in name for k in ("extra high", "extra-high", "xhigh")):
-                  score += 6
+              if "max" in name or any(k in name for k in ("extra high", "extra-high", "xhigh")):
+                  score -= 6
               elif "high" in name and "fast" not in name:
-                  score += 3
+                  score += 10
               if variant.get("isDefault"):
                   score += 1
               if params.get("fast") == "true":
@@ -131,40 +129,6 @@ jobs:
                   if fallback != candidates[0]:
                       candidates.append(fallback)
           if (model["id"] or "").startswith("claude-opus-"):
-              candidates.append({
-                  "id": model["id"],
-                  "params": [
-                      {"id": "thinking", "value": "true"},
-                      {"id": "context", "value": "1m"},
-                      {"id": "effort", "value": "max"},
-                      {"id": "fast", "value": "false"},
-                  ],
-              })
-              candidates.append({
-                  "id": model["id"],
-                  "params": [
-                      {"id": "thinking", "value": "true"},
-                      {"id": "effort", "value": "max"},
-                      {"id": "fast", "value": "false"},
-                  ],
-              })
-              candidates.append({
-                  "id": model["id"],
-                  "params": [
-                      {"id": "thinking", "value": "true"},
-                      {"id": "context", "value": "1m"},
-                      {"id": "effort", "value": "xhigh"},
-                      {"id": "fast", "value": "false"},
-                  ],
-              })
-              candidates.append({
-                  "id": model["id"],
-                  "params": [
-                      {"id": "thinking", "value": "true"},
-                      {"id": "effort", "value": "xhigh"},
-                      {"id": "fast", "value": "false"},
-                  ],
-              })
               candidates.append({
                   "id": model["id"],
                   "params": [
