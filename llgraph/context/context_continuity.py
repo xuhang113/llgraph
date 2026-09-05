@@ -17,7 +17,12 @@ _CONTINUE_INTENT_RE = re.compile(
     r"(重写|再来一份|再写一份|继续|接着|那份|刚才|上一轮|允许写了)",
     re.IGNORECASE,
 )
-_PATH_IN_TOOL_RE = re.compile(r"[`'\"]?([^\s`'\"><|]+\.(?:md|mdc|txt|json|yaml|yml))[`'\"]?", re.I)
+# 起点必须紧跟分隔符：否则 `[^\s…]+` 会在每个位置贪婪吃到行尾再回溯找扩展名，
+# 读过 lock/压缩 JSON/base64 等无空格长行时单条工具结果要 45ms（整段前奏 >2s）。
+_PATH_IN_TOOL_RE = re.compile(
+    r"(?:\A|[\s`'\"><|])([^\s`'\"><|]+\.(?:md|mdc|txt|json|yaml|yml))",
+    re.I,
+)
 
 
 def strip_workspace_context_wrapper(user_message: str) -> str:
