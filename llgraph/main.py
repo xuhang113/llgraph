@@ -599,6 +599,9 @@ def main() -> None:
             sandbox_policy=sandbox_policy,
             sandbox_cli_enabled=cli_sandbox,
         )
+        from llgraph.memory.scheduler import schedule_memory_embedder_prewarm
+
+        schedule_memory_embedder_prewarm(workspace)
         if explicit_thread:
             from llgraph.session.session_file_store import (
                 prepare_resumable_agent_session,

@@ -98,3 +98,48 @@ def schedule_light_consolidate(workspace: Path) -> None:
 def touch_memory_workspace(workspace: Path) -> None:
     """记忆读写前登记工作区。"""
     register_memory_workspace(workspace)
+
+
+def _memory_store_has_rows(workspace: Path) -> bool:
+    from llgraph.memory.paths import ACTIVE_KINDS, workspace_identity
+    from llgraph.memory.store import list_memory_rows
+
+    user_id, workspace_key, _ = workspace_identity(workspace)
+    return bool(list_memory_rows(user_id, workspace_key, status="active", kinds=ACTIVE_KINDS))
+
+
+def schedule_memory_embedder_prewarm(workspace: Path) -> threading.Thread | None:
+    """
+    会话建好后后台加载本地 embedding 模型，把冷启动挪出首轮 TTFT。
+
+    仅在「已有记忆可召回」且用的是本地模型时预热：空库首轮根本不会 embed，
+    预热只会白占内存。
+
+    @param workspace 工作区根
+    @return 预热线程；未触发时 None
+    """
+    try:
+        if not resolve_memory_settings(workspace).enabled:
+            return None
+        from llgraph.code_index.embedding_config import resolve_embedding_profile
+        from llgraph.code_index.local_embedder import local_embedder_is_loaded
+
+        profile = resolve_embedding_profile(workspace)
+        if profile.provider != "local" or local_embedder_is_loaded(profile):
+            return None
+        if not _memory_store_has_rows(workspace):
+            return None
+    except Exception:
+        return None
+
+    def _run() -> None:
+        try:
+            from llgraph.code_index.local_embedder import prewarm_local_embedder
+
+            prewarm_local_embedder(profile)
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_run, name="memory-embedder-prewarm", daemon=True)
+    thread.start()
+    return thread

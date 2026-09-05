@@ -97,6 +97,9 @@ def build_agent_session_for_thread(
         subagent_parent_slot=subagent_slot,
     )
     restore_session_to_agent(agent, workspace, thread_id)
+    from llgraph.memory.scheduler import schedule_memory_embedder_prewarm
+
+    schedule_memory_embedder_prewarm(workspace)
     session = AgentSessionContext(
         agent=agent,
         workspace=workspace,
