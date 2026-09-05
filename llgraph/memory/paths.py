@@ -65,6 +65,27 @@ def memory_meta_path(user_id: str, workspace_key: str) -> Path:
     return memory_root(user_id, workspace_key) / META_FILENAME
 
 
+def memory_store_is_definitely_empty(user_id: str, workspace_key: str) -> bool:
+    """
+    纯文件系统判断「库里一定没有记忆」。
+
+    `import lancedb` 约 0.8s，全新工作区首轮却只是为了确认表不存在而付这笔钱。
+    只在能确定为空时返回 True（目录缺失，或存在但一个条目都没有）；
+    目录里有任何内容都返回 False，交回 lancedb 正常读，不猜它的落盘布局。
+
+    @param user_id 用户 ID
+    @param workspace_key 工作区键
+    @return 是否确定无记忆
+    """
+    lance_dir = Path(memory_lance_uri(user_id, workspace_key))
+    try:
+        return next(lance_dir.iterdir(), None) is None
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+
+
 def ensure_memory_dirs(user_id: str, workspace_key: str) -> Path:
     """
     创建记忆目录。

@@ -12,6 +12,7 @@ from llgraph.memory.paths import (
     TABLE_NAME,
     ensure_memory_dirs,
     memory_lance_uri,
+    memory_store_is_definitely_empty,
     save_memory_meta,
 )
 
@@ -154,6 +155,8 @@ def list_memory_rows(
     @param kinds kind 白名单
     @return 行 dict 列表
     """
+    if memory_store_is_definitely_empty(user_id, workspace_key):
+        return []
     db = connect_memory_db(user_id, workspace_key)
     if TABLE_NAME not in _table_names(db):
         return []
@@ -191,6 +194,8 @@ def search_memory_vectors(
     @param kinds kind 白名单
     @return 命中行
     """
+    if memory_store_is_definitely_empty(user_id, workspace_key):
+        return []
     db = connect_memory_db(user_id, workspace_key)
     if TABLE_NAME not in _table_names(db):
         return []
