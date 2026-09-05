@@ -28,6 +28,7 @@ htmlcov/
 !.env.example
 llgraph.env
 *.env.local
+*.local.yaml
 secrets/
 *.pem
 *.key
