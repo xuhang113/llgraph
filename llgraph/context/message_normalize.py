@@ -187,9 +187,22 @@ def prepare_messages_for_llm_dispatch(
         with_soft = redact_messages_for_dispatch(with_soft, redact_settings)
 
     from llgraph.context.dispatch_compaction import record_dispatch_prefix
+    from llgraph.core.prompt_cache import (
+        apply_cache_breakpoints_for_dispatch,
+        last_stable_message_index,
+    )
 
-    record_dispatch_prefix(with_soft, thread_id=thread_id)
-    return with_soft
+    stable_idx = last_stable_message_index(with_soft)
+    record_dispatch_prefix(
+        with_soft,
+        thread_id=thread_id,
+        cacheable_upto=None if stable_idx is None else stable_idx + 1,
+    )
+    return apply_cache_breakpoints_for_dispatch(
+        with_soft,
+        workspace=workspace,
+        model_id=model_id,
+    )
 
 
 def normalize_messages_for_llm(

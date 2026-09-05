@@ -130,23 +130,9 @@ def build_react_graph(
     if ws is None:
         ws = getattr(model, "llgraph_workspace", None)
     tool_node = build_tool_node(list(tools), workspace=ws)
+    # 对话缓存断点由 prepare_messages_for_llm_dispatch 打在最后一条**稳定**消息上；
+    # 旧的 top-level cache_control 会落到出站最后一块（ephemeral 提醒），写进去读不回来。
     bound_model = _bind_tools_if_needed(model, tools)
-    if ws is not None:
-        from llgraph.core.prompt_cache import apply_prompt_cache_to_llm
-        from llgraph.core.prompt_cache_settings import (
-            prompt_cache_enabled_for_model,
-            resolve_prompt_cache_settings,
-        )
-        from llgraph.core.llm_settings import resolve_effective_model
-
-        cache_settings = resolve_prompt_cache_settings(ws)
-        model_id = resolve_effective_model(ws)
-        if (
-            prompt_cache_enabled_for_model(ws, model_id)
-            and cache_settings.enabled
-            and cache_settings.tag_conversation_tail
-        ):
-            bound_model = apply_prompt_cache_to_llm(bound_model, ws)
     agent_runnable = _prompt_runnable(prompt) | bound_model
     prompt_runnable = _prompt_runnable(prompt)
 

@@ -365,15 +365,18 @@ def record_dispatch_prefix(
     messages: list[BaseMessage],
     *,
     thread_id: str | None,
+    cacheable_upto: int | None = None,
 ) -> PrefixStabilityReport | None:
     """
-    记录本次出站指纹并给出与上一次的公共前缀（prompt cache 可命中量）。
+    记录本次出站指纹并给出与上一次**写进缓存的前缀**的公共前缀。
 
     这是本模块唯一的效果度量：比值接近 1 说明工具循环里几乎整段命中缓存，
-    掉到 0 附近说明历史又被中途改写了。
+    掉到 0 附近说明历史又被中途改写了。cacheable_upto 之后的尾部是 ephemeral 提醒，
+    断点不打在那里，因此也不算进上一次的缓存前缀。
 
     @param messages 即将提交网关的消息
     @param thread_id 会话线程；None 时不记录
+    @param cacheable_upto 本次断点覆盖到的消息条数；None 表示全部
     @return 与上一次出站的前缀报告；首次调用返回 None
     """
     if not thread_id or not messages:
@@ -382,11 +385,12 @@ def record_dispatch_prefix(
     hashes = tuple(h for h, _n in fingerprints)
     sizes = tuple(n for _h, n in fingerprints)
     total_chars = sum(sizes)
+    upto = len(hashes) if cacheable_upto is None else max(0, min(cacheable_upto, len(hashes)))
 
     state = _state_for(thread_id)
     prev_hashes = state.prefix_hashes
-    state.prefix_hashes = hashes
-    state.prefix_sizes = sizes
+    state.prefix_hashes = hashes[:upto]
+    state.prefix_sizes = sizes[:upto]
     if not prev_hashes:
         state.last_report = None
         return None
@@ -401,7 +405,7 @@ def record_dispatch_prefix(
         stable_messages=stable,
         total_chars=total_chars,
         stable_chars=sum(sizes[:stable]),
-        first_changed_index=None if stable == len(prev_hashes) == len(hashes) else stable,
+        first_changed_index=None if stable == len(prev_hashes) else stable,
     )
     state.last_report = report
     return report
