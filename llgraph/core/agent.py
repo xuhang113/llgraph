@@ -39,7 +39,6 @@ def build_system_prompt(
     *,
     allow_write: bool,
     web_search_enabled: bool = False,
-    survey_interactive_enabled: bool = True,
 ) -> str:
     """
     根据工作区与权限生成系统提示。
@@ -47,7 +46,6 @@ def build_system_prompt(
     @param workspace_root 工作区绝对路径
     @param allow_write 是否允许写入
     @param web_search_enabled 是否已注册 web_search
-    @param survey_interactive_enabled 是否启用交互式 survey 向导
     @return 系统提示词
     """
     from llgraph.code_index.index_ready import code_index_is_ready
@@ -86,7 +84,6 @@ def build_system_prompt(
         thinking_payload=thinking_payload,
         web_search_enabled=web_search_enabled,
         allow_write=allow_write,
-        survey_interactive_enabled=survey_interactive_enabled,
     )
 
     thought_block = build_thought_prompt_block(workspace_root)
@@ -168,13 +165,10 @@ def build_agent(
 
     cp_key = resolve_thread_checkpointer_key(root, thread_id) if thread_id else None
     checkpointer = create_checkpointer(root, with_memory=with_memory, thread_key=cp_key)
-    from llgraph.config.survey_settings import survey_interactive_enabled
-
     system_prompt = build_system_prompt(
         root,
         allow_write=allow_write,
         web_search_enabled=web_search_enabled,
-        survey_interactive_enabled=survey_interactive_enabled(root, context_session),
     )
     if sandbox_policy is not None and sandbox_policy.enabled:
         from llgraph.config.sandbox_settings import format_sandbox_config_hint

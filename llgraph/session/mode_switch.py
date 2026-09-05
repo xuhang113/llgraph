@@ -1,4 +1,4 @@
-"""Agent ↔ Plan 模式切换。"""
+"""会话内 /session agent 切换。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Literal
 class SessionModeTransition:
     """会话模式切换请求。"""
 
-    mode: Literal["agent", "plan"]
+    mode: Literal["agent"]
     thread_id: str | None = None
     opening_goal: str = ""
     from_thread_id: str | None = None
@@ -19,7 +19,7 @@ class SessionModeTransition:
 
 def parse_session_mode_command(text: str) -> tuple[str | None, str, str]:
     """
-    解析 /session plan|agent 子命令。
+    解析 /session agent 子命令。
 
     @param text 用户输入
     @return (mode, thread_id, goal)；非模式切换命令返回 (None, "", "")
@@ -34,12 +34,6 @@ def parse_session_mode_command(text: str) -> tuple[str | None, str, str]:
         return None, "", ""
 
     sub = tokens[1].lower()
-    if sub == "plan":
-        if len(tokens) >= 3 and tokens[2].lower() in ("use", "switch", "resume"):
-            return "plan_switch_removed", "", ""
-        goal = stripped.split(None, 2)[2].strip() if len(stripped.split(None, 2)) > 2 else ""
-        return "plan", "", goal
-
     if sub == "agent":
         if len(tokens) >= 4 and tokens[2].lower() in ("use", "switch", "resume"):
             return "agent", tokens[3].strip(), ""

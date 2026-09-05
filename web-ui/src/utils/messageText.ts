@@ -3,7 +3,6 @@ import type { ChatImageAttachment } from '../types/chatImage';
 import type { ChatMessage } from '../components/console/ChatThread';
 import type { TraceStep, TraceTurn } from '../types/trace';
 import { extractReplyTextFromTraceStep } from '../pages/console/traceUtils';
-import { stripSurveyForDisplay } from './surveyDisplay';
 
 /**
  * 从 LangChain / 网关消息 content 提取用户可见正文（仅 text 块，忽略 thinking）。
@@ -228,7 +227,7 @@ export function splitAssistantStreamDisplay(text: string): {
   replyText: string;
   planningText: string;
 } {
-  const cleaned = stripSurveyForDisplay(stripInboundToolCallMarkup(text || ''));
+  const cleaned = stripInboundToolCallMarkup(text || '');
   let body = cleaned;
   let trailingPlanning = '';
 

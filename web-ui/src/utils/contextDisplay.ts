@@ -12,7 +12,6 @@ export const CONTEXT_BREAKDOWN_LABELS: Record<string, string> = {
 /** 与后端 _BUILTIN_META_COMMAND_NAMES 对齐（首 token，不含 /） */
 const BUILTIN_META_TOKENS = new Set([
   'index',
-  'survey',
   'paste',
   'p',
   'watch',
@@ -24,7 +23,6 @@ const BUILTIN_META_TOKENS = new Set([
   'sessionid',
   'session-id',
   'sessions',
-  'plan',
   'help',
   'h',
   'compress',
@@ -61,8 +59,6 @@ const BUILTIN_META_TITLES: Record<string, string> = {
   model: '模型',
   web: '联网搜索',
   write: '写权限',
-  plan: 'Plan',
-  survey: '梳理向导',
   paste: '多行粘贴',
   p: '多行粘贴',
   watch: '索引 Watch',

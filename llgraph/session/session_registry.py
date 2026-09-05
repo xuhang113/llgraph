@@ -206,16 +206,6 @@ def _plan_main_has_substantive_content(workspace: Path, thread_id: str) -> bool:
                 plan.get("goal") or plan.get("tasks") or plan.get("title")
             ):
                 return True
-    from llgraph.plan.config import resolve_plan_settings
-    from llgraph.plan.plan_store import plan_json_path
-    from llgraph.session.session_meta import load_session_meta
-
-    meta = load_session_meta(root, thread_id)
-    plan_id = str(meta.get("plan_id") or "").strip()
-    if plan_id:
-        settings = resolve_plan_settings(root)
-        if plan_json_path(root, plan_id, plans_dir=settings.plans_dir).is_file():
-            return True
     return False
 
 

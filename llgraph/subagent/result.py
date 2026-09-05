@@ -12,7 +12,7 @@ class SubagentResult:
     子 Agent 一轮交付。
 
     @param sub_thread 子会话 thread_id
-    @param kind explore | worker | planner | general
+    @param kind explore | general
     @param sub_id 子会话短 id（如 explore-a1b2 / w1）
     @param summary 回传父侧的摘要正文
     @param status ok | failed | cancelled

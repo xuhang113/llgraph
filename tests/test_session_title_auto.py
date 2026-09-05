@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from llgraph.plan.plan_store import is_placeholder_plan_title
 from llgraph.session.session_meta import (
     disambiguate_session_titles,
     ensure_session_title_auto,
@@ -53,13 +52,6 @@ def test_ensure_title_respects_manual_lock(tmp_path: Path) -> None:
     thread_id = "plan-12345678"
     set_session_title(workspace, thread_id, "手动标题", source="manual")
     assert ensure_session_title_auto(workspace, thread_id, "不应覆盖") is None
-
-
-def test_is_placeholder_plan_title() -> None:
-    assert is_placeholder_plan_title("", "abc")
-    assert is_placeholder_plan_title("未命名计划", "abc")
-    assert is_placeholder_plan_title("Plan abc12345", "abc12345")
-    assert not is_placeholder_plan_title("订单模块文档整理", "abc12345")
 
 
 def test_normalize_session_title_truncates() -> None:

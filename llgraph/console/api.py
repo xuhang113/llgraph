@@ -65,17 +65,17 @@ class Console:
 
     def session_tree(self, slug: str) -> dict[str, Any]:
         """
-        构建 Agent + Plan 会话树。
+        构建 Agent 会话树（含子 Agent 节点）。
 
         @param slug 工作区 slug
-        @return agents / plans 树
+        @return agents 树
         """
         workspace = self.resolve_workspace(slug)
         return discovery.build_session_tree(workspace)
 
     def delete_session(self, slug: str, thread_id: str) -> dict[str, Any]:
         """
-        删除 Agent 或 Plan 会话（Plan 含 Worker 级联）。
+        删除 Agent 会话（遗留 plan-* 目录按普通会话删除）。
 
         @param slug 工作区 slug
         @param thread_id 会话 ID

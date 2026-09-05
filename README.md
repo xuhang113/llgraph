@@ -243,7 +243,6 @@ llgraph web --help                          # Web Console（需 [web]）
 llgraph index --status -C .
 llgraph index -C . --incremental
 llgraph search "NotFoundException" -C .
-llgraph plan -C . "实现某某功能"             # Plan 模式
 llgraph --once -C . "现在 UTC 几点"
 llgraph --no-watch-index -C .
 llgraph --no-spill -C .

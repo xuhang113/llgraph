@@ -1,4 +1,4 @@
-"""Agent 模式：spawn_subagent / explore 工具（与 Plan 共用 run_subagent）。"""
+"""Agent 模式：spawn_subagent / explore 工具。"""
 
 from __future__ import annotations
 

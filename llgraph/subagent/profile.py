@@ -1,4 +1,4 @@
-"""Subagent Profile：explore / worker / planner / general。"""
+"""Subagent Profile：explore / general。"""
 
 from __future__ import annotations
 
@@ -78,22 +78,6 @@ _PROFILES: dict[str, SubagentProfile] = {
         max_turns=None,
         thread_suffix=":subagent:{sub_id}",
     ),
-    "worker": SubagentProfile(
-        kind="worker",
-        title="Worker",
-        allow_write=True,
-        include_mcp=True,
-        max_turns=None,
-        thread_suffix=":worker:{sub_id}",
-    ),
-    "planner": SubagentProfile(
-        kind="planner",
-        title="Planner",
-        allow_write=False,
-        include_mcp=True,
-        max_turns=None,
-        thread_suffix=":planner:{sub_id}",
-    ),
 }
 
 
@@ -101,7 +85,7 @@ def get_subagent_profile(kind: str, *, workspace: Path | None = None) -> Subagen
     """
     按 kind 取 Profile；explore 的 max_turns 可读 agent.json。
 
-    @param kind explore | worker | planner | general
+    @param kind explore | general
     @param workspace 可选，用于覆盖 explore max_turns
     """
     key = (kind or "explore").strip().lower()

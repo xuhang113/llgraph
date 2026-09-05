@@ -28,17 +28,14 @@ from llgraph.console.discovery import (
     dismiss_workspace_from_recent,
     touch_workspace_opened,
     list_edits,
-    load_plan_detail,
-    load_worker_detail,
     read_jsonl_lines,
     register_workspace_path,
     simplify_message,
     workspace_path_from_slug,
-    workspace_plans_payload,
     workspace_sessions_payload,
 )
 from llgraph.session.session_meta import load_session_meta
-from llgraph.session.user_storage import session_messages_path, session_thread_dir
+from llgraph.session.user_storage import session_messages_path
 from llgraph.console.runtime.agent_service import (
     AgentChatRequest,
     abort_agent_chat,
@@ -48,19 +45,6 @@ from llgraph.console.runtime.agent_service import (
 )
 from llgraph.console.runtime.capabilities import load_capabilities
 from llgraph.console.runtime.event_hub import HUB
-from llgraph.console.runtime.plan_service import (
-    abort_plan,
-    cancel_plan,
-    cancel_plan_task,
-    check_plan_task_runnable,
-    confirm_plan,
-    continue_plan,
-    create_plan_session,
-    discuss_plan,
-    get_plan_status,
-    run_plan_task,
-    start_plan_with_goal,
-)
 from llgraph.console.runtime.session_lock import LOCKS
 from llgraph.console.runtime.sse_utils import format_sse, merge_sse_streams
 from llgraph.console.runtime.workspace_runtime import RUNTIME_MANAGER
@@ -119,30 +103,15 @@ class PickDirectoryBody(BaseModel):
 class CreateSessionBody(BaseModel):
     """创建会话。"""
 
-    kind: str = Field(description="agent | plan")
+    kind: str = Field(description="agent")
     title: str = ""
     goal: str = ""
-
-
-class ChatBody(BaseModel):
-    """发送消息（Plan 等 JSON 接口）。"""
-
-    message: str = ""
-    allow_write: bool = False
 
 
 class TraceModeBody(BaseModel):
     """Trace 模式。"""
 
     mode: str
-
-
-class PlanConfirmBody(BaseModel):
-    """Plan 确认。"""
-
-    action: str = "approve"
-    allow_worker_write: bool = False
-    revise_note: str = ""
 
 
 class MetaCommandBody(BaseModel):
@@ -166,26 +135,6 @@ class UndoBody(BaseModel):
     """还原文件改动。"""
 
     target: str = "all"
-
-
-class PlanUndoBody(BaseModel):
-    """Plan / Work 回滚。"""
-
-    target: str = "all"
-    task_id: str | None = None
-
-
-class SurveyFormatBody(BaseModel):
-    """问卷答案格式化。"""
-
-    answers: dict[str, str] = Field(default_factory=dict)
-    allow_write: bool = False
-
-
-class SurveyResolveBody(BaseModel):
-    """从助手回复解析问卷。"""
-
-    text: str = ""
 
 
 class ReviewBody(BaseModel):
@@ -334,21 +283,20 @@ def _resolve_session_kind(workspace: Path, thread_id: str) -> str | None:
 
     @param workspace 工作区根
     @param thread_id 会话 ID
-    @return agent | plan | worker；无法识别时 None
+    @return agent | unknown；无法识别时 None
     """
-    from llgraph.session.session_delete import is_plan_main_thread
-
     meta = load_session_meta(workspace, thread_id.strip())
     raw = meta.get("session_kind")
     if isinstance(raw, str) and raw.strip():
-        return raw.strip()
+        kind = raw.strip()
+        if kind == "plan":
+            return "unknown"
+        return kind
     tid = thread_id.strip()
     if tid.startswith("cli-"):
         return "agent"
-    if is_plan_main_thread(tid):
-        return "plan"
     if tid.startswith("plan-"):
-        return "worker"
+        return "unknown"
     return None
 
 
@@ -1244,31 +1192,6 @@ def list_sessions(slug: str) -> dict:
     return workspace_sessions_payload(_ws(slug))
 
 
-@app.get("/api/workspaces/{slug}/plans")
-def list_plans(slug: str) -> dict:
-    """Plan 列表。"""
-    return workspace_plans_payload(_ws(slug))
-
-
-@app.get("/api/workspaces/{slug}/plans/{thread_id}")
-def get_plan(slug: str, thread_id: str) -> dict:
-    """Plan 详情。"""
-    workspace = _ws(slug)
-    if not session_thread_dir(workspace, thread_id).is_dir():
-        raise HTTPException(status_code=404, detail=f"Plan 不存在: {thread_id}")
-    detail = load_plan_detail(workspace, thread_id)
-    detail["job"] = get_plan_status(thread_id)
-    lock = LOCKS.get(thread_id)
-    detail["lock"] = {"owner": lock.owner, "since": lock.since} if lock else None
-    return detail
-
-
-@app.get("/api/workspaces/{slug}/plans/{thread_id}/tasks/{task_id}")
-def get_worker(slug: str, thread_id: str, task_id: str) -> dict:
-    """Worker 详情。"""
-    return load_worker_detail(_ws(slug), thread_id, task_id)
-
-
 @app.get("/api/workspaces/{slug}/sessions/{thread_id}")
 def get_session(slug: str, thread_id: str) -> dict:
     """会话元数据。"""
@@ -1313,7 +1236,7 @@ def touch_session(slug: str, thread_id: str) -> dict[str, Any]:
 
 @app.patch("/api/workspaces/{slug}/sessions/{thread_id}/title")
 def patch_session_title(slug: str, thread_id: str, body: SessionTitleBody) -> dict[str, Any]:
-    """重命名 Agent / Plan 会话标题。"""
+    """重命名会话标题。"""
     from llgraph.console.runtime.session_title_api import update_session_display_title
 
     ok, msg, normalized = update_session_display_title(
@@ -1470,83 +1393,20 @@ def review_session_files(slug: str, thread_id: str, body: ReviewBody) -> dict[st
     return run_session_review(_ws(slug), thread_id, topic=body.topic.strip())
 
 
-@app.get("/api/workspaces/{slug}/plans/{thread_id}/file-changes")
-def get_plan_file_changes(slug: str, thread_id: str) -> dict[str, Any]:
-    """聚合 Plan 各 Work 的文件改动。"""
-    from llgraph.console.edit_service import plan_file_changes
-
-    return plan_file_changes(_ws(slug), thread_id)
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/undo")
-def undo_plan_files(slug: str, thread_id: str, body: PlanUndoBody) -> dict[str, Any]:
-    """Plan 整体或单 Work 回滚（等同放弃对应产出物）。"""
-    from llgraph.console.edit_service import plan_undo_files
-
-    target = body.target.strip()
-    if not target:
-        raise HTTPException(status_code=400, detail="target 不能为空")
-    try:
-        return plan_undo_files(
-            _ws(slug),
-            thread_id,
-            target=target,
-            task_id=body.task_id,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/review")
-def review_plan_files(slug: str, thread_id: str, body: ReviewBody) -> dict[str, Any]:
-    """对 Plan 各 Work 改动执行 /review。"""
-    from llgraph.console.edit_service import plan_run_review
-
-    return plan_run_review(_ws(slug), thread_id, topic=body.topic.strip())
-
-
-@app.post("/api/workspaces/{slug}/survey/format")
-def format_survey_answers(body: SurveyFormatBody) -> dict[str, str]:
-    """将问卷答案格式化为 Agent 用户消息。"""
-    from llgraph.survey.survey_prompt import format_survey_answers_for_agent
-
-    message = format_survey_answers_for_agent(
-        body.answers,
-        allow_write=body.allow_write,
-    )
-    return {"message": message}
-
-
-@app.post("/api/workspaces/{slug}/survey/resolve")
-def resolve_survey_from_text(body: SurveyResolveBody) -> dict[str, Any]:
-    """从助手回复解析 survey（仅 <<<llgraph-survey>>> JSON 块）。"""
-    from llgraph.console.runtime.agent_service import _survey_spec_to_dict
-    from llgraph.survey.survey_prompt import resolve_survey_from_assistant
-
-    text = body.text.strip()
-    if not text:
-        return {"survey": None}
-    spec = resolve_survey_from_assistant(text)
-    if spec is None:
-        return {"survey": None}
-    return {"survey": _survey_spec_to_dict(spec)}
-
-
 # ── 交互：创建会话 ──
 
 
 @app.post("/api/workspaces/{slug}/sessions/create")
 def create_session(slug: str, body: CreateSessionBody) -> dict[str, str]:
-    """新建 Agent 或 Plan 会话。"""
+    """新建 Agent 会话。"""
     workspace = _ws(slug)
     kind = body.kind.strip().lower()
+    if kind == "plan":
+        raise HTTPException(status_code=400, detail="Plan 模式已移除")
     if kind == "agent":
         thread_id = create_agent_session(workspace, title=body.title)
         return {"thread_id": thread_id, "kind": "agent"}
-    if kind == "plan":
-        thread_id = create_plan_session(workspace, goal=body.goal)
-        return {"thread_id": thread_id, "kind": "plan", "goal": body.goal}
-    raise HTTPException(status_code=400, detail="kind 须为 agent 或 plan")
+    raise HTTPException(status_code=400, detail="kind 须为 agent")
 
 
 @app.post("/api/workspaces/{slug}/sessions/{thread_id}/warm")
@@ -1781,234 +1641,6 @@ def agent_chat_abort(slug: str, thread_id: str) -> dict[str, Any]:
     """停止进行中的 Agent 对话（ReAct 步间取消）。"""
     _ws(slug)
     return abort_agent_chat(thread_id)
-
-
-# ── 交互：Plan ──
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/start")
-async def plan_start_stream(
-    slug: str,
-    thread_id: str,
-    body: ChatBody,
-    request: Request,
-) -> StreamingResponse:
-    """启动/续跑 Plan（goal 或空继续）。"""
-    workspace = _ws(slug)
-    loop = asyncio.get_event_loop()
-    channel = f"plan:{thread_id}"
-    queue = HUB.subscribe(channel)
-
-    if body.message.strip():
-        start_plan_with_goal(
-            workspace,
-            thread_id,
-            body.message.strip(),
-            allow_write=body.allow_write,
-            channel=channel,
-            loop=loop,
-            block_first=False,
-        )
-    else:
-        from llgraph.console.runtime.plan_service import continue_plan
-
-        continue_plan(
-            workspace,
-            thread_id,
-            allow_write=body.allow_write,
-            channel=channel,
-            loop=loop,
-        )
-
-    async def gen():
-        try:
-            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
-                yield chunk
-        finally:
-            HUB.unsubscribe(channel, queue)
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/confirm")
-async def plan_confirm_stream(
-    slug: str,
-    thread_id: str,
-    body: PlanConfirmBody,
-    request: Request,
-) -> StreamingResponse:
-    """Plan 确认 Survey 决策。"""
-    workspace = _ws(slug)
-    loop = asyncio.get_event_loop()
-    channel = f"plan:{thread_id}"
-    queue = HUB.subscribe(channel)
-    decision = {
-        "action": body.action,
-        "allow_worker_write": body.allow_worker_write,
-        "revise_note": body.revise_note,
-    }
-    confirm_plan(
-        workspace,
-        thread_id,
-        decision,
-        allow_write=body.allow_worker_write,
-        channel=channel,
-        loop=loop,
-    )
-
-    async def gen():
-        try:
-            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
-                yield chunk
-        finally:
-            HUB.unsubscribe(channel, queue)
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/continue")
-async def plan_continue_stream(
-    slug: str,
-    thread_id: str,
-    body: ChatBody,
-    request: Request,
-) -> StreamingResponse:
-    """Plan task_step_confirm 后继续。"""
-    workspace = _ws(slug)
-    loop = asyncio.get_event_loop()
-    channel = f"plan:{thread_id}"
-    queue = HUB.subscribe(channel)
-    continue_plan(
-        workspace,
-        thread_id,
-        allow_write=body.allow_write,
-        channel=channel,
-        loop=loop,
-    )
-
-    async def gen():
-        try:
-            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
-                yield chunk
-        finally:
-            HUB.unsubscribe(channel, queue)
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/discuss")
-async def plan_discuss_stream(
-    slug: str,
-    thread_id: str,
-    body: ChatBody,
-    request: Request,
-) -> StreamingResponse:
-    """Plan 终止后基于最终报告问答。"""
-    workspace = _ws(slug)
-    loop = asyncio.get_event_loop()
-    channel = f"plan:{thread_id}"
-    queue = HUB.subscribe(channel)
-    discuss_plan(
-        workspace,
-        thread_id,
-        body.message.strip(),
-        channel=channel,
-        loop=loop,
-    )
-
-    async def gen():
-        try:
-            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
-                yield chunk
-        finally:
-            HUB.unsubscribe(channel, queue)
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/cancel")
-def plan_cancel(slug: str, thread_id: str) -> dict[str, Any]:
-    """立即停止 Plan（跳过所有未完成 Work，不再调度新 batch）。"""
-    return cancel_plan(_ws(slug), thread_id)
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/abort")
-def plan_abort(slug: str, thread_id: str) -> dict[str, Any]:
-    """取消 Plan（标记 cancelled，未完成 task 跳过）。"""
-    return abort_plan(_ws(slug), thread_id)
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/tasks/{task_id}/cancel")
-def plan_task_cancel(slug: str, thread_id: str, task_id: str) -> dict[str, Any]:
-    """停止/跳过单个 Work task。"""
-    return cancel_plan_task(_ws(slug), thread_id, task_id)
-
-
-@app.get("/api/workspaces/{slug}/plans/{thread_id}/tasks/{task_id}/runnable")
-def plan_task_runnable(slug: str, thread_id: str, task_id: str) -> dict[str, Any]:
-    """检查 Work task 是否可执行（依赖是否满足）。"""
-    return check_plan_task_runnable(_ws(slug), thread_id, task_id)
-
-
-@app.post("/api/workspaces/{slug}/plans/{thread_id}/tasks/{task_id}/run")
-async def plan_run_task_stream(
-    slug: str,
-    thread_id: str,
-    task_id: str,
-    body: ChatBody,
-    request: Request,
-) -> StreamingResponse:
-    """手动执行单个 Work task。"""
-    workspace = _ws(slug)
-    loop = asyncio.get_event_loop()
-    channel = f"plan:{thread_id}"
-    queue = HUB.subscribe(channel)
-    run_plan_task(
-        workspace,
-        thread_id,
-        task_id,
-        allow_write=body.allow_write,
-        channel=channel,
-        loop=loop,
-    )
-
-    async def gen():
-        try:
-            async for chunk in merge_sse_streams(queue, is_disconnected=request.is_disconnected):
-                yield chunk
-        finally:
-            HUB.unsubscribe(channel, queue)
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-@app.get("/api/workspaces/{slug}/plans/{thread_id}/events")
-async def plan_events_subscribe(slug: str, thread_id: str, request: Request) -> StreamingResponse:
-    """订阅 Plan trace / 状态事件（长连接）。"""
-    channel = f"plan:{thread_id}"
-    queue = HUB.subscribe(channel)
-
-    async def gen():
-        try:
-            yield format_sse({"type": "subscribed", "channel": channel})
-            detail = load_plan_detail(_ws(slug), thread_id)
-            yield format_sse({"type": "plan_state", "phase": detail.get("phase")})
-            async for chunk in merge_sse_streams(
-                queue,
-                timeout_sec=86400,
-                is_disconnected=request.is_disconnected,
-            ):
-                yield chunk
-        finally:
-            HUB.unsubscribe(channel, queue)
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-
-@app.get("/api/workspaces/{slug}/plans/{thread_id}/job")
-def plan_job_status(slug: str, thread_id: str) -> dict:
-    """Plan 后台 job 状态。"""
-    return get_plan_status(thread_id)
 
 
 # ── 静态资源 ──

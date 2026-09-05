@@ -1,4 +1,4 @@
-"""ReAct 子图基元（Plan / Agent 共用）。"""
+"""ReAct 子图基元（explore / general 子 Agent）。"""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ class ReactSubgraphSpec:
     """
     子图元数据。
 
-    @param node_id 父图 node id（Plan）；Agent 工具侧可用 kind
-    @param subgraph_kind explore | planner | worker | general
+    @param node_id 子图标识；Agent 工具侧可用 kind
+    @param subgraph_kind explore | general
     @param thread_suffix checkpoint thread 后缀模板
     """
 
@@ -46,10 +46,8 @@ def build_react_subgraph(
     """
     构建 LangGraph ReAct 子图。
 
-    @param subgraph_kind planner | worker 时启用结构化交付物完成判定
+    @param subgraph_kind 子图类型（explore | general）
     """
-    from llgraph.plan.subgraphs.routing import resolve_structured_complete_fn
-
     checkpointer = create_checkpointer(
         workspace,
         with_memory=with_memory,
@@ -61,7 +59,7 @@ def build_react_subgraph(
         prompt=make_prompt_normalizer(system_prompt, workspace),
         checkpointer=checkpointer,
         workspace=workspace,
-        complete_on_thinking_if=resolve_structured_complete_fn(subgraph_kind),
+        complete_on_thinking_if=None,
     )
 
 
@@ -88,11 +86,7 @@ def extract_subagent_result_text(
     *,
     subgraph_kind: str | None,
 ) -> str:
-    """子图 turn 结束后的交付正文。"""
-    if subgraph_kind in ("planner", "worker"):
-        from llgraph.plan.subgraphs.routing import extract_structured_deliverable_text
-
-        return extract_structured_deliverable_text(messages, subgraph_kind=subgraph_kind)
+    """子图 turn 结束后的交付正文（始终取最后一条可见助手文本）。"""
     return _extract_last_visible_ai_text(messages)
 
 
@@ -200,19 +194,12 @@ def invoke_react_subgraph_turn(
     _persist_subagent_web_trace(runtime, sub_thread, trace)
 
     messages = collect_subgraph_messages(subgraph, sub_thread)
-    kind_key = spec.subgraph_kind if spec is not None else None
-    if kind_key in ("planner", "worker"):
-        deliverable = extract_subagent_result_text(messages, subgraph_kind=kind_key)
-        if deliverable:
-            return deliverable
     stream_text = turn.text.strip()
     if stream_text and stream_text != FALLBACK_INCOMPLETE_TURN:
         return stream_text
-    if kind_key in ("planner", "worker"):
-        return extract_subagent_result_text(messages, subgraph_kind=kind_key)
     if stream_text:
         return stream_text
-    return _extract_last_visible_ai_text(messages)
+    return extract_subagent_result_text(messages, subgraph_kind=None)
 
 
 def _persist_subagent_web_trace(

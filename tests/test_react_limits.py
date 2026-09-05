@@ -14,7 +14,6 @@ from llgraph.core.react_limits import (
     parse_react_max_turns,
     resolve_agent_max_turns,
 )
-from llgraph.plan.config import resolve_plan_settings
 
 
 def test_parse_react_max_turns_defaults_and_clamps() -> None:
@@ -35,16 +34,6 @@ def test_resolve_agent_max_turns_from_workspace(tmp_path: Path, monkeypatch) -> 
     )
     monkeypatch.setenv("HOME", str(tmp_path))
     assert resolve_agent_max_turns(tmp_path) == 80
-
-
-def test_plan_defaults_max_turns_match_agent_default(tmp_path: Path, monkeypatch) -> None:
-    llgraph_dir = tmp_path / ".llgraph"
-    llgraph_dir.mkdir()
-    (llgraph_dir / "agent.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setenv("HOME", str(tmp_path))
-    settings = resolve_plan_settings(tmp_path)
-    assert settings.planner_max_turns == DEFAULT_REACT_MAX_TURNS
-    assert settings.worker_max_turns == DEFAULT_REACT_MAX_TURNS
 
 
 def test_format_tool_round_budget_line() -> None:

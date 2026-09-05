@@ -64,12 +64,12 @@ export interface Workspace {
   slug: string;
   path: string;
   session_count: number;
-  plan_count: number;
+  plan_count?: number;
   updated_at: string | null;
 }
 
 export interface TreeNode {
-  kind: 'agent' | 'plan' | 'worker' | 'subagent';
+  kind: 'agent' | 'subagent';
   thread_id: string;
   title: string;
   title_full?: string;
@@ -77,7 +77,6 @@ export interface TreeNode {
   /** 仅前端：新建会话尚未出现在 tree API 前保留侧栏占位 */
   _optimistic?: boolean;
   phase?: string;
-  plan_id?: string;
   task_id?: string;
   status?: string;
   children: TreeNode[];
@@ -303,19 +302,6 @@ export interface FileChangesSummary {
   can_undo: boolean;
 }
 
-export interface PlanFileChangesGroup extends FileChangesSummary {
-  task_id: string;
-  title: string;
-  thread_id: string;
-}
-
-export interface PlanFileChangesSummary {
-  plan_thread_id: string;
-  groups: PlanFileChangesGroup[];
-  total: number;
-  can_undo: boolean;
-}
-
 export interface MessageItem {
   type: string;
   content: unknown;
@@ -338,16 +324,6 @@ export interface SessionSummary {
   has_edits: boolean;
 }
 
-export interface PlanSummary {
-  thread_id: string;
-  plan_id: string;
-  title: string;
-  phase: string;
-  tasks_done: number;
-  tasks_total: number;
-  updated_at: string | null;
-}
-
 export interface SlashCatalogItem {
   name: string;
   description: string;
@@ -355,88 +331,6 @@ export interface SlashCatalogItem {
   badge: string;
   insert_text: string;
   origin?: string;
-}
-
-export interface WorkflowNode {
-  id: string;
-  status: string;
-}
-
-export interface WorkflowTask {
-  id: string;
-  title: string;
-  status: string;
-  worker_node_status?: string;
-  depends_on?: string[];
-}
-
-export interface WorkerDetail {
-  thread_id: string;
-  task_id: string;
-  worker_thread_id: string;
-  task: Record<string, unknown>;
-  result: Record<string, unknown> | null;
-  messages: MessageItem[];
-  message_total: number;
-  edits: Array<Record<string, unknown>>;
-}
-
-export interface PlanConfirmHistoryEntry {
-  at: string;
-  action: 'approve' | 'revise' | 'cancel' | string;
-  allow_worker_write: boolean;
-  revise_note?: string;
-  plan_version?: number;
-  title?: string;
-  task_count?: number;
-  tasks?: Array<{ id: string; title: string }>;
-}
-
-export interface PlanDetail {
-  thread_id: string;
-  plan_id: string;
-  title: string;
-  goal: string;
-  phase: string;
-  final_report: string | null;
-  error: string | null;
-  tasks: Array<Record<string, unknown>>;
-  workflow_snapshot: {
-    nodes?: WorkflowNode[];
-    tasks?: WorkflowTask[];
-    synthesize_depends_on?: string[];
-    graph_definition?: Record<string, unknown>;
-  };
-  updated_at?: string | null;
-  job?: { running?: boolean; error?: string | null };
-  plan?: {
-    execution?: { allow_worker_write?: boolean };
-  };
-  plan_state?: {
-    plan_version?: number;
-    user_messages?: string[];
-    revision_note?: string | null;
-    allow_worker_write?: boolean;
-    cancel_requested?: boolean;
-    discuss_messages?: Array<{ role: string; content: string }>;
-    pending_interrupt?: Record<string, unknown>;
-    confirm_history?: PlanConfirmHistoryEntry[];
-  };
-}
-
-export interface SurveySpec {
-  title: string;
-  questions: Array<{
-    id: string;
-    prompt: string;
-    options: string[];
-    default_index: number;
-    default_indices?: number[];
-    allow_free_text?: boolean;
-    step_label?: string;
-    option_hints?: string[];
-    multi_select?: boolean;
-  }>;
 }
 
 export type SSEHandler = (event: Record<string, unknown>) => void;
@@ -505,11 +399,9 @@ export const api = {
       method: 'POST',
     }),
   tree: (slug: string) =>
-    fetchJson<{ agents: TreeNode[]; plans: TreeNode[] }>(`/workspaces/${slug}/tree`),
+    fetchJson<{ agents: TreeNode[] }>(`/workspaces/${slug}/tree`),
   sessions: (slug: string) =>
     fetchJson<{ sessions: SessionSummary[] }>(`/workspaces/${slug}/sessions`),
-  plans: (slug: string) =>
-    fetchJson<{ plans: PlanSummary[] }>(`/workspaces/${slug}/plans`),
   renameSession: (slug: string, threadId: string, title: string) =>
     fetchJson<{ ok: boolean; title: string; message: string }>(
       `/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/title`,
@@ -569,42 +461,6 @@ export const api = {
         body: JSON.stringify({ topic }),
       },
     ),
-  planFileChanges: (slug: string, planThreadId: string) =>
-    fetchJson<PlanFileChangesSummary>(
-      `/workspaces/${slug}/plans/${encodeURIComponent(planThreadId)}/file-changes`,
-    ),
-  planUndo: (slug: string, planThreadId: string, target = 'all', taskId?: string) =>
-    fetchJson<{
-      ok: boolean;
-      summary: { restored: number; deleted: number; skipped: number; failed: number };
-      plan_changes: PlanFileChangesSummary;
-    }>(`/workspaces/${slug}/plans/${encodeURIComponent(planThreadId)}/undo`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target, task_id: taskId || null }),
-    }),
-  planReview: (slug: string, planThreadId: string, topic = '') =>
-    fetchJson<{
-      ok: boolean;
-      message?: string;
-      reviews?: Array<{ task_id?: string; review_path?: string; summary?: string }>;
-    }>(`/workspaces/${slug}/plans/${encodeURIComponent(planThreadId)}/review`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ topic }),
-    }),
-  formatSurveyAnswers: (slug: string, answers: Record<string, string>, allowWrite: boolean) =>
-    fetchJson<{ message: string }>(`/workspaces/${slug}/survey/format`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ answers, allow_write: allowWrite }),
-    }),
-  resolveSurvey: (slug: string, text: string) =>
-    fetchJson<{ survey: SurveySpec | null }>(`/workspaces/${slug}/survey/resolve`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    }),
   skillDetail: (slug: string, name: string) =>
     fetchJson<{
       name: string;
@@ -652,7 +508,7 @@ export const api = {
         thread_id: threadId,
       }),
     }),
-  createSession: (slug: string, kind: 'agent' | 'plan', goal = '') =>
+  createSession: (slug: string, kind: 'agent', goal = '') =>
     fetchJson<{ thread_id: string; kind: string }>(`/workspaces/${slug}/sessions/create`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -721,10 +577,6 @@ export const api = {
       turns?: Record<string, unknown>[];
       live_ts?: string;
     }>(`/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/trace`),
-  plan: (slug: string, threadId: string) =>
-    fetchJson<PlanDetail>(`/workspaces/${slug}/plans/${threadId}`),
-  worker: (slug: string, threadId: string, taskId: string) =>
-    fetchJson<WorkerDetail>(`/workspaces/${slug}/plans/${threadId}/tasks/${taskId}`),
   startAgentChat: (
     slug: string,
     threadId: string,
@@ -750,62 +602,6 @@ export const api = {
   abortAgentChat: (slug: string, threadId: string) =>
     fetchJson<{ ok: boolean; message: string }>(
       `/workspaces/${slug}/sessions/${encodeURIComponent(threadId)}/abort`,
-      { method: 'POST' },
-    ),
-  planStart: (slug: string, threadId: string, message: string, allowWrite: boolean, onEvent: SSEHandler, signal?: AbortSignal) =>
-    consumeSSE(
-      `/workspaces/${slug}/plans/${threadId}/start`,
-      { message, allow_write: allowWrite },
-      onEvent,
-      signal,
-    ),
-  planConfirm: (slug: string, threadId: string, body: Record<string, unknown>, onEvent: SSEHandler, signal?: AbortSignal) =>
-    consumeSSE(`/workspaces/${slug}/plans/${threadId}/confirm`, body, onEvent, signal),
-  planContinue: (slug: string, threadId: string, allowWrite: boolean, onEvent: SSEHandler, signal?: AbortSignal) =>
-    consumeSSE(
-      `/workspaces/${slug}/plans/${threadId}/continue`,
-      { message: '', allow_write: allowWrite },
-      onEvent,
-      signal,
-    ),
-  planDiscuss: (slug: string, threadId: string, message: string, onEvent: SSEHandler, signal?: AbortSignal) =>
-    consumeSSE(
-      `/workspaces/${slug}/plans/${threadId}/discuss`,
-      { message, allow_write: false },
-      onEvent,
-      signal,
-    ),
-  planTaskRunnable: (slug: string, threadId: string, taskId: string) =>
-    fetchJson<{ ok: boolean; message: string; missing_deps: string[] }>(
-      `/workspaces/${slug}/plans/${threadId}/tasks/${taskId}/runnable`,
-    ),
-  planRunTask: (
-    slug: string,
-    threadId: string,
-    taskId: string,
-    allowWrite: boolean,
-    onEvent: SSEHandler,
-    signal?: AbortSignal,
-  ) =>
-    consumeSSE(
-      `/workspaces/${slug}/plans/${threadId}/tasks/${taskId}/run`,
-      { message: '', allow_write: allowWrite },
-      onEvent,
-      signal,
-    ),
-  planCancel: (slug: string, threadId: string) =>
-    fetchJson<{ ok: boolean; message: string }>(
-      `/workspaces/${slug}/plans/${encodeURIComponent(threadId)}/cancel`,
-      { method: 'POST' },
-    ),
-  planAbort: (slug: string, threadId: string) =>
-    fetchJson<{ ok: boolean; message: string }>(
-      `/workspaces/${slug}/plans/${encodeURIComponent(threadId)}/abort`,
-      { method: 'POST' },
-    ),
-  planTaskCancel: (slug: string, threadId: string, taskId: string) =>
-    fetchJson<{ ok: boolean; message: string }>(
-      `/workspaces/${slug}/plans/${encodeURIComponent(threadId)}/tasks/${encodeURIComponent(taskId)}/cancel`,
       { method: 'POST' },
     ),
   setWebSearch: (
@@ -893,15 +689,6 @@ export const api = {
     fetchJson<{ ok: boolean; deleted: number; failed?: number; message: string }>(
       `/workspaces/${slug}/sessions/delete-empty`,
       { method: 'POST' },
-    ),
-  subscribePlanEvents: (
-    slug: string,
-    threadId: string,
-    onEvent: (data: Record<string, unknown>) => void,
-  ): (() => void) =>
-    subscribeReconnectingSSE(
-      `${BASE}/workspaces/${slug}/plans/${encodeURIComponent(threadId)}/events`,
-      onEvent,
     ),
   subscribeSessionEvents: (
     slug: string,

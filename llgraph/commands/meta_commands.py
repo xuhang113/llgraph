@@ -100,7 +100,6 @@ def _print_trace_stats(
 # 内置元命令首 token（不含 /）；新增命令须同步更新 handle_meta_command 与此集合
 _BUILTIN_META_COMMAND_NAMES = frozenset({
     "index",
-    "survey",
     "paste",
     "p",
     "watch",
@@ -112,7 +111,6 @@ _BUILTIN_META_COMMAND_NAMES = frozenset({
     "sessionid",
     "session-id",
     "sessions",
-    "plan",
     "help",
     "h",
     "compress",
@@ -268,66 +266,6 @@ def _effective_edit_tracker(
     if agent_session is not None and agent_session.edit_tracker is not None:
         return agent_session.edit_tracker
     return edit_tracker
-
-
-def _handle_survey_command(
-    line: str,
-    workspace: Path,
-    agent_session: AgentSessionContext | None,
-    context_session: ContextSession | None = None,
-) -> bool:
-    """
-    处理 /survey：off | on | status（无固定问卷向导）。
-
-    @param line 用户输入
-    @param workspace 工作区根
-    @param agent_session Agent 会话
-    @param context_session Rule/Skill 会话状态
-    @return 恒为 True
-    """
-    from llgraph.config.survey_settings import (
-        format_survey_status,
-        survey_interactive_enabled,
-    )
-
-    stripped = line.strip()
-    parts = stripped.split(maxsplit=1)
-    sub = parts[1].strip().lower() if len(parts) > 1 else ""
-
-    if sub in ("off", "disable", "0"):
-        if context_session is not None:
-            context_session.survey_enabled = False
-        if agent_session is not None:
-            from llgraph.core.agent import rebuild_agent_preserving_memory
-
-            rebuild_agent_preserving_memory(
-                agent_session,
-                allow_write=agent_session.allow_write,
-            )
-        emit("Survey 交互已关闭（本会话）。", colorize=True)
-        return True
-    if sub in ("on", "enable", "1"):
-        if context_session is not None:
-            context_session.survey_enabled = True
-        if agent_session is not None:
-            from llgraph.core.agent import rebuild_agent_preserving_memory
-
-            rebuild_agent_preserving_memory(
-                agent_session,
-                allow_write=agent_session.allow_write,
-            )
-        emit("Survey 交互已开启（本会话）。", colorize=True)
-        return True
-    if sub in ("status", "?"):
-        emit_report(format_survey_status(workspace, context_session))
-        return True
-
-    emit_warn(
-        "无固定问卷。确认须由 Agent 在回复末尾输出 <<<llgraph-survey>>> JSON；"
-        "可用 /survey on|off|status 控制 followup 渲染。"
-    )
-    emit_report(format_survey_status(workspace, context_session))
-    return True
 
 
 def _handle_watch_command(
@@ -605,135 +543,6 @@ def _handle_model_command(
     return True
 
 
-def _persist_agent_and_enter_plan(
-    agent_session: AgentSessionContext,
-    workspace: Path,
-    *,
-    opening_goal: str,
-) -> None:
-    """
-    落盘当前 Agent 对话并请求切换到 Plan（附带 source_agent_thread_id）。
-
-    @param agent_session Agent 会话
-    @param workspace 工作区根
-    @param opening_goal 计划目标（可简短；细节在 Agent 摘录中）
-    """
-    from llgraph.session.session_file_store import persist_agent_session
-    from llgraph.session.mode_switch import SessionModeTransition
-
-    persist_agent_session(agent_session.agent, workspace, agent_session.thread_id)
-    agent_session.mode_switch = SessionModeTransition(
-        mode="plan",
-        thread_id=None,
-        opening_goal=opening_goal,
-        from_thread_id=agent_session.thread_id,
-    )
-
-
-def _handle_plan_command(
-    stripped: str,
-    workspace: Path,
-    agent_session: AgentSessionContext | None,
-) -> bool:
-    """
-    Agent 模式 /plan 入口：进入 Plan、列举、切换；Plan 内子命令提示先进入 Plan。
-
-    @param stripped 原始输入
-    @param workspace 工作区根
-    @param agent_session Agent 会话
-    @return 是否已处理
-    """
-    if agent_session is None:
-        emit("需要交互会话才能使用 /plan。", colorize=True)
-        return True
-
-    from llgraph.plan.meta_commands import _PLAN_SUBCOMMANDS, _parse_plan_command
-    from llgraph.plan.help_text import print_plan_help
-    from llgraph.plan.plan_registry import format_plans_list
-    from llgraph.session.mode_switch import SessionModeTransition
-
-    sub, arg = _parse_plan_command(stripped)
-    if sub is None:
-        return False
-
-    if sub == "help":
-        print_plan_help(in_plan_mode=False)
-        return True
-
-    if sub == "list":
-        emit_report(format_plans_list(workspace, current_thread_id=None))
-        return True
-
-    if sub == "switch":
-        tid = arg.strip()
-        if not tid:
-            emit_warn("用法: /plan switch plan-xxxxxxxx")
-            return True
-        if not tid.startswith("plan-"):
-            emit_warn("Plan 会话 thread_id 须以 plan- 开头")
-            return True
-        agent_session.mode_switch = SessionModeTransition(
-            mode="plan",
-            thread_id=tid,
-            from_thread_id=agent_session.thread_id,
-        )
-        emit_ok(f"正在切换到 Plan 模式（{tid}）…")
-        return True
-
-    if sub == "run":
-        goal = arg.strip() or "根据上文 Agent 对话已讨论的内容制定并执行计划。"
-        _persist_agent_and_enter_plan(agent_session, workspace, opening_goal=goal)
-        emit_ok("正在进入 Plan 模式（已附带当前 Agent 会话摘录）…")
-        return True
-
-    if sub == "results":
-        from llgraph.plan.plan_results import format_plan_results
-
-        parts = arg.split() if arg else []
-        query = ""
-        task_id = ""
-        for part in parts:
-            if part.startswith("plan-") or (len(part) == 8 and all(c in "0123456789abcdef" for c in part.lower())):
-                query = part
-            elif part.startswith("w"):
-                task_id = part
-        emit_report(
-            format_plan_results(
-                workspace,
-                query=query,
-                task_id=task_id,
-            )
-        )
-        return True
-
-    plan_only = frozenset({
-        "graph",
-        "status",
-        "confirm",
-        "revise",
-        "cancel",
-        "handoff",
-    })
-    if sub in plan_only:
-        emit_warn(
-            f"/plan {sub} 需在 Plan 模式内使用。"
-            " 输入 /plan [目标] 或 /plan switch <id> 进入 Plan。"
-        )
-        return True
-
-    if sub not in _PLAN_SUBCOMMANDS:
-        goal = stripped.split(None, 1)[1].strip() if len(stripped.split(None, 1)) > 1 else ""
-        if goal:
-            _persist_agent_and_enter_plan(agent_session, workspace, opening_goal=goal)
-            emit_ok("正在进入 Plan 模式（已附带当前 Agent 会话摘录）…")
-            return True
-        print_plan_help(in_plan_mode=False)
-        return True
-
-    print_plan_help(in_plan_mode=False)
-    return True
-
-
 def _handle_session_command(
     stripped: str,
     workspace: Path,
@@ -793,37 +602,6 @@ def _handle_session_command(
         emit(msg, colorize=True)
         return True
 
-    if sub == "plan":
-        from llgraph.session.mode_switch import SessionModeTransition, parse_session_mode_command
-
-        mode, plan_tid, goal = parse_session_mode_command(stripped)
-        if mode == "plan_switch_removed":
-            emit_warn(
-                "切换 Plan 请用 /plan switch <plan-id>；"
-                "/session plan 仅用于进入 Plan（/session plan [目标]）。"
-            )
-            return True
-        if mode != "plan":
-            emit("用法: /session plan [目标说明]  |  切换 Plan: /plan switch plan-xxx", colorize=True)
-            return True
-        if agent_session is not None:
-            from llgraph.session.session_file_store import persist_agent_session
-
-            persist_agent_session(
-                agent_session.agent, workspace, agent_session.thread_id
-            )
-        agent_session.mode_switch = SessionModeTransition(
-            mode="plan",
-            thread_id=None,
-            opening_goal=goal,
-            from_thread_id=agent_session.thread_id,
-        )
-        if goal:
-            emit("正在切换到 Plan 模式（已附带 Agent 会话摘录）…", colorize=True)
-        else:
-            emit("正在切换到 Plan 模式（新建 Plan 会话）…", colorize=True)
-        return True
-
     if sub == "agent":
         emit("当前已在 Agent 模式。", colorize=True)
         return True
@@ -861,7 +639,6 @@ def _handle_session_command(
             delete_sessions,
             delete_workspace_session,
             format_delete_report,
-            is_plan_main_thread,
             validate_thread_id,
         )
         from llgraph.session.session_meta import default_session_title, set_session_title
@@ -940,8 +717,7 @@ def _handle_session_command(
 
         result = delete_workspace_session(workspace, tid)
         if result.ok:
-            label = "Plan 及子节点" if is_plan_main_thread(tid) else "会话"
-            emit(f"已删除{label} {tid}。", colorize=True)
+            emit(f"已删除会话 {tid}。", colorize=True)
             for path in result.removed_paths:
                 emit(f"  - {path}", colorize=True)
             for path in result.related_removed:
@@ -1035,11 +811,6 @@ def handle_meta_command(
     ):
         return _handle_index_meta_command(stripped, workspace)
 
-    if lower == "/survey" or lower == "survey" or lower.startswith("/survey "):
-        return _handle_survey_command(
-            stripped, workspace, agent_session, context_session
-        )
-
     if lower in ("/paste", "/p", "paste"):
         emit(
             "请直接输入 /paste 后回车进入粘贴模式，或:\n"
@@ -1085,12 +856,6 @@ def handle_meta_command(
 
     if lower.startswith("/session ") or lower.startswith("session "):
         return _handle_session_command(stripped, workspace, agent_session)
-
-    if lower == "/plan" or lower == "plan":
-        return _handle_plan_command(stripped, workspace, agent_session)
-
-    if lower.startswith("/plan ") or lower.startswith("plan "):
-        return _handle_plan_command(stripped, workspace, agent_session)
 
     if lower in ("/sessionid", "sessionid", "/session-id", "session-id"):
         if agent_session is None:
@@ -1149,12 +914,6 @@ def handle_meta_command(
 
         missing_only = "missing" in lower or "缺" in stripped
         print_install_extras_help(missing_only=missing_only)
-        return True
-
-    if lower in ("/help plan", "help plan", "/plan help"):
-        from llgraph.plan.help_text import print_plan_help
-
-        print_plan_help(in_plan_mode=False)
         return True
 
     if lower in ("/compress", "compress") or lower.startswith("/compress "):

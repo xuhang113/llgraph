@@ -18,10 +18,10 @@ class AssistantTurnContent:
     """
 
     markdown: str
-    """展示用 Markdown（已去掉 survey 块等终端向导接管的片段）。"""
+    """展示用 Markdown。"""
 
     raw_markdown: str = ""
-    """模型原始 Markdown（含 survey 块，供解析与落盘）。"""
+    """模型原始 Markdown（供解析与落盘）。"""
 
     format: str = CONTENT_FORMAT_MARKDOWN
     """内容格式标识，供 Web Content-Type / 渲染器选择。"""

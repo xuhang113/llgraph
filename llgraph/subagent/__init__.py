@@ -1,4 +1,4 @@
-"""统一 Subagent 引擎（Plan Worker / Planner 与 Agent explore 共用）。"""
+"""统一 Subagent 引擎（explore / general）。"""
 
 from llgraph.subagent.engine import (
     ReactSubgraphSpec,

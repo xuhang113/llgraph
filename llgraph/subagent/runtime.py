@@ -1,4 +1,4 @@
-"""Subagent 运行时（与 PlanRuntimeContext 解耦的共享宿主）。"""
+"""Subagent 运行时（explore / general 共享宿主）。"""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from llgraph.session.session_edits import SessionEditTracker
 @dataclass
 class SubagentRuntime:
     """
-    子 Agent 执行宿主（Plan / Agent 共用）。
+    子 Agent 执行宿主。
 
     parent_thread_id 为父会话；fork 后仍保留该字段，子会话用 sub_thread 参数区分。
     """
@@ -37,7 +37,7 @@ class SubagentRuntime:
 
     @property
     def thread_id(self) -> str:
-        """兼容 Plan 侧 ctx.thread_id（父会话 id）。"""
+        """父会话 id。"""
         return self.parent_thread_id
 
 
@@ -54,9 +54,9 @@ def fork_subagent_runtime(
     为子 Agent 创建独立运行时（独立 context / trace / SSE channel）。
 
     @param parent 父运行时
-    @param sub_thread 如 cli-xxx:explore:a1b2 或 plan-xxx:worker:t1
-    @param subgraph_kind explore | worker | planner | general
-    @param task_id 可选任务 id（Worker / 展示标签）
+    @param sub_thread 如 cli-xxx:explore:a1b2
+    @param subgraph_kind explore | general
+    @param task_id 可选展示标签
     @param allow_write 覆盖父写权限；None 继承
     @param max_turns 覆盖步数上限
     @return 子运行时
@@ -91,7 +91,7 @@ def fork_subagent_runtime(
             parent_emit(payload)
 
     wft = None
-    if child_allow and kind in ("worker", "general"):
+    if child_allow:
         edit_settings = resolve_edit_settings(parent.workspace)
         wft = WriteFailureTracker(
             child_cs,
@@ -173,34 +173,6 @@ def subagent_edit_tracker(
     if not allow_write:
         return None
     return SessionEditTracker(runtime.workspace, session_id=sub_session_id)
-
-
-def runtime_from_plan_context(ctx: Any) -> SubagentRuntime:
-    """
-    从 PlanRuntimeContext 构造共享运行时视图（不 fork）。
-
-    @param ctx PlanRuntimeContext
-    @return SubagentRuntime
-    """
-    settings = getattr(ctx, "settings", None)
-    max_turns = None
-    if settings is not None:
-        max_turns = getattr(settings, "worker_max_turns", None)
-    return SubagentRuntime(
-        workspace=ctx.workspace,
-        parent_thread_id=ctx.thread_id,
-        trace_session=ctx.trace_session,
-        context_session=ctx.context_session,
-        allow_write=bool(getattr(ctx, "allow_write_cli", False)),
-        mcp_tools=list(getattr(ctx, "mcp_tools", None) or []),
-        sandbox_policy=getattr(ctx, "sandbox_policy", None),
-        web_search_enabled=bool(getattr(ctx, "web_search_enabled", False)),
-        write_failure_tracker=getattr(ctx, "write_failure_tracker", None),
-        on_file_changed=getattr(ctx, "on_file_changed", None),
-        sse_emit=getattr(ctx, "sse_emit", None),
-        sse_loop=getattr(ctx, "sse_loop", None),
-        max_turns=max_turns,
-    )
 
 
 def runtime_from_agent_session(session: Any) -> SubagentRuntime:

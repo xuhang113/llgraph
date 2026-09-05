@@ -302,34 +302,6 @@ def create_agent_session(workspace: Path, *, title: str = "") -> str:
     return thread_id
 
 
-def _survey_spec_to_dict(spec: Any) -> dict[str, Any]:
-    questions = []
-    for q in spec.questions:
-        questions.append(
-            {
-                "id": q.question_id,
-                "prompt": q.prompt,
-                "options": list(q.options),
-                "default_index": q.default_index,
-                "default_indices": list(q.default_indices),
-                "allow_free_text": q.allow_free_text,
-                "step_label": q.step_label,
-                "option_hints": list(q.option_hints),
-                "multi_select": q.multi_select,
-            }
-        )
-    return {"title": spec.title, "questions": questions}
-
-
-def _survey_payload(text: str) -> dict[str, Any] | None:
-    from llgraph.survey.survey_prompt import resolve_survey_from_assistant
-
-    spec = resolve_survey_from_assistant(text)
-    if spec is None:
-        return None
-    return _survey_spec_to_dict(spec)
-
-
 @dataclass
 class AgentChatRequest:
     """Agent 对话请求。"""
@@ -510,10 +482,9 @@ def run_agent_chat(
             )
         else:
             from llgraph.context.message_normalize import _message_text, format_agent_chat_display_text
-            from llgraph.survey.survey_prompt import strip_survey_for_display
 
             raw_display = _message_text(text).strip() or (text.strip() if isinstance(text, str) else "")
-            display_text = format_agent_chat_display_text(strip_survey_for_display(raw_display))
+            display_text = format_agent_chat_display_text(raw_display)
             payload: dict[str, Any] = {
                 "type": "turn_done",
                 "text": display_text,
@@ -538,15 +509,6 @@ def run_agent_chat(
                     outcome="ok",
                 )
                 touch_session_activity(req.workspace, req.thread_id)
-            survey = None
-            if req.allow_write:
-                from llgraph.config.survey_settings import survey_followup_enabled
-
-                if survey_followup_enabled(req.workspace, rt.context_session):
-                    survey = _survey_payload(trace.last_turn_raw_reply or text)
-            if survey is not None:
-                payload["survey"] = survey
-                payload["type"] = "survey"
             emit(payload)
             from llgraph.session.session_title_llm import schedule_session_title_llm_refresh
 

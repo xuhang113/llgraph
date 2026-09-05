@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
-import { api, type Capabilities, type ContextDetail, type ContextUsage, type IndexStatus, type PlanDetail } from '../../api/client';
+import { api, type Capabilities, type ContextDetail, type ContextUsage, type IndexStatus } from '../../api/client';
 import type { TraceStep } from '../../types/trace';
 import { partitionTraceMiscLines, filterTraceMiscWhenSteps, filterTraceStepsForDisplay, traceStepsFingerprint } from '../../types/trace';
 import { useStickToBottomScroll } from '../../utils/useStickToBottomScroll';
-import WorkflowGraph from '../WorkflowGraph';
 import TraceStepList from './TraceStepList';
 import TraceTurnList from './TraceTurnList';
 import ContextDetailSections from './ContextDetailSections';
@@ -20,7 +19,7 @@ interface TraceLine {
   text: string;
 }
 
-export type RightPanelTab = 'trace' | 'tools' | 'context' | 'log' | 'plan';
+export type RightPanelTab = 'trace' | 'tools' | 'context' | 'log';
 
 interface Props {
   caps: Capabilities | null;
@@ -28,20 +27,15 @@ interface Props {
   traceSteps: TraceStep[];
   traceTurns?: TraceTurn[];
   liveThinking?: string;
-  planDetail: PlanDetail | null;
   slug: string;
   threadId: string;
-  isPlan: boolean;
   isAgent?: boolean;
   allowWrite?: boolean;
   requestedTab?: RightPanelTab | null;
   onRequestedTabHandled?: () => void;
   onTraceMode: (mode: string) => void;
-  onPlanConfirm: () => void;
-  onPlanContinue: () => void;
   busy: boolean;
   contextRefreshSignal?: number;
-  onTaskSelect?: (taskId: string) => void;
   onCapsLoaded?: (caps: Capabilities) => void;
   /** 当前轮已执行秒数（SSE 心跳 + 本地计时） */
   traceActivitySec?: number;
@@ -87,25 +81,20 @@ export default function CursorRightPanel({
   traceSteps,
   traceTurns = [],
   liveThinking = '',
-  planDetail,
   slug,
   threadId,
-  isPlan,
   isAgent = false,
   allowWrite = false,
   requestedTab = null,
   onRequestedTabHandled,
   onTraceMode,
-  onPlanConfirm,
-  onPlanContinue,
   busy,
   contextRefreshSignal = 0,
-  onTaskSelect,
   onCapsLoaded,
   traceActivitySec = 0,
 }: Props) {
   const { confirm } = useAppDialog();
-  const [tab, setTab] = useState<RightPanelTab>(isPlan ? 'plan' : 'trace');
+  const [tab, setTab] = useState<RightPanelTab>('trace');
   const [toolsCaps, setToolsCaps] = useState<Capabilities | null>(caps);
   const [toolsLoading, setToolsLoading] = useState(false);
   const [toolsError, setToolsError] = useState('');
@@ -126,8 +115,8 @@ export default function CursorRightPanel({
   }, [caps]);
 
   useEffect(() => {
-    setTab(isPlan ? 'plan' : 'trace');
-  }, [isPlan, threadId]);
+    setTab('trace');
+  }, [threadId]);
 
   const loadToolsCaps = useCallback(async () => {
     if (!slug) {
@@ -317,11 +306,6 @@ export default function CursorRightPanel({
   return (
     <aside className="cursor-right">
       <div className="cursor-right-tabs">
-        {isPlan && (
-          <button type="button" className={tab === 'plan' ? 'active' : ''} onClick={() => setTab('plan')}>
-            Plan
-          </button>
-        )}
         <button type="button" className={tab === 'trace' ? 'active' : ''} onClick={() => setTab('trace')}>
           Trace
         </button>
@@ -777,93 +761,7 @@ export default function CursorRightPanel({
               清理过期日志
             </button>
           </div>
-        )}
-
-
-        {tab === 'plan' && planDetail && (
-          <div className="cursor-plan-panel">
-            <div className="cursor-plan-meta">
-              <span className="badge">{planDetail.phase}</span>
-              {planDetail.job?.running && <span className="badge badge-running">running</span>}
-            </div>
-            <p className="small">{planDetail.goal}</p>
-            <WorkflowGraph
-              slug={slug}
-              threadId={threadId}
-              nodes={planDetail.workflow_snapshot?.nodes || []}
-              tasks={planDetail.workflow_snapshot?.tasks || []}
-              planTasks={planDetail.tasks}
-              synthesizeDependsOn={planDetail.workflow_snapshot?.synthesize_depends_on}
-              currentTaskId={
-                (planDetail.workflow_snapshot as { current_task_id?: string })?.current_task_id || null
-              }
-              variant="main"
-              onTaskSelect={onTaskSelect}
-            />
-            <div className="cursor-plan-actions">
-              {planDetail.phase === 'awaiting_confirm' && (
-                <button type="button" className="cursor-btn-primary" onClick={onPlanConfirm}>
-                  确认计划
-                </button>
-              )}
-              {(() => {
-                const wfTasks = planDetail.workflow_snapshot?.tasks || [];
-                const planTasks = planDetail.tasks || [];
-                const taskIds =
-                  planTasks.length > 0
-                    ? planTasks.map((t) => String(t.id || ''))
-                    : wfTasks.map((t) => t.id);
-                const statusOf = (taskId: string): string => {
-                  const wf = wfTasks.find((t) => t.id === taskId);
-                  const row = planTasks.find((t) => String(t.id) === taskId);
-                  return String(wf?.worker_node_status || wf?.status || row?.status || 'pending');
-                };
-                const incompleteCount = taskIds.filter((id) => {
-                  const s = statusOf(id);
-                  return s === 'pending' || s === 'running' || s === 'failed';
-                }).length;
-                const showContinue =
-                  planDetail.phase === 'executing' &&
-                  incompleteCount > 0 &&
-                  !planDetail.job?.running;
-                const showSynthesizeContinue =
-                  incompleteCount === 0 &&
-                  !planDetail.final_report &&
-                  !planDetail.job?.running &&
-                  planDetail.phase === 'executing';
-                if (planDetail.phase !== 'executing') {
-                  return null;
-                }
-                if (showContinue) {
-                  return (
-                    <button
-                      type="button"
-                      className="cursor-btn-primary"
-                      onClick={onPlanContinue}
-                      disabled={busy}
-                    >
-                      继续执行未完成（已成功跳过）
-                    </button>
-                  );
-                }
-                if (showSynthesizeContinue) {
-                  return (
-                    <button
-                      type="button"
-                      className="cursor-btn-ghost"
-                      onClick={onPlanContinue}
-                      disabled={busy || !!planDetail.job?.running}
-                    >
-                      Continue
-                    </button>
-                  );
-                }
-                return null;
-              })()}
-            </div>
-          </div>
-        )}
-      </div>
+        )}      </div>
     </aside>
   );
 }

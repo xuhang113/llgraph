@@ -683,51 +683,6 @@ def backfill_session_titles(workspace: Path, thread_ids: list[str]) -> int:
     return count
 
 
-def _sync_plan_json_title_after_auto(
-    workspace: Path,
-    thread_id: str,
-    title: str,
-) -> None:
-    """
-    Plan 会话自动标题写入后，同步 plan.json（替换 Plan {plan_id} 占位）。
-
-    @param workspace 工作区根
-    @param thread_id plan thread
-    @param title 自动标题
-    """
-    meta = load_session_meta(workspace, thread_id)
-    is_plan = meta.get("session_kind") == "plan" or thread_id.startswith("plan-")
-    if not is_plan:
-        return
-    plan_id = str(meta.get("plan_id") or "").strip()
-    if not plan_id:
-        return
-    from llgraph.plan.config import resolve_plan_settings
-    from llgraph.plan.plan_store import is_placeholder_plan_title, load_plan, save_plan
-
-    settings = resolve_plan_settings(workspace)
-    plan = load_plan(workspace, plan_id, plans_dir=settings.plans_dir)
-    if not plan:
-        return
-    current = str(plan.get("title") or "")
-    if not is_placeholder_plan_title(current, plan_id):
-        return
-    plan["title"] = title
-    save_plan(workspace, plan, plans_dir=settings.plans_dir)
-
-
-def sync_plan_json_title_from_session_meta(workspace: Path, thread_id: str) -> None:
-    """
-    将 meta 中已有自动标题同步到 plan.json（plan 文件晚于 meta 创建时补写）。
-
-    @param workspace 工作区根
-    @param thread_id plan thread
-    """
-    title = get_session_title(workspace, thread_id)
-    if title:
-        _sync_plan_json_title_after_auto(workspace, thread_id, title)
-
-
 def ensure_session_title_auto(
     workspace: Path,
     thread_id: str,
@@ -757,7 +712,6 @@ def ensure_session_title_auto(
     if is_weak_auto_session_title(suggested):
         return None
     set_session_title(workspace, thread_id, suggested, source="auto")
-    _sync_plan_json_title_after_auto(workspace, thread_id, suggested)
     return suggested
 
 

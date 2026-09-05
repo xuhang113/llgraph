@@ -46,7 +46,7 @@ class EventHub:
         """
         订阅 channel。
 
-        @param channel 如 plan:plan-abc123
+        @param channel 如 session:cli-abc123
         @return 事件队列
         """
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=500)

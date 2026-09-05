@@ -20,7 +20,6 @@ class ContextSession:
     disabled_rules: set[str] = field(default_factory=set)
     forced_rules: set[str] = field(default_factory=set)
     write_failure_hint: str = ""
-    survey_enabled: bool | None = None
 
     def activate_skill(self, name: str) -> None:
         """
@@ -53,7 +52,7 @@ class ContextSession:
 
     def fork(self) -> ContextSession:
         """
-        复制会话级 Rule/Skill 状态（并行 Worker 独立 ctx）。
+        复制会话级 Rule/Skill 状态。
 
         @return 新 ContextSession 快照
         """
@@ -62,5 +61,4 @@ class ContextSession:
             disabled_rules=set(self.disabled_rules),
             forced_rules=set(self.forced_rules),
             write_failure_hint=self.write_failure_hint,
-            survey_enabled=self.survey_enabled,
         )

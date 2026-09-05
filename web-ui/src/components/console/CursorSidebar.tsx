@@ -15,7 +15,6 @@ interface Props {
   workspaceDisplay?: StoredWorkspaceMeta | null;
   workspacesLoading?: boolean;
   agents: TreeNode[];
-  plans: TreeNode[];
   treeLoading?: boolean;
   selectedId: string | null;
   catalogOpen: 'skills' | 'rules' | 'tools' | null;
@@ -27,7 +26,6 @@ interface Props {
   onDismissWorkspace: (slug: string) => void;
   onSelect: (node: TreeNode) => void;
   onNewAgent: () => void;
-  onNewPlan: () => void;
   onDelete: (node: TreeNode) => void;
   onRename: (node: TreeNode, title: string) => Promise<void>;
   onCatalogOpen: (kind: 'skills' | 'rules' | 'tools') => void;
@@ -41,7 +39,7 @@ interface Props {
   onDeleteEmpty?: () => void;
 }
 
-type SessionGroupKind = 'agent' | 'plan';
+type SessionGroupKind = 'agent';
 
 interface ContextMenuState {
   x: number;
@@ -53,7 +51,7 @@ function displayLabel(node: TreeNode): string {
   if (node.title && node.title !== node.thread_id) {
     return node.title;
   }
-  return node.kind === 'agent' || node.kind === 'plan' ? '未命名会话' : node.thread_id;
+  return node.kind === 'agent' ? '未命名会话' : node.thread_id;
 }
 
 function SessionRow({
@@ -80,13 +78,9 @@ function SessionRow({
   const label = displayLabel(node);
   const fullLabel = resolveSessionFullTitle(label, node.title_full, node.thread_id);
   const editBase = fullLabel;
-  const selected =
-    selectedId === node.thread_id ||
-    (node.kind === 'plan' &&
-      !!selectedId &&
-      selectedId.startsWith(`${node.thread_id}:worker:`));
+  const selected = selectedId === node.thread_id;
   const checked = selectedSessionIds.has(node.thread_id);
-  const deletable = depth === 0 && (node.kind === 'agent' || node.kind === 'plan');
+  const deletable = depth === 0 && node.kind === 'agent';
   const renamable = deletable && !multiSelectMode;
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(editBase);
@@ -225,21 +219,20 @@ function SessionRow({
           </button>
         )}
       </div>
-      {node.kind !== 'plan' &&
-        node.children?.map((child) => (
-          <SessionRow
-            key={child.thread_id}
-            node={child}
-            selectedId={selectedId}
-            multiSelectMode={multiSelectMode}
-            selectedSessionIds={selectedSessionIds}
-            onSelect={onSelect}
-            onDelete={onDelete}
-            onRename={onRename}
-            onToggleSessionSelect={onToggleSessionSelect}
-            depth={depth + 1}
-          />
-        ))}
+      {node.children?.map((child) => (
+        <SessionRow
+          key={child.thread_id}
+          node={child}
+          selectedId={selectedId}
+          multiSelectMode={multiSelectMode}
+          selectedSessionIds={selectedSessionIds}
+          onSelect={onSelect}
+          onDelete={onDelete}
+          onRename={onRename}
+          onToggleSessionSelect={onToggleSessionSelect}
+          depth={depth + 1}
+        />
+      ))}
     </>
   );
 }
@@ -377,7 +370,6 @@ export default function CursorSidebar({
   workspaceDisplay = null,
   workspacesLoading = false,
   agents,
-  plans,
   treeLoading = false,
   selectedId,
   catalogOpen,
@@ -389,7 +381,6 @@ export default function CursorSidebar({
   onDismissWorkspace,
   onSelect,
   onNewAgent,
-  onNewPlan,
   onDelete,
   onRename,
   onCatalogOpen,
@@ -446,9 +437,6 @@ export default function CursorSidebar({
         <div className="cursor-new-actions">
           <button type="button" className="cursor-btn-primary" onClick={onNewAgent} disabled={busy}>
             New Agent
-          </button>
-          <button type="button" className="cursor-btn-ghost" onClick={onNewPlan} disabled={busy}>
-            New Plan
           </button>
         </div>
       </div>
@@ -549,8 +537,8 @@ export default function CursorSidebar({
                         <span className="cursor-ws-item-slug">{label}</span>
                         <span className="cursor-ws-item-meta">
                           {isActive
-                            ? `${agents.length} agent · ${plans.length} plan`
-                            : `${Math.max(0, w.session_count - w.plan_count)} agent · ${w.plan_count} plan`}
+                            ? `${agents.length} agent`
+                            : `${w.session_count} agent`}
                         </span>
                         {w.path && w.path !== label && (
                           <span className="cursor-ws-item-path">{w.path}</span>
@@ -629,21 +617,6 @@ export default function CursorSidebar({
             onSelectAllSessions={onSelectAllSessions}
             onGroupContextMenu={handleGroupContextMenu}
           />
-          <SessionGroup
-            groupKind="plan"
-            title="Plan"
-            nodes={plans}
-            loading={treeLoading}
-            selectedId={selectedId}
-            multiSelectMode={multiSelectMode}
-            selectedSessionIds={selectedSessionIds}
-            onSelect={onSelect}
-            onDelete={onDelete}
-            onRename={onRename}
-            onToggleSessionSelect={onToggleSessionSelect}
-            onSelectAllSessions={onSelectAllSessions}
-            onGroupContextMenu={handleGroupContextMenu}
-          />
         </div>
       )}
 
@@ -669,7 +642,7 @@ export default function CursorSidebar({
               <button
                 type="button"
                 className="cursor-session-context-item"
-                disabled={busy || (agents.length === 0 && plans.length === 0)}
+                disabled={busy || agents.length === 0}
                 onClick={() => {
                   setContextMenu(null);
                   onEnterMultiSelect();

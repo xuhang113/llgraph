@@ -1,4 +1,4 @@
-"""删除会话落盘数据（Agent / Plan 含 Worker 子节点）。"""
+"""删除会话落盘数据。"""
 
 from __future__ import annotations
 
@@ -106,51 +106,6 @@ def collect_session_artifact_paths(workspace: Path, thread_id: str) -> list[Path
     return paths
 
 
-def _collect_plan_related_session_dirs(sessions_root: Path, plan_thread_id: str) -> list[Path]:
-    """
-    收集 Plan 主会话及子 Agent 目录（planner / worker）。
-
-    @param sessions_root sessions 根目录
-    @param plan_thread_id plan-* 主 thread
-    @return 待删目录列表
-    """
-    prefix = f"{plan_thread_id}:"
-    paths: list[Path] = []
-    if not sessions_root.is_dir():
-        return paths
-    for child in sessions_root.iterdir():
-        name = child.name
-        if name == plan_thread_id or name.startswith(prefix):
-            paths.append(child)
-    return paths
-
-
-def _resolve_plan_id_for_delete(workspace: Path, thread_id: str) -> str:
-    """
-    删除前解析 plan_id（读 meta / plan_state）。
-
-    @param workspace 工作区根
-    @param thread_id plan-* thread
-    @return plan_id 或空串
-    """
-    from llgraph.plan.plan_state_store import load_plan_state
-    from llgraph.session.session_meta import load_session_meta
-
-    meta = load_session_meta(workspace, thread_id)
-    plan_id = str(meta.get("plan_id") or "").strip()
-    if plan_id:
-        return plan_id
-    state = load_plan_state(workspace, thread_id)
-    if isinstance(state, dict):
-        plan_id = str(state.get("plan_id") or "").strip()
-        if plan_id:
-            return plan_id
-        plan = state.get("plan")
-        if isinstance(plan, dict):
-            return str(plan.get("plan_id") or "").strip()
-    return ""
-
-
 def _remove_path(path: Path) -> tuple[bool, str | None]:
     if not path.exists() and not path.is_symlink():
         return True, None
@@ -212,112 +167,15 @@ def delete_session(workspace: Path, thread_id: str) -> SessionDeleteResult:
     )
 
 
-def delete_plan_session(workspace: Path, thread_id: str) -> SessionDeleteResult:
-    """
-    删除 Plan 主会话及关联子节点（planner / worker 目录、.llgraph/plans 落盘）。
-
-    @param workspace 工作区根
-    @param thread_id plan-* 主 thread
-    @return 删除结果
-    """
-    try:
-        tid = validate_thread_id(thread_id)
-    except ValueError as exc:
-        return SessionDeleteResult(
-            thread_id=thread_id,
-            ok=False,
-            removed_paths=(),
-            error=str(exc),
-        )
-    if not is_plan_main_thread(tid):
-        return SessionDeleteResult(
-            thread_id=tid,
-            ok=False,
-            removed_paths=(),
-            error=f"须为 Plan 主会话 plan-xxxxxxxx: {tid}",
-        )
-
-    from llgraph.plan.execution_coordinator import is_running
-
-    if is_running(tid):
-        return SessionDeleteResult(
-            thread_id=tid,
-            ok=False,
-            removed_paths=(),
-            error="Plan 正在执行，请先 /plan stop 或等待完成后再删除",
-        )
-
-    root = workspace.expanduser().resolve()
-    from llgraph.plan.config import resolve_plan_settings
-    from llgraph.plan.plan_store import plan_dir
-    from llgraph.session.user_storage import legacy_workspace_session_dir
-
-    settings = resolve_plan_settings(root)
-    plan_id = _resolve_plan_id_for_delete(root, tid)
-
-    removed: list[str] = []
-    related: list[str] = []
-    errors: list[str] = []
-
-    sessions_root = user_sessions_root(root)
-    for path in _collect_plan_related_session_dirs(sessions_root, tid):
-        existed = path.exists()
-        ok, err = _remove_path(path)
-        if existed and ok:
-            related.append(str(path))
-        if not ok and err:
-            errors.append(f"{path}: {err}")
-
-    for artifact in (
-        sessions_root / f"{tid}.jsonl",
-        legacy_workspace_session_dir(root, tid),
-    ):
-        existed = artifact.exists()
-        ok, err = _remove_path(artifact)
-        if existed and ok:
-            related.append(str(artifact))
-        if not ok and err:
-            errors.append(f"{artifact}: {err}")
-
-    if plan_id:
-        pd = plan_dir(root, plan_id, plans_dir=settings.plans_dir)
-        if pd.is_dir():
-            ok, err = _remove_path(pd)
-            if ok:
-                related.append(str(pd))
-            elif err:
-                errors.append(f"{pd}: {err}")
-
-    if errors:
-        return SessionDeleteResult(
-            thread_id=tid,
-            ok=False,
-            removed_paths=tuple(removed),
-            related_removed=tuple(related),
-            error="; ".join(errors),
-        )
-    return SessionDeleteResult(
-        thread_id=tid,
-        ok=True,
-        removed_paths=tuple(removed),
-        related_removed=tuple(related),
-    )
-
-
 def delete_workspace_session(workspace: Path, thread_id: str) -> SessionDeleteResult:
     """
-    按 thread 类型删除 Agent 或 Plan 会话（Plan 含 Worker 级联）。
+    删除指定会话落盘（含遗留 plan-* 目录，按普通会话删除）。
 
     @param workspace 工作区根
     @param thread_id 会话 ID
     @return 删除结果
     """
-    tid = thread_id.strip()
-    if is_plan_main_thread(tid):
-        return delete_plan_session(workspace, tid)
-    if is_plan_subsession_thread(tid):
-        return delete_session(workspace, tid)
-    return delete_session(workspace, tid)
+    return delete_session(workspace, thread_id)
 
 
 def _filter_batch_delete_ids(thread_ids: list[str]) -> list[str]:

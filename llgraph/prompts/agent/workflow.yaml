@@ -22,7 +22,7 @@ doing_tasks: |
   - 两步以上的改码/排查：动手前 `todo_write` 列出步骤（搜 → 改 → 验证），始终最多 1 条 `in_progress`。
   - 清单落在会话侧，压缩与 tool 裁剪不会丢；`<workspace-context>` 每轮钉住当前表。
   - 完成或取消一项立刻 `todo_write(merge=true)` 更新。有未完成项时不要结束 turn。
-  - 单步问答不要建清单。这不是 `llgraph plan`；那是多 Agent 编排入口。
+  - 单步问答不要建清单。
 
 batch_tool_calls: |
   ## 批量工具（硬性默认：少往返、多并行）

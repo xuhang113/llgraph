@@ -69,23 +69,20 @@ export function groupSessionsByDate(
 export function bumpSidebarSession(
   node: TreeNode,
   setAgents: Dispatch<SetStateAction<TreeNode[]>>,
-  setPlans: Dispatch<SetStateAction<TreeNode[]>>,
   updatedAt?: string | null,
 ): void {
   const now = updatedAt || new Date().toISOString();
-  const bump = (prev: TreeNode[]) => {
+  if (node.kind !== 'agent') {
+    return;
+  }
+  setAgents((prev) => {
     const index = prev.findIndex((item) => item.thread_id === node.thread_id);
     if (index < 0) {
       return prev;
     }
     const item = { ...prev[index], updated_at: now };
     return [item, ...prev.slice(0, index), ...prev.slice(index + 1)];
-  };
-  if (node.kind === 'agent') {
-    setAgents(bump);
-  } else if (node.kind === 'plan') {
-    setPlans(bump);
-  }
+  });
 }
 
 /** 新建 Agent 尚未出现在 tree API 时，保留侧栏 optimistic 条目。 */
@@ -103,9 +100,7 @@ export function prependAgentSession(
 export function removeSessionsFromTree(
   threadIds: Iterable<string>,
   setAgents: Dispatch<SetStateAction<TreeNode[]>>,
-  setPlans: Dispatch<SetStateAction<TreeNode[]>>,
 ): void {
   const idSet = new Set(threadIds);
   setAgents((prev) => prev.filter((n) => !idSet.has(n.thread_id)));
-  setPlans((prev) => prev.filter((n) => !idSet.has(n.thread_id)));
 }

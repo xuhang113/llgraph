@@ -73,10 +73,8 @@ def format_agent_chat_display_text(text: str) -> str:
     @return 用户可见文本
     """
     from llgraph.adapters.inbound.xml_tool_call import strip_inbound_tool_call_markup
-    from llgraph.survey.survey_prompt import strip_survey_for_display
 
     cleaned = strip_inbound_tool_call_markup(text or "")
-    cleaned = strip_survey_for_display(cleaned)
     lines = [
         ln
         for ln in cleaned.splitlines()

@@ -70,7 +70,6 @@ PACKAGE_MAP: dict[str, str] = {
     "edit_settings": "config",
     "shell_settings": "config",
     "web_search_settings": "config",
-    "survey_settings": "config",
     # loaders — Rules / Skills / Commands 加载
     "rules_loader": "loaders",
     "skills_loader": "loaders",
@@ -80,9 +79,6 @@ PACKAGE_MAP: dict[str, str] = {
     "meta_commands": "commands",
     "review_command": "commands",
     "help_text": "commands",
-    # survey — 交互确认
-    "survey_prompt": "survey",
-    "edit_confirm": "survey",
     # display — 追踪、日志、终端样式
     "trace_display": "display",
     "execution_log": "display",
@@ -104,7 +100,6 @@ PACKAGE_DOCS: dict[str, str] = {
     "config": "环境变量、agent.json 与各 feature settings。",
     "loaders": "Rules、Skills、Commands、Thought 加载。",
     "commands": "斜杠命令（/review、/trace 等）实现。",
-    "survey": "交互式 survey 与编辑确认。",
     "display": "过程追踪、执行日志与终端样式。",
     "cli": "llgraph index / search 等 CLI 子命令。",
 }

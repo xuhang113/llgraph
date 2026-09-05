@@ -2,12 +2,10 @@ import type { TreeNode } from '../../api/client';
 
 interface Props {
   agents: TreeNode[];
-  plans: TreeNode[];
   selectedId: string | null;
   onSelect: (node: TreeNode) => void;
   onRefresh: () => void;
   onNewAgent: () => void;
-  onNewPlan: () => void;
 }
 
 function NodeItem({
@@ -50,21 +48,16 @@ function NodeItem({
 
 export default function SessionTree({
   agents,
-  plans,
   selectedId,
   onSelect,
   onRefresh,
   onNewAgent,
-  onNewPlan,
 }: Props) {
   return (
     <div className="session-tree">
       <div className="tree-toolbar">
         <button type="button" onClick={onNewAgent}>
           + Agent
-        </button>
-        <button type="button" onClick={onNewPlan}>
-          + Plan
         </button>
         <button type="button" onClick={onRefresh}>
           ↻
@@ -73,12 +66,6 @@ export default function SessionTree({
       <div className="tree-section">
         <div className="tree-section-title">Agent</div>
         {agents.map((n) => (
-          <NodeItem key={n.thread_id} node={n} selectedId={selectedId} onSelect={onSelect} depth={0} />
-        ))}
-      </div>
-      <div className="tree-section">
-        <div className="tree-section-title">Plan</div>
-        {plans.map((n) => (
           <NodeItem key={n.thread_id} node={n} selectedId={selectedId} onSelect={onSelect} depth={0} />
         ))}
       </div>

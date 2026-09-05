@@ -7,10 +7,7 @@ from pathlib import Path
 from llgraph.gateway.protocol import ControlGateway
 from llgraph.gateway.services import workspace_catalog
 from llgraph.gateway.types import SessionDeleteRecord, WorkspaceRecord
-from llgraph.session.session_delete import (
-    delete_workspace_session,
-    is_plan_main_thread,
-)
+from llgraph.session.session_delete import delete_workspace_session
 
 
 def _session_kind(thread_id: str) -> str:
@@ -18,12 +15,10 @@ def _session_kind(thread_id: str) -> str:
     推断会话类型。
 
     @param thread_id 会话 ID
-    @return agent | plan | worker
+    @return agent | unknown
     """
-    if is_plan_main_thread(thread_id):
-        return "plan"
     if thread_id.startswith("plan-"):
-        return "worker"
+        return "unknown"
     return "agent"
 
 

@@ -41,7 +41,6 @@ export function useWorkspaceCatalog({
   const [workspacesLoading, setWorkspacesLoading] = useState(true);
   const [slug, setSlug] = useState(readStoredWorkspaceSlug);
   const [agents, setAgents] = useState<TreeNode[]>([]);
-  const [plans, setPlans] = useState<TreeNode[]>([]);
   const [treeLoading, setTreeLoading] = useState(false);
   const [treeReadySlug, setTreeReadySlug] = useState<string | null>(null);
   const treeFetchSeqRef = useRef(0);
@@ -99,7 +98,6 @@ export function useWorkspaceCatalog({
       setTreeLoading(false);
       setTreeReadySlug(null);
       setAgents([]);
-      setPlans([]);
       return;
     }
     const seq = ++treeFetchSeqRef.current;
@@ -118,7 +116,6 @@ export function useWorkspaceCatalog({
           );
           return [...pending, ...loaded];
         });
-        setPlans(t.plans ?? []);
         setTreeReadySlug(slug);
         setTreeLoading(false);
         if (warmedSlugRef.current !== slug) {
@@ -275,7 +272,6 @@ export function useWorkspaceCatalog({
         treeFetchSeqRef.current += 1;
         setTreeReadySlug(null);
         setAgents([]);
-        setPlans([]);
       }
       return next;
     });
@@ -322,8 +318,6 @@ export function useWorkspaceCatalog({
     workspacesLoading,
     agents,
     setAgents,
-    plans,
-    setPlans,
     treeLoading,
     treeReadySlug,
     setTreeReadySlug,

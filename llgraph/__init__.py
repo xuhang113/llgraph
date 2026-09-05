@@ -11,7 +11,6 @@ LangGraph terminal agent with LLGRAPH_* API credentials.
     config    环境变量与 settings
     loaders   Rules / Skills / Commands
     commands  斜杠命令
-    survey    交互确认
     display   trace 与终端样式
     cli       index / search 子命令
     code_index / terminal / ui  — 已有子包

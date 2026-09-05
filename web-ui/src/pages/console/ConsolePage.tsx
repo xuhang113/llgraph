@@ -3,18 +3,13 @@ import {
   api,
   type Capabilities,
   type LlmSettings,
-  type PlanConfirmHistoryEntry,
-  type PlanDetail,
   type SlashCatalogItem,
-  type SurveySpec,
   type TreeNode,
 } from '../../api/client';
 import AgentToolbar from '../../components/console/AgentToolbar';
 import ComposerDock from '../../components/console/ComposerDock';
 import FileChangesPanel from '../../components/console/FileChangesPanel';
 import CatalogPanel from '../../components/console/CatalogPanel';
-import PlanMainPanel from '../../components/console/PlanMainPanel';
-import WorkerMainPanel from '../../components/console/WorkerMainPanel';
 import ChatComposer from '../../components/console/ChatComposer';
 import { metaCommandModalTitle } from '../../utils/contextDisplay';
 import {
@@ -30,13 +25,6 @@ import EditableSessionTitle from '../../components/console/EditableSessionTitle'
 import CodeSearchPanel from '../../components/console/CodeSearchPanel';
 import MemorySearchPanel from '../../components/console/MemorySearchPanel';
 import { useStickToBottomScroll } from '../../utils/useStickToBottomScroll';
-import SurveyDialog, {
-  PlanConfirmDialog,
-  PlanConfirmReviewDialog,
-  PlanConfirmSummaryChip,
-  TaskStepConfirmDialog,
-} from '../../components/console/SurveyDialogs';
-import { planPlannerSubThread, planPlannerVersion } from '../../utils/planPlannerTrace';
 import type { TraceStep, TraceTurn } from '../../types/trace';
 import { buildDisplayTraceTurns, mergeTraceStepsUnique, stepsToPanelLogLines, traceStepsFingerprint } from '../../types/trace';
 import { savePendingUserMessage } from '../../utils/pendingUserMessage';
@@ -45,15 +33,6 @@ import {
   loadComposerDraft,
   saveComposerDraft,
 } from '../../utils/composerDraft';
-import {
-  countPendingConfirms,
-  clearConfirmQueue,
-  dequeueConfirm,
-  hasPendingKind,
-  peekConfirmHead,
-} from '../../utils/pendingConfirmQueue';
-import { applyPendingConfirmHead, ingestPlanConfirmFromDetail } from '../../utils/pendingConfirmUi';
-import { releaseStreamState } from './streamHelpers';
 import {
   clearComposerImagesCache,
   getComposerImagesCache,
@@ -94,9 +73,7 @@ import {
   writeStoredAllowWrite,
   writeStoredSandboxEnabled,
 } from './storage';
-import { planExecutionAllowWrite } from './planHelpers';
 import {
-  parseTraceStep,
   parseTraceSteps,
   panelLinesFromTexts,
   releaseTurnOpen,
@@ -107,7 +84,6 @@ import {
   maxStepId,
   preferRicherTraceCache,
 } from './traceUtils';
-import { parseWorkerMessages } from './workerUtils';
 import { shouldSuppressSessionTrace } from './sseHelpers';
 import { SSE_TRACE_CONTENT_TYPES } from './constants';
 import { bumpSidebarSession, prependAgentSession, removeSessionsFromTree } from './sidebarUtils';
@@ -115,12 +91,11 @@ import type { TraceLine } from './types';
 import { useWorkspaceCatalog } from '../../hooks/useWorkspaceCatalog';
 import { createHandleSSEEvent } from '../../hooks/useConsoleSSE';
 import { useSessionHistory } from '../../hooks/useSessionHistory';
-import { usePlanSession } from '../../hooks/usePlanSession';
 
 
 
 export default function ConsolePage() {
-  const { alert, confirm, prompt } = useAppDialog();
+  const { alert, confirm } = useAppDialog();
   const [selected, setSelected] = useState<TreeNode | null>(null);
   const [caps, setCaps] = useState<Capabilities | null>(null);
   const [llmSettings, setLlmSettings] = useState<LlmSettings | null>(() =>
@@ -148,8 +123,6 @@ export default function ConsolePage() {
     workspacesLoading,
     agents,
     setAgents,
-    plans,
-    setPlans,
     treeLoading,
     treeReadySlug,
     setTreeReadySlug,
@@ -161,11 +134,6 @@ export default function ConsolePage() {
     refreshCaps,
   } = useWorkspaceCatalog({ allowWrite, setCaps, setLlmSettings, setSlashCatalog });
 
-  const [planDetail, setPlanDetail] = useState<PlanDetail | null>(null);
-  const [survey, setSurvey] = useState<SurveySpec | null>(null);
-  const [planConfirm, setPlanConfirm] = useState<Record<string, unknown> | null>(null);
-  const [planConfirmReview, setPlanConfirmReview] = useState<PlanConfirmHistoryEntry | null>(null);
-  const [taskStepConfirm, setTaskStepConfirm] = useState<string | null>(null);
   const [fileChangesTick, setFileChangesTick] = useState(0);
   const [contextRefreshSignal, setContextRefreshSignal] = useState(0);
   const bumpContextRefresh = useCallback(() => {
@@ -225,7 +193,6 @@ export default function ConsolePage() {
   const runningThreadsRef = useRef<Set<string>>(new Set());
   const turnOpenRef = useRef<Set<string>>(new Set());
   const stoppedThreadsRef = useRef<Set<string>>(new Set());
-  const planSubsRef = useRef<Map<string, () => void>>(new Map());
   const sessionSubsRef = useRef<Map<string, () => void>>(new Map());
   const handleSSEEventRef = useRef<(event: Record<string, unknown>, eventThread: string) => void>(
     () => {},
@@ -238,38 +205,16 @@ export default function ConsolePage() {
   sidebarWidthRef.current = sidebarWidth;
   rightPanelWidthRef.current = rightPanelWidth;
   const pollRef = useRef<number | null>(null);
-  const maybePromptPlanConfirmRef = useRef<(detail: PlanDetail, threadId: string) => void>(() => {});
   const sessionRestoreSlugRef = useRef<string | null>(null);
-  const plannerVerRef = useRef<Map<string, number>>(new Map());
-  const surveyDismissedRef = useRef<string | null>(null);
-  const taskStepDismissedRef = useRef<string | null>(null);
-  const planStopInFlightRef = useRef(false);
 
   const fileChangesConfig = useMemo(() => {
     if (!slug || !selected) {
       return null;
     }
-    if (selected.kind === 'agent') {
+    if (selected.kind === 'agent' || selected.kind === 'subagent') {
       return {
         mode: 'agent' as const,
         sessionThreadId: selected.thread_id,
-      };
-    }
-    if (selected.kind === 'plan') {
-      return {
-        mode: 'plan' as const,
-        sessionThreadId: selected.thread_id,
-        planThreadId: selected.thread_id,
-      };
-    }
-    if (selected.kind === 'worker') {
-      const planThread = selected.thread_id.split(':worker:')[0];
-      const taskId = selected.task_id || selected.thread_id.split(':worker:')[1] || '';
-      return {
-        mode: 'worker' as const,
-        sessionThreadId: selected.thread_id,
-        planThreadId: planThread,
-        taskId,
       };
     }
     return null;
@@ -281,9 +226,6 @@ export default function ConsolePage() {
   }, []);
 
   selectedRef.current = selected;
-
-  const planDetailRef = useRef<PlanDetail | null>(null);
-  planDetailRef.current = planDetail;
 
   const applyTraceToViewIfSelected = useCallback(
     (
@@ -297,21 +239,8 @@ export default function ConsolePage() {
         return;
       }
       const traceThread =
-        sel.kind === 'worker'
-          ? sel.thread_id
-          : sel.kind === 'agent'
-            ? sel.thread_id
-            : null;
+        sel.kind === 'agent' || sel.kind === 'subagent' ? sel.thread_id : null;
       if (traceThread === threadId) {
-        setPanelTraceLines(panelLines);
-        setPanelTraceSteps(panelSteps);
-        setPanelTraceTurns(panelTurns);
-        panelTraceLinesRef.current = panelLines;
-        panelTraceStepsRef.current = panelSteps;
-        panelTraceTurnsRef.current = panelTurns;
-        return;
-      }
-      if (sel.kind === 'plan' && threadId.includes(':planner:')) {
         setPanelTraceLines(panelLines);
         setPanelTraceSteps(panelSteps);
         setPanelTraceTurns(panelTurns);
@@ -406,24 +335,6 @@ export default function ConsolePage() {
     [slug, applyTraceToViewIfSelected],
   );
 
-  const flushPlannerTraceCacheToPanel = useCallback(
-    (sub: string) => {
-      if (!slug || !sub) {
-        return;
-      }
-      const cached = loadTracePanelCache(slug, sub);
-      if (!cached || (cached.log_lines.length === 0 && cached.steps.length === 0)) {
-        return;
-      }
-      applyTraceToViewIfSelected(
-        sub,
-        panelLinesFromTexts(cached.log_lines),
-        cached.steps,
-      );
-    },
-    [slug, applyTraceToViewIfSelected],
-  );
-
   const ensureSessionSubscription = useCallback(
     (sessionThread: string) => {
       if (!slug || !sessionThread || sessionSubsRef.current.has(sessionThread)) {
@@ -438,7 +349,6 @@ export default function ConsolePage() {
         'stream_delta',
         'stream_end',
         'turn_done',
-        'survey',
         'end',
       ]);
       const unsub = api.subscribeSessionEvents(slug, sessionThread, (ev) => {
@@ -474,91 +384,8 @@ export default function ConsolePage() {
       });
       sessionSubsRef.current.set(sessionThread, unsub);
     },
-    [slug, syncRemoteTrace, applyTraceToViewIfSelected, flushPlannerTraceCacheToPanel],
+    [slug, syncRemoteTrace],
   );
-
-  const ensurePlanPlannerSubscription = useCallback(
-    (planThread: string, versionOverride?: number) => {
-      const detail = planDetailRef.current;
-      const baseVer = planPlannerVersion(detail);
-      const ver =
-        typeof versionOverride === 'number' && versionOverride > 0
-          ? versionOverride
-          : baseVer;
-      const prevVer = plannerVerRef.current.get(planThread);
-      if (prevVer != null && prevVer !== ver) {
-        const oldThread = planPlannerSubThread(planThread, prevVer);
-        sessionSubsRef.current.get(oldThread)?.();
-        sessionSubsRef.current.delete(oldThread);
-      }
-      plannerVerRef.current.set(planThread, ver);
-      const plannerThread = planPlannerSubThread(planThread, ver);
-      ensureSessionSubscription(plannerThread);
-      return plannerThread;
-    },
-    [ensureSessionSubscription],
-  );
-
-  const ensurePlanSubscription = useCallback(
-    (planThread: string) => {
-      if (!slug || planSubsRef.current.has(planThread)) {
-        return;
-      }
-      const forwardTypes = new Set([
-        'end',
-        'error',
-        'interrupt',
-        'plan_job',
-        'plan_state',
-        'plan_done',
-      ]);
-      const unsub = api.subscribePlanEvents(slug, planThread, (ev) => {
-        const t = String(ev.type || '');
-        // POST SSE 与长连接订阅同一 channel；POST 仍活跃时由 POST 独占 trace，避免重复渲染
-        if (
-          forwardTypes.has(t) &&
-          shouldSuppressSessionTrace(
-            planThread,
-            streamAbortRef.current,
-            streamLastEventAtRef.current,
-            selectedRef.current,
-          )
-        ) {
-          return;
-        }
-        if (forwardTypes.has(t)) {
-          onSSEHandlerRef.current({ ...ev, thread_id: ev.thread_id || planThread });
-        }
-        if (t === 'plan_state' || t === 'turn_done' || t === 'end' || t === 'subscribed') {
-          if (
-            selectedRef.current?.thread_id === planThread &&
-            selectedRef.current?.kind === 'plan'
-          ) {
-            api.plan(slug, planThread).then((detail) => {
-              setPlanDetail(detail);
-              if (planExecutionAllowWrite(detail)) {
-                setAllowWrite(true);
-              }
-            }).catch(() => {});
-            refreshTree();
-          }
-        }
-      });
-      planSubsRef.current.set(planThread, unsub);
-    },
-    [slug, refreshTree],
-  );
-
-  const maybeReleasePlanSubscription = useCallback((planThread: string) => {
-    if (selectedRef.current?.thread_id === planThread) {
-      return;
-    }
-    if (runningThreadsRef.current.has(planThread)) {
-      return;
-    }
-    planSubsRef.current.get(planThread)?.();
-    planSubsRef.current.delete(planThread);
-  }, []);
 
   const ingestSSE = useCallback((event: Record<string, unknown>, defaultThread?: string) => {
     const threadId = String(event.thread_id || defaultThread || '');
@@ -567,14 +394,6 @@ export default function ConsolePage() {
     }
     handleSSEEventRef.current(event, threadId);
   }, []);
-
-  const bindSSE = useCallback(
-    (threadId: string) => (ev: Record<string, unknown>) => {
-      streamLastEventAtRef.current.set(threadId, Date.now());
-      ingestSSE(ev, threadId);
-    },
-    [ingestSSE],
-  );
 
   const resubscribeSession = useCallback(
     (sessionThread: string) => {
@@ -598,17 +417,8 @@ export default function ConsolePage() {
       } else {
         ensureSessionSubscription(tid);
       }
-      if (tid.startsWith('plan-')) {
-        ensurePlanSubscription(tid);
-        ensurePlanPlannerSubscription(tid);
-      }
     }
-  }, [
-    ensureSessionSubscription,
-    ensurePlanSubscription,
-    ensurePlanPlannerSubscription,
-    resubscribeSession,
-  ]);
+  }, [ensureSessionSubscription, resubscribeSession]);
 
   const dropSessionSubscription = useCallback((threadId: string) => {
     if (!threadId) {
@@ -687,7 +497,7 @@ export default function ConsolePage() {
       }
       ensureRunningSessionSubscriptions();
 
-      if (node.kind === 'agent') {
+      if (node.kind === 'agent' || node.kind === 'subagent') {
         const still = await syncAgentRunningState(node.thread_id, {
           trustServer: true,
         });
@@ -697,30 +507,9 @@ export default function ConsolePage() {
           dropSessionSubscription(node.thread_id);
           setBusy(false);
         }
-      } else if (node.kind === 'plan') {
-        try {
-          const detail = await api.plan(slug, node.thread_id);
-          if (selectedRef.current?.thread_id !== node.thread_id) {
-            return;
-          }
-          if (detail.job?.running || (detail as { lock?: { owner?: string } }).lock?.owner === 'web') {
-            runningThreadsRef.current.add(node.thread_id);
-            setBusy(true);
-            resubscribeSession(node.thread_id);
-            ensurePlanSubscription(node.thread_id);
-          } else {
-            dropSessionSubscription(node.thread_id);
-            setBusy(false);
-          }
-        } catch {
-          /* ignore */
-        }
-      } else if (node.kind === 'worker') {
-        resubscribeSession(node.thread_id);
       }
 
-      const traceThread =
-        node.kind === 'worker' ? node.thread_id : node.thread_id;
+      const traceThread = node.thread_id;
       const loaded = await syncRemoteTrace(traceThread);
       if (!loaded || selectedRef.current?.thread_id !== node.thread_id) {
         return;
@@ -755,7 +544,6 @@ export default function ConsolePage() {
       resubscribeSession,
       dropSessionSubscription,
       ensureRunningSessionSubscriptions,
-      ensurePlanSubscription,
       syncRemoteTrace,
       syncAgentRunningState,
     ],
@@ -763,9 +551,6 @@ export default function ConsolePage() {
 
   const { loadHistory, historyLoading } = useSessionHistory({
     slug,
-    maybePromptPlanConfirm: (detail, threadId) => maybePromptPlanConfirmRef.current(detail, threadId),
-    ensurePlanSubscription,
-    ensurePlanPlannerSubscription,
     ensureSessionSubscription,
     resumeSessionAfterSelect,
     syncAgentRunningState,
@@ -776,15 +561,8 @@ export default function ConsolePage() {
     panelTraceLinesRef,
     panelTraceStepsRef,
     panelTraceTurnsRef,
-    surveyDismissedRef,
-    taskStepDismissedRef,
-    streamAbortRef,
     setAllowWrite,
     setCaps,
-    setPlanDetail,
-    setSurvey,
-    setPlanConfirm,
-    setTaskStepConfirm,
     setMessages,
     setTraceLines,
     setTraceSteps,
@@ -805,30 +583,7 @@ export default function ConsolePage() {
         resubscribeSession(tid);
       }
     }
-    for (const [planThread, unsub] of planSubsRef.current) {
-      if (runningThreadsRef.current.has(planThread)) {
-        unsub();
-        planSubsRef.current.delete(planThread);
-        ensurePlanSubscription(planThread);
-      }
-    }
-  }, [resubscribeSession, ensurePlanSubscription]);
-
-  const beginStream = useCallback(
-    (threadId: string) => {
-      runningThreadsRef.current.add(threadId);
-      ensureSessionSubscription(threadId);
-      if (threadId.startsWith('plan-')) {
-        ensurePlanPlannerSubscription(threadId);
-        ensurePlanSubscription(threadId);
-      }
-      const ac = new AbortController();
-      streamAbortRef.current.set(threadId, ac);
-      abortRef.current = ac;
-      return ac;
-    },
-    [ensureSessionSubscription, ensurePlanPlannerSubscription, ensurePlanSubscription],
-  );
+  }, [resubscribeSession]);
 
   useEffect(() => {
     if (!slug) {
@@ -843,10 +598,6 @@ export default function ConsolePage() {
           continue;
         }
         void syncRemoteTrace(tid);
-        if (tid.startsWith('plan-')) {
-          const ver = planPlannerVersion(planDetailRef.current);
-          void syncRemoteTrace(planPlannerSubThread(tid, ver));
-        }
       }
     }, 2000);
     return () => window.clearInterval(id);
@@ -937,117 +688,17 @@ export default function ConsolePage() {
   }, [busy, selected?.thread_id]);
 
   useEffect(() => {
-    if (!slug || !planDetail) {
-      return;
-    }
-    const planThread =
-      selected?.kind === 'plan'
-        ? selected.thread_id
-        : selected?.kind === 'worker'
-          ? selected.thread_id.split(':worker:')[0]
-          : planDetail.thread_id;
-    if (!planThread) {
-      return;
-    }
-    for (const task of planDetail.tasks || []) {
-      if (String(task.status) === 'running') {
-        ensureSessionSubscription(`${planThread}:worker:${task.id}`);
-      }
-    }
-  }, [slug, planDetail, selected, ensureSessionSubscription]);
-
-  useEffect(() => {
-    if (!slug || selected?.kind !== 'plan' || !planDetail) {
-      return;
-    }
-    const planThread = selected.thread_id;
-    const plannerThread = ensurePlanPlannerSubscription(planThread);
-    void (async () => {
-      const loaded = await syncRemoteTrace(plannerThread);
-      if (!loaded) {
-        return;
-      }
-      const picked = preferRicherTraceCache(
-        slug,
-        plannerThread,
-        loaded.panelLines,
-        loaded.panelSteps,
-      );
-      if (picked.lines.length || picked.steps.length) {
-        applyTraceToViewIfSelected(plannerThread, picked.lines, picked.steps);
-      }
-    })();
-  }, [
-    slug,
-    selected?.kind,
-    selected?.thread_id,
-    planDetail?.phase,
-    planDetail?.job?.running,
-    planDetail?.plan_state?.plan_version,
-    planDetail?.plan,
-    ensurePlanPlannerSubscription,
-    syncRemoteTrace,
-    applyTraceToViewIfSelected,
-  ]);
-
-  useEffect(() => {
-    if (!slug || selected?.kind !== 'plan') {
-      return;
-    }
-    const planThread = selected.thread_id;
-    const syncBusy = () => {
-      api
-        .plan(slug, planThread)
-        .then((detail) => {
-          setPlanDetail(detail);
-          if (detail.job?.running) {
-            runningThreadsRef.current.add(planThread);
-            setBusy(true);
-          } else {
-            streamAbortRef.current.delete(planThread);
-            runningThreadsRef.current.delete(planThread);
-            setBusy(false);
-          }
-        })
-        .catch(() => {});
-    };
-    syncBusy();
-    const id = window.setInterval(syncBusy, 3000);
-    return () => window.clearInterval(id);
-  }, [slug, selected?.kind, selected?.thread_id]);
-
-  useEffect(() => {
-    if (!slug || (selected?.kind !== 'plan' && selected?.kind !== 'worker')) {
-      return;
-    }
-    const planThread =
-      selected.kind === 'worker'
-        ? selected.thread_id.split(':worker:')[0]
-        : selected.thread_id;
-    ensurePlanSubscription(planThread);
-  }, [slug, selected?.kind, selected?.thread_id, ensurePlanSubscription]);
-
-  useEffect(() => {
     if (!slug) {
       return;
     }
-    for (const unsub of planSubsRef.current.values()) {
-      unsub();
-    }
-    planSubsRef.current.clear();
     for (const unsub of sessionSubsRef.current.values()) {
       unsub();
     }
     sessionSubsRef.current.clear();
-    plannerVerRef.current.clear();
   }, [slug]);
 
   useEffect(
     () => () => {
-      for (const unsub of planSubsRef.current.values()) {
-        unsub();
-      }
-      planSubsRef.current.clear();
       for (const unsub of sessionSubsRef.current.values()) {
         unsub();
       }
@@ -1202,9 +853,7 @@ export default function ConsolePage() {
     if (!lastThread) {
       return;
     }
-    const node =
-      agents.find((a) => a.thread_id === lastThread) ??
-      plans.find((p) => p.thread_id === lastThread);
+    const node = agents.find((a) => a.thread_id === lastThread);
     if (!node) {
       return;
     }
@@ -1214,16 +863,14 @@ export default function ConsolePage() {
       prewarmAgentSession(slug, node.thread_id);
     }
     void loadHistory(node);
-  }, [slug, treeReadySlug, agents, plans, loadHistory, prewarmAgentSession]);
+  }, [slug, treeReadySlug, agents, loadHistory, prewarmAgentSession]);
 
   useEffect(() => {
     const current = selectedRef.current;
-    if (!current || current.kind === 'worker') {
+    if (!current) {
       return;
     }
-    const updated =
-      agents.find((a) => a.thread_id === current.thread_id) ??
-      plans.find((p) => p.thread_id === current.thread_id);
+    const updated = agents.find((a) => a.thread_id === current.thread_id);
     if (!updated) {
       return;
     }
@@ -1235,7 +882,7 @@ export default function ConsolePage() {
       selectedRef.current = merged;
       setSelected(merged);
     }
-  }, [agents, plans]);
+  }, [agents]);
 
   const handleSelect = (node: TreeNode) => {
     const prev = selectedRef.current;
@@ -1245,11 +892,6 @@ export default function ConsolePage() {
       setSessionChatCache(slug, prev.thread_id, messagesRef.current);
       persistPanelTraceSnapshot(prev.thread_id);
       streamLastEventAtRef.current.delete(prev.thread_id);
-      const prevMain =
-        prev.kind === 'worker' ? prev.thread_id.split(':worker:')[0] : prev.thread_id;
-      if (prevMain) {
-        streamLastEventAtRef.current.delete(prevMain);
-      }
     }
     setCatalogOpen(null);
     selectedRef.current = node;
@@ -1294,55 +936,6 @@ export default function ConsolePage() {
     if (pollRef.current) {
       window.clearInterval(pollRef.current);
       pollRef.current = null;
-    }
-    if (node.kind === 'worker' && slug) {
-      const planThread = node.thread_id.split(':worker:')[0];
-      const taskId = node.task_id || '';
-      pollRef.current = window.setInterval(async () => {
-        try {
-          const [data, detail] = await Promise.all([
-            api.worker(slug, planThread, taskId),
-            api.plan(slug, planThread),
-          ]);
-          setPlanDetail(detail);
-          const { chat, traces, traceSteps } = parseWorkerMessages(data);
-          setMessages(chat);
-          if (selectedRef.current?.thread_id === node.thread_id) {
-            try {
-              const remote = await api.sessionTrace(slug, node.thread_id);
-              let pollLines: TraceLine[] = [];
-              let pollSteps: TraceStep[] = [];
-              if (remote.steps?.length) {
-                pollSteps = remote.steps.map((s) => parseTraceStep(s));
-              }
-              if (remote.log_lines?.length) {
-                pollLines = panelLinesFromTexts(remote.log_lines);
-              } else if (pollSteps.length > 0) {
-                pollLines = stepsToPanelLogLines(pollSteps);
-              }
-              const picked = preferRicherTraceCache(slug, node.thread_id, pollLines, pollSteps);
-              if (picked.lines.length || picked.steps.length) {
-                setPanelTraceLines(picked.lines);
-                setPanelTraceSteps(picked.steps);
-                panelTraceLinesRef.current = picked.lines;
-                panelTraceStepsRef.current = picked.steps;
-              } else {
-                setPanelTraceLines(traces);
-                setPanelTraceSteps(traceSteps);
-                panelTraceLinesRef.current = traces;
-                panelTraceStepsRef.current = traceSteps;
-              }
-            } catch {
-              setPanelTraceLines(traces);
-              setPanelTraceSteps(traceSteps);
-              panelTraceLinesRef.current = traces;
-              panelTraceStepsRef.current = traceSteps;
-            }
-          }
-        } catch {
-          /* ignore */
-        }
-      }, 3000);
     }
   };
 
@@ -1403,7 +996,7 @@ export default function ConsolePage() {
     if (
       !(await confirm({
         title: '移除工作区',
-        message: `从最近列表移除「${label}」？\n\n仅隐藏侧栏入口，Agent/Plan 会话数据仍保留；再次打开同一路径可恢复。`,
+        message: `从最近列表移除「${label}」？\n\n仅隐藏侧栏入口，Agent 会话数据仍保留；再次打开同一路径可恢复。`,
         confirmLabel: '移除',
       }))
     ) {
@@ -1420,7 +1013,6 @@ export default function ConsolePage() {
         setSelected(null);
         setCatalogOpen(null);
         setMessages([]);
-        setPlanDetail(null);
         setTreeReadySlug(null);
       }
       refreshWorkspaces();
@@ -1450,36 +1042,6 @@ export default function ConsolePage() {
     handleSelect(newNode);
   };
 
-  const handleNewPlan = async () => {
-    const activeSlug = await ensureWorkspace();
-    if (!activeSlug) {
-      return;
-    }
-    const goalInput = await prompt({
-      title: '新建 Plan',
-      message: 'Plan 目标（自然语言）',
-      placeholder: '例如：梳理模块依赖并输出重构计划',
-      confirmLabel: '创建',
-    });
-    if (goalInput === null) {
-      return;
-    }
-    const goal = goalInput.trim();
-    const { thread_id } = await api.createSession(activeSlug, 'plan', goal);
-    refreshTree();
-    const node: TreeNode = {
-      kind: 'plan',
-      thread_id,
-      title: goal || thread_id,
-      children: [],
-    };
-    setSelected(node);
-    await loadHistory(node);
-    if (goal.trim() && selectedRef.current?.thread_id === thread_id) {
-      await sendPlanMessage(node, goal);
-    }
-  };
-
   const handleCatalogOpen = async (kind: 'skills' | 'rules' | 'tools') => {
     const activeSlug = await ensureWorkspace();
     if (!activeSlug) {
@@ -1491,7 +1053,6 @@ export default function ConsolePage() {
     setTraceSteps([]);
     setPanelTraceLines([]);
     setPanelTraceSteps([]);
-    setPlanDetail(null);
     setCatalogOpen(kind);
   };
 
@@ -1499,10 +1060,7 @@ export default function ConsolePage() {
     if (!slug || busy) {
       return;
     }
-    const label =
-      node.kind === 'plan'
-        ? `Plan「${node.title || node.thread_id}」及其 Worker 节点`
-        : `Agent「${node.title || node.thread_id}」`;
+    const label = `Agent「${node.title || node.thread_id}」`;
     if (
       !(await confirm({
         title: '删除会话',
@@ -1516,7 +1074,7 @@ export default function ConsolePage() {
     try {
       abortRef.current?.abort();
       await api.deleteSession(slug, node.thread_id);
-      removeSessionsFromTree([node.thread_id], setAgents, setPlans);
+      removeSessionsFromTree([node.thread_id], setAgents);
       if (isSessionAffectedByDelete(node.thread_id)) {
         clearSessionView();
       }
@@ -1544,7 +1102,6 @@ export default function ConsolePage() {
     setTraceSteps([]);
     setPanelTraceLines([]);
     setPanelTraceSteps([]);
-    setPlanDetail(null);
   };
 
   const isSessionAffectedByDelete = (threadId: string) => {
@@ -1592,7 +1149,7 @@ export default function ConsolePage() {
     if (
       !(await confirm({
         title: '批量删除会话',
-        message: `确定删除选中的 ${ids.length} 个会话？Plan 将级联删除 Worker。此操作不可恢复。`,
+        message: `确定删除选中的 ${ids.length} 个会话？此操作不可恢复。`,
         confirmLabel: '删除',
         danger: true,
       }))
@@ -1604,7 +1161,7 @@ export default function ConsolePage() {
       const res = await api.deleteSessions(slug, ids);
       const succeeded = res.results.filter((r) => r.ok).map((r) => r.thread_id);
       if (succeeded.length > 0) {
-        removeSessionsFromTree(succeeded, setAgents, setPlans);
+        removeSessionsFromTree(succeeded, setAgents);
       }
       if (ids.some((id) => isSessionAffectedByDelete(id))) {
         clearSessionView();
@@ -1662,43 +1219,6 @@ export default function ConsolePage() {
     traceStepsRef.current = [];
   };
 
-  const {
-    maybePromptPlanConfirm,
-    handleWorkClick,
-    handleBackToPlan,
-    handlePlanStop,
-    handlePlanAbort,
-    handleTaskStop,
-    handleTaskRun,
-    handlePlanConfirm,
-    handlePlanContinue,
-  } = usePlanSession({
-    slug,
-    selected,
-    planDetail,
-    allowWrite,
-    plans,
-    alert,
-    confirm,
-    setBusy,
-    setPlanDetail,
-    setMessages,
-    setAllowWrite,
-    setPlanConfirm,
-    setTaskStepConfirm,
-    taskStepDismissedRef,
-    planStopInFlightRef,
-    runningThreadsRef,
-    streamAbortRef,
-    streamLastEventAtRef,
-    beginStream,
-    bindSSE,
-    finalizeLiveTrace,
-    handleSelect,
-    refreshTree,
-  });
-  maybePromptPlanConfirmRef.current = maybePromptPlanConfirm;
-
   handleSSEEventRef.current = createHandleSSEEvent({
     slug,
     selected,
@@ -1713,8 +1233,6 @@ export default function ConsolePage() {
     panelTraceTurnsRef,
     traceLinesRef,
     traceStepsRef,
-    surveyDismissedRef,
-    taskStepDismissedRef,
     traceTurnStartRef,
     streamedRef,
     traceFlushedRef,
@@ -1729,14 +1247,7 @@ export default function ConsolePage() {
     setPanelTraceTurns,
     setStreamText,
     setMessages,
-    setPlanDetail,
-    setAllowWrite,
-    setSurvey,
-    setPlanConfirm,
-    setTaskStepConfirm,
     setFileChangesTick,
-    ensurePlanSubscription,
-    maybeReleasePlanSubscription,
     finalizeLiveTrace,
     refreshTree,
     bumpContextRefresh,
@@ -1744,7 +1255,6 @@ export default function ConsolePage() {
   onSSEHandlerRef.current = (event) => ingestSSE(event);
 
   const liveTraceText = traceLines.map((l) => l.text).join('\n');
-  const planViewBusy = busy && selected?.kind === 'plan';
   const mergedPanelTrace = mergeLiveTraceIntoPanel(
     panelTraceLines,
     panelTraceSteps,
@@ -1752,17 +1262,11 @@ export default function ConsolePage() {
     traceSteps,
   );
   const displayPanelSteps =
-    planViewBusy && panelTraceSteps.length > 0
-      ? panelTraceSteps
-      : mergedPanelTrace.steps.length > 0
-        ? mergedPanelTrace.steps
-        : panelTraceSteps;
+    mergedPanelTrace.steps.length > 0 ? mergedPanelTrace.steps : panelTraceSteps;
   const displayPanelLines =
-    planViewBusy && panelTraceLines.length > 0
-      ? panelTraceLines
-      : mergedPanelTrace.lines.length > 0
-        ? panelLinesFromTexts(mergedPanelTrace.lines)
-        : panelTraceLines;
+    mergedPanelTrace.lines.length > 0
+      ? panelLinesFromTexts(mergedPanelTrace.lines)
+      : panelTraceLines;
   /** 右侧 Trace：完整历史轮 + 当前轮。对话区 SSE：只展示当前轮（不与右侧整板重复）。
    * 刷新后 SSE 回放可能只有缓冲尾部几步，当前轮步骤须与 panel 合并，不能只用短 live. */
   const currentTurnSteps = mergeTraceStepsUnique(panelTraceSteps, traceSteps);
@@ -1776,28 +1280,21 @@ export default function ConsolePage() {
   });
   /** 对话区仅当前进行中的一轮；用户气泡已在上方，日志里的「用户消息」行不再重复。 */
   const agentChatLiveTurn =
-    busy && selected?.kind === 'agent'
+    busy && (selected?.kind === 'agent' || selected?.kind === 'subagent')
       ? displayPanelTurns.find((turn) => turn.live)
       : undefined;
   const agentChatTraceTurns = agentChatLiveTurn ? [agentChatLiveTurn] : [];
   const agentChatTraceSteps =
-    busy && selected?.kind === 'agent' ? (agentChatLiveTurn?.steps ?? []) : [];
+    busy && (selected?.kind === 'agent' || selected?.kind === 'subagent')
+      ? (agentChatLiveTurn?.steps ?? [])
+      : [];
   const agentChatTraceText =
-    busy && selected?.kind === 'agent' && agentChatLiveTurn
+    busy && (selected?.kind === 'agent' || selected?.kind === 'subagent') && agentChatLiveTurn
       ? (displayPanelLines.map((l) => l.text).join('\n') || liveTraceText)
           .split('\n')
           .filter((line) => !line.includes('用户消息'))
           .join('\n')
       : '';
-  const planChatTraceText =
-    busy && selected?.kind === 'plan'
-      ? panelTraceLines
-          .map((l) => l.text)
-          .filter((line) => !line.includes('用户消息'))
-          .join('\n')
-      : '';
-  const planChatTraceSteps =
-    busy && selected?.kind === 'plan' ? panelTraceSteps : [];
 
   const handleModelChange = async (modelId: string) => {
     if (!slug || !modelId || llmSettings?.model === modelId) {
@@ -1863,7 +1360,7 @@ export default function ConsolePage() {
       return;
     }
     const threadId =
-      selected?.kind === 'agent' || selected?.kind === 'plan' ? selected.thread_id : '';
+      selected?.kind === 'agent' || selected?.kind === 'subagent' ? selected.thread_id : '';
     const res = await api.setWebSearch(slug, enabled, threadId, allowWrite);
     setCaps((prev) => (prev ? { ...prev, web_search_enabled: res.enabled } : prev));
   };
@@ -1874,7 +1371,7 @@ export default function ConsolePage() {
     }
     writeStoredSandboxEnabled(enabled);
     const threadId =
-      selected?.kind === 'agent' || selected?.kind === 'plan' ? selected.thread_id : '';
+      selected?.kind === 'agent' || selected?.kind === 'subagent' ? selected.thread_id : '';
     try {
       const res = await api.setSandbox(slug, enabled, threadId, allowWrite);
       setCaps((prev) => (prev && res.sandbox ? { ...prev, sandbox: res.sandbox } : prev));
@@ -1902,16 +1399,7 @@ export default function ConsolePage() {
 
   const handleStop = async () => {
     const tid = selected?.thread_id;
-    if (selected?.kind === 'plan' && slug && tid) {
-      if (planDetail?.job?.running || busy) {
-        void handlePlanStop();
-        streamAbortRef.current.get(tid)?.abort();
-        streamAbortRef.current.delete(tid);
-        finalizeLiveTrace(tid);
-        return;
-      }
-    }
-    if (selected?.kind === 'agent' && slug && tid) {
+    if ((selected?.kind === 'agent' || selected?.kind === 'subagent') && slug && tid) {
       stoppedThreadsRef.current.add(tid);
       releaseTurnOpen(tid, turnOpenRef.current);
       try {
@@ -1956,7 +1444,7 @@ export default function ConsolePage() {
     }));
     releaseTurnOpen(node.thread_id, turnOpenRef.current);
     setBusy(true);
-    bumpSidebarSession(node, setAgents, setPlans);
+    bumpSidebarSession(node, setAgents);
     streamedRef.current = false;
     traceFlushedRef.current = false;
     // 先归档上一轮 current steps，避免 busy=true 到 turn_start 之间对话区仍展示上一轮 Trace
@@ -2036,57 +1524,6 @@ export default function ConsolePage() {
     }
   };
 
-  const sendPlanMessage = async (node: TreeNode, text: string) => {
-    if (!slug) {
-      return;
-    }
-    setBusy(true);
-    streamedRef.current = false;
-    traceFlushedRef.current = false;
-    setTraceLines([]);
-    setTraceSteps([]);
-    traceLinesRef.current = [];
-    traceStepsRef.current = [];
-    setThinkingText('');
-    setMessages((prev) => [...prev, { id: `u-${Date.now()}`, role: 'user', text }]);
-    requestAnimationFrame(() => mainScroll.stickToBottom());
-    const ac = beginStream(node.thread_id);
-    try {
-      if (planDetail?.phase === 'completed') {
-        await api.planDiscuss(slug, node.thread_id, text, bindSSE(node.thread_id), ac.signal);
-      } else {
-        await api.planStart(slug, node.thread_id, text, allowWrite, bindSSE(node.thread_id), ac.signal);
-      }
-    } catch (e) {
-      releaseStreamState(
-        node.thread_id,
-        {
-          runningThreads: runningThreadsRef,
-          streamAbort: streamAbortRef,
-          streamLastEventAt: streamLastEventAtRef,
-        },
-        setBusy,
-      );
-      if (e instanceof DOMException && e.name === 'AbortError') {
-        return;
-      }
-      void syncRemoteTrace(node.thread_id);
-      setMessages((prev) => [
-        ...prev,
-        { id: `err-${Date.now()}`, role: 'system', text: String(e) },
-      ]);
-    } finally {
-      if (!runningThreadsRef.current.has(node.thread_id)) {
-        releaseStreamState(node.thread_id, {
-          runningThreads: runningThreadsRef,
-          streamAbort: streamAbortRef,
-          streamLastEventAt: streamLastEventAtRef,
-        });
-        setBusy(false);
-      }
-    }
-  };
-
   const handleSend = async () => {
     const text = input.trim();
     const images = composerImages;
@@ -2132,114 +1569,17 @@ export default function ConsolePage() {
       }
     }
 
-    if (selected.kind === 'agent') {
+    if (selected.kind === 'agent' || selected.kind === 'subagent') {
       await sendAgentMessage(selected, text, images);
-    } else if (selected.kind === 'plan') {
-      await sendPlanMessage(selected, text);
     }
   };
 
   const sessionTitle =
-    selected?.kind === 'worker'
-      ? `Work ${selected.task_id || ''}`
-      : selected?.title && selected.title !== selected.thread_id
-        ? selected.title
-        : selected?.thread_id || 'llgraph';
+    selected?.title && selected.title !== selected.thread_id
+      ? selected.title
+      : selected?.thread_id || 'llgraph';
 
-  const workerMeta = useMemo(() => {
-    if (!selected || selected.kind !== 'worker') {
-      return null;
-    }
-    const taskId = selected.task_id || '';
-    const planThread = selected.thread_id.split(':worker:')[0];
-    const task = planDetail?.tasks.find((t) => String(t.id) === taskId);
-    const wfTask = planDetail?.workflow_snapshot?.tasks?.find((t) => t.id === taskId);
-    return {
-      planThread,
-      taskId,
-      title: String(task?.title || selected.title || taskId),
-      status: String(wfTask?.status || task?.status || selected.status || 'pending'),
-      planTitle: planDetail?.title || planThread,
-      readonly: Boolean(task?.readonly),
-    };
-  }, [selected, planDetail]);
-
-  const workerLiveSteps =
-    busy && traceSteps.length > 0
-      ? mergeTraceStepsUnique(panelTraceSteps, traceSteps)
-      : panelTraceSteps;
-  const workerLiveText =
-    busy && traceLines.length > 0
-      ? [...panelTraceLines, ...panelLinesFromTexts(traceLines.map((l) => l.text))]
-          .map((l) => l.text)
-          .join('\n')
-      : panelTraceLines.map((l) => l.text).join('\n');
-
-  const workerTraceText = workerLiveText;
-
-  const canChat = selected && (selected.kind === 'agent' || selected.kind === 'plan');
-  const confirmThreadId =
-    selected?.kind === 'worker'
-      ? selected.thread_id.split(':worker:')[0]
-      : selected?.thread_id || '';
-  const pendingConfirmCount =
-    slug && confirmThreadId ? countPendingConfirms(slug, confirmThreadId) : 0;
-  const showPendingSurveyChip =
-    Boolean(slug && confirmThreadId && !survey && hasPendingKind(slug, confirmThreadId, 'survey'));
-  const showPendingPlanChip =
-    Boolean(
-      slug && confirmThreadId && !planConfirm && hasPendingKind(slug, confirmThreadId, 'plan_confirm'),
-    );
-  const pendingTaskStepId = (() => {
-    if (!slug || !confirmThreadId || taskStepConfirm) {
-      return null;
-    }
-    const head = peekConfirmHead(slug, confirmThreadId);
-    if (head?.kind !== 'task_step_confirm') {
-      return null;
-    }
-    if (taskStepDismissedRef.current === head.id) {
-      return String((head.payload as { task_id?: string })?.task_id || '');
-    }
-    return null;
-  })();
-
-  const openPendingConfirm = useCallback(() => {
-    if (!slug || !confirmThreadId) {
-      return;
-    }
-    surveyDismissedRef.current = null;
-    taskStepDismissedRef.current = null;
-    applyPendingConfirmHead(
-      slug,
-      confirmThreadId,
-      { setSurvey, setPlanConfirm, setTaskStepConfirm },
-    );
-  }, [slug, confirmThreadId, setSurvey, setPlanConfirm, setTaskStepConfirm]);
-
-  const openPendingPlanConfirm = useCallback(() => {
-    if (!slug || !confirmThreadId || !planDetail) {
-      return;
-    }
-    ingestPlanConfirmFromDetail(slug, confirmThreadId, planDetail);
-    const head = peekConfirmHead(slug, confirmThreadId);
-    if (head?.kind === 'plan_confirm') {
-      setPlanConfirm(head.payload as Record<string, unknown>);
-      return;
-    }
-    openPendingConfirm();
-  }, [slug, confirmThreadId, planDetail, setPlanConfirm, openPendingConfirm]);
-
-  const latestPlanConfirm = useMemo((): PlanConfirmHistoryEntry | null => {
-    const history = planDetail?.plan_state?.confirm_history;
-    if (!Array.isArray(history) || history.length === 0) {
-      return null;
-    }
-    return history[history.length - 1] as PlanConfirmHistoryEntry;
-  }, [planDetail?.plan_state?.confirm_history]);
-
-  const showPlanMain = selected?.kind === 'plan' && planDetail;
-  const showWorkerMain = selected?.kind === 'worker' && workerMeta;
+  const canChat = selected && (selected.kind === 'agent' || selected.kind === 'subagent');
   const showRightPanel = Boolean(selected && !catalogOpen && rightPanelOpen);
 
   const layoutStyle = {
@@ -2248,7 +1588,6 @@ export default function ConsolePage() {
   } as React.CSSProperties;
 
   const sidebarAgents = agents;
-  const sidebarPlans = plans;
   const sessionTreeLoading = Boolean(slug && treeLoading && treeReadySlug !== slug);
 
   return (
@@ -2264,7 +1603,6 @@ export default function ConsolePage() {
         workspaceDisplay={workspaceDisplay}
         workspacesLoading={workspacesLoading}
         agents={sidebarAgents}
-        plans={sidebarPlans}
         treeLoading={sessionTreeLoading}
         selectedId={selected?.thread_id || null}
         catalogOpen={catalogOpen}
@@ -2284,9 +1622,7 @@ export default function ConsolePage() {
           setSelectedSessionIds(new Set());
           setTreeReadySlug(null);
           setAgents([]);
-          setPlans([]);
           setMessages([]);
-          setPlanDetail(null);
           if (s) {
             void api.touchWorkspace(s).then(() => refreshWorkspaces()).catch(() => {});
           }
@@ -2295,7 +1631,6 @@ export default function ConsolePage() {
         onDismissWorkspace={(s) => void handleDismissWorkspace(s)}
         onSelect={handleSelect}
         onNewAgent={handleNewAgent}
-        onNewPlan={handleNewPlan}
         onDelete={handleDeleteSession}
         onRename={handleRenameSession}
         onCatalogOpen={handleCatalogOpen}
@@ -2344,7 +1679,7 @@ export default function ConsolePage() {
         ) : !selected ? (
           <div className="cursor-welcome">
             <h1>llgraph Agent</h1>
-            <p>选择左侧工作区，创建 Agent / Plan，或浏览 Skills / Rules / 工具</p>
+            <p>选择左侧工作区，创建 Agent，或浏览 Skills / Rules / 工具</p>
           </div>
         ) : (
           <>
@@ -2354,14 +1689,14 @@ export default function ConsolePage() {
                   title={sessionTitle}
                   titleFull={selected.title_full}
                   threadId={selected.thread_id}
-                  renamable={selected.kind === 'agent' || selected.kind === 'plan'}
+                  renamable={selected.kind === 'agent' || selected.kind === 'subagent'}
                   onRename={
-                    selected.kind === 'agent' || selected.kind === 'plan'
+                    selected.kind === 'agent'
                       ? (title) => handleRenameSession(selected, title)
                       : undefined
                   }
                 />
-                {(selected.kind === 'agent' || selected.kind === 'plan') && (
+                {(selected.kind === 'agent' || selected.kind === 'subagent') && (
                   <AgentToolbar
                     llm={llmSettings}
                     busy={busy}
@@ -2374,7 +1709,7 @@ export default function ConsolePage() {
                     onModelChange={handleModelChange}
                     onThinkingChange={handleThinkingChange}
                     onWebSearchChange={
-                      selected.kind === 'agent' || selected.kind === 'plan'
+                      selected.kind === 'agent' || selected.kind === 'subagent'
                         ? handleWebSearchChange
                         : undefined
                     }
@@ -2382,7 +1717,7 @@ export default function ConsolePage() {
                 )}
               </div>
               <div className="cursor-main-actions">
-                {selected && (selected.kind === 'agent' || selected.kind === 'plan') && (
+                {selected && (selected.kind === 'agent' || selected.kind === 'subagent') && (
                   <ConsoleOps
                     ref={consoleOpsRef}
                     slug={slug}
@@ -2398,7 +1733,7 @@ export default function ConsolePage() {
                     }}
                   />
                 )}
-                {selected && (selected.kind === 'agent' || selected.kind === 'plan') && (
+                {selected && (selected.kind === 'agent' || selected.kind === 'subagent') && (
                   <button
                     type="button"
                     className="cursor-panel-toggle"
@@ -2413,130 +1748,19 @@ export default function ConsolePage() {
             </header>
 
             <div className="cursor-main-scroll" ref={mergeMainScrollRef}>
-              {selected?.kind === 'plan' && !planDetail ? (
-                <div className="cursor-catalog-empty">加载 Plan 工作流…</div>
-              ) : showPlanMain ? (
-                <>
-                  <PlanMainPanel
-                    slug={slug}
-                    planDetail={planDetail}
-                    busy={busy}
-                    onTaskSelect={handleWorkClick}
-                    onPlanConfirm={openPendingPlanConfirm}
-                    onPlanContinue={handlePlanContinue}
-                    onPlanStop={() => void handlePlanStop()}
-                    onPlanAbort={() => void handlePlanAbort()}
-                    onTaskStop={(taskId) => void handleTaskStop(taskId)}
-                    onTaskRun={(taskId) => void handleTaskRun(taskId)}
-                  />
-                  <section className="cursor-plan-chat">
-                    <header className="cursor-plan-chat-header">
-                      <h2 className="cursor-plan-chat-title">对话与修订</h2>
-                      <p className="cursor-plan-chat-hint">
-                        目标与修订说明在此；Planner 调研过程见右侧 Trace 面板
-                      </p>
-                      {showPendingPlanChip && (
-                        <button
-                          type="button"
-                          className="plan-confirm-summary-chip"
-                          onClick={openPendingPlanConfirm}
-                        >
-                          待确认计划
-                        </button>
-                      )}
-                      {latestPlanConfirm && !planConfirm && !showPendingPlanChip && (
-                        <PlanConfirmSummaryChip
-                          entry={latestPlanConfirm}
-                          onClick={() => setPlanConfirmReview(latestPlanConfirm)}
-                        />
-                      )}
-                    </header>
-                    <ChatThread
-                      messages={messages}
-                      liveTraceText={planChatTraceText}
-                      liveTraceSteps={planChatTraceSteps}
-                      streamText={streamText}
-                      liveThinking={thinkingText}
-                      busy={busy}
-                      historyLoading={historyLoading}
-                      traceMode={caps?.trace_mode}
-                      scrollRootRef={mainScrollElRef}
-                      slug={slug}
-                    />
-                  </section>
-                </>
-              ) : showWorkerMain ? (
-                <WorkerMainPanel
-                  planTitle={workerMeta.planTitle}
-                  taskId={workerMeta.taskId}
-                  taskTitle={workerMeta.title}
-                  taskStatus={workerMeta.status}
-                  taskReadonly={workerMeta.readonly}
-                  messages={messages}
-                  traceLines={workerTraceText}
-                  liveTraceSteps={workerLiveSteps}
-                  busy={busy || workerMeta.status === 'running'}
-                  scrollRootRef={mainScrollElRef}
-                  onBack={handleBackToPlan}
-                  onStop={() => void handleTaskStop(workerMeta.taskId)}
-                  onRun={() => void handleTaskRun(workerMeta.taskId)}
-                />
-              ) : (
-                <>
-                  {(showPendingSurveyChip || showPendingPlanChip || pendingTaskStepId) && (
-                    <div className="pending-confirm-bar">
-                      {showPendingSurveyChip && (
-                        <button
-                          type="button"
-                          className="plan-confirm-summary-chip"
-                          onClick={openPendingConfirm}
-                        >
-                          有待确认问卷{pendingConfirmCount > 1 ? ` (${pendingConfirmCount})` : ''}
-                        </button>
-                      )}
-                      {showPendingPlanChip && (
-                        <button
-                          type="button"
-                          className="plan-confirm-summary-chip"
-                          onClick={openPendingPlanConfirm}
-                        >
-                          待确认计划
-                        </button>
-                      )}
-                      {pendingTaskStepId && (
-                        <div className="pending-confirm-task-step">
-                          <span>Plan 等待继续执行 Work {pendingTaskStepId}</span>
-                          <button type="button" className="cursor-btn-primary" onClick={() => void handlePlanContinue()}>
-                            继续执行
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              taskStepDismissedRef.current = null;
-                              setTaskStepConfirm(pendingTaskStepId);
-                            }}
-                          >
-                            打开确认框
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                  <ChatThread
-                  messages={messages}
-                  liveTraceText={agentChatTraceText}
-                  liveTraceSteps={agentChatTraceSteps}
-                  liveTraceTurns={agentChatTraceTurns}
-                  streamText={streamText}
-                  liveThinking={thinkingText}
-                  busy={busy}
-                  historyLoading={historyLoading}
-                  traceMode={caps?.trace_mode}
-                  scrollRootRef={mainScrollElRef}
-                  slug={slug}
-                />
-                </>
-              )}
+              <ChatThread
+                messages={messages}
+                liveTraceText={agentChatTraceText}
+                liveTraceSteps={agentChatTraceSteps}
+                liveTraceTurns={agentChatTraceTurns}
+                streamText={streamText}
+                liveThinking={thinkingText}
+                busy={busy}
+                historyLoading={historyLoading}
+                traceMode={caps?.trace_mode}
+                scrollRootRef={mainScrollElRef}
+                slug={slug}
+              />
               <div ref={chatEndRef} />
             </div>
 
@@ -2546,8 +1770,6 @@ export default function ConsolePage() {
                 slug={slug}
                 mode={fileChangesConfig.mode}
                 sessionThreadId={fileChangesConfig.sessionThreadId}
-                planThreadId={fileChangesConfig.planThreadId}
-                taskId={fileChangesConfig.taskId}
                 busy={busy}
                 allowWrite={allowWrite}
                 onChangesUpdated={() => setFileChangesTick((n) => n + 1)}
@@ -2561,8 +1783,6 @@ export default function ConsolePage() {
                     slug,
                     mode: fileChangesConfig.mode,
                     sessionThreadId: fileChangesConfig.sessionThreadId,
-                    planThreadId: fileChangesConfig.planThreadId,
-                    taskId: fileChangesConfig.taskId,
                     refreshKey: fileChangesTick,
                     onChangesUpdated: () => setFileChangesTick((n) => n + 1),
                   }}
@@ -2575,9 +1795,7 @@ export default function ConsolePage() {
                   busy={busy}
                   disabled={busy}
                   slashCatalog={slashCatalog}
-                  placeholder={
-                    selected.kind === 'plan' ? 'Plan 目标或修订说明…' : 'Ask llgraph…'
-                  }
+                  placeholder="Ask llgraph…"
                 />
               ) : (
                 <ChatComposer
@@ -2590,16 +1808,10 @@ export default function ConsolePage() {
                   busy={busy}
                   disabled={busy}
                   slashCatalog={slashCatalog}
-                  placeholder={
-                    selected.kind === 'plan' ? 'Plan 目标或修订说明…' : 'Ask llgraph…'
-                  }
+                  placeholder="Ask llgraph…"
                 />
               )
-            ) : (
-              <div className="cursor-composer-wrap cursor-composer-readonly">
-                Worker 只读 trace · 由 Plan 自动执行
-              </div>
-            )}
+            ) : null}
           </>
         )}
       </main>
@@ -2637,10 +1849,8 @@ export default function ConsolePage() {
               traceSteps={displayPanelSteps}
               traceTurns={displayPanelTurns}
               liveThinking={thinkingText}
-              planDetail={selected.kind === 'plan' ? planDetail : null}
               slug={slug}
               threadId={selected.thread_id}
-              isPlan={selected.kind === 'plan'}
               isAgent={selected.kind === 'agent'}
               allowWrite={allowWrite}
               requestedTab={rightPanelRequestedTab}
@@ -2653,110 +1863,13 @@ export default function ConsolePage() {
                   setCaps((prev) => (prev ? { ...prev, trace_mode: r.mode } : prev));
                 });
               }}
-              onPlanConfirm={openPendingPlanConfirm}
-              onPlanContinue={handlePlanContinue}
               busy={busy}
               traceActivitySec={traceActivitySec}
               contextRefreshSignal={contextRefreshSignal}
-              onTaskSelect={handleWorkClick}
               onCapsLoaded={setCaps}
             />
           </div>
         </>
-      )}
-
-      {survey && slug && (
-        <SurveyDialog
-          survey={survey}
-          onCancel={() => {
-            if (slug && confirmThreadId) {
-              const head = peekConfirmHead(slug, confirmThreadId);
-              if (head?.kind === 'survey') {
-                dequeueConfirm(slug, confirmThreadId, head.id);
-                applyPendingConfirmHead(
-                  slug,
-                  confirmThreadId,
-                  { setSurvey, setPlanConfirm, setTaskStepConfirm },
-                );
-              }
-            }
-            surveyDismissedRef.current = null;
-            setSurvey(null);
-          }}
-          onSubmit={async (answers) => {
-            const head =
-              slug && confirmThreadId ? peekConfirmHead(slug, confirmThreadId) : null;
-            const surveyItemId = head?.kind === 'survey' ? head.id : null;
-            surveyDismissedRef.current = null;
-            try {
-              const { message } = await api.formatSurveyAnswers(slug, answers, allowWrite);
-              if (surveyItemId && confirmThreadId) {
-                dequeueConfirm(slug, confirmThreadId, surveyItemId);
-                applyPendingConfirmHead(
-                  slug,
-                  confirmThreadId,
-                  { setSurvey, setPlanConfirm, setTaskStepConfirm },
-                );
-              }
-              setSurvey(null);
-              if (selected?.kind === 'agent') {
-                void sendAgentMessage(selected, message);
-              } else if (selected?.kind === 'plan') {
-                void sendPlanMessage(selected, message);
-              }
-            } catch (err) {
-              if (surveyItemId && confirmThreadId && head?.kind === 'survey') {
-                setSurvey(head.payload as SurveySpec);
-              }
-              await alert(err instanceof Error ? err.message : String(err));
-            }
-          }}
-        />
-      )}
-
-      {taskStepConfirm && (
-        <TaskStepConfirmDialog
-          taskId={taskStepConfirm}
-          onDismiss={() => {
-            if (slug && confirmThreadId) {
-              const head = peekConfirmHead(slug, confirmThreadId);
-              if (head?.kind === 'task_step_confirm') {
-                dequeueConfirm(slug, confirmThreadId, head.id);
-                applyPendingConfirmHead(
-                  slug,
-                  confirmThreadId,
-                  { setSurvey, setPlanConfirm, setTaskStepConfirm },
-                );
-              }
-            }
-            taskStepDismissedRef.current = null;
-            setTaskStepConfirm(null);
-          }}
-          onContinue={() => {
-            setTaskStepConfirm(null);
-            void handlePlanContinue();
-          }}
-        />
-      )}
-
-      {planConfirm && (
-        <PlanConfirmDialog
-          payload={planConfirm}
-          onCancel={() => {
-            if (slug && confirmThreadId) {
-              clearConfirmQueue(slug, confirmThreadId, 'plan_confirm');
-            }
-            setPlanConfirm(null);
-          }}
-          onConfirm={handlePlanConfirm}
-        />
-      )}
-
-      {planConfirmReview && (
-        <PlanConfirmReviewDialog
-          entry={planConfirmReview}
-          onClose={() => setPlanConfirmReview(null)}
-        />
       )}
 
       {codeSearchOpen && slug && (

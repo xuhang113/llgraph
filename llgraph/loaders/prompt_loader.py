@@ -70,7 +70,6 @@ def compose_agent_system_prompt(
     thinking_payload: Any | None,
     web_search_enabled: bool,
     allow_write: bool,
-    survey_interactive_enabled: bool,
 ) -> str:
     """
     组装 Agent 主 system prompt。
@@ -141,13 +140,6 @@ def compose_agent_system_prompt(
     if web_search_enabled:
         dynamic_parts.append(render_prompt(str(tools.get("web_search_hint", "")), **vars_base))
 
-    if allow_write and survey_interactive_enabled:
-        survey = load_prompt_module("agent", "survey")
-        dynamic_parts.append(render_prompt(str(survey.get("interactive", "")), **vars_base))
-    elif allow_write:
-        survey = load_prompt_module("agent", "survey")
-        dynamic_parts.append(render_prompt(str(survey.get("disabled", "")), **vars_base))
-
     dynamic = "\n\n".join(p for p in dynamic_parts if p and p.strip())
 
     if dynamic:
@@ -197,37 +189,6 @@ def compose_search_order_hint(*, index_ready: bool) -> tuple[str, str]:
         )
 
     return tools_read.strip(), hint.strip()
-
-
-def compose_plan_planner_role(*, workspace: Path) -> str:
-    """Plan Planner 角色块。"""
-    data = load_prompt_module("plan", "planner")
-    return render_prompt(str(data.get("role", "")), workspace=str(workspace))
-
-
-def compose_plan_worker_role(
-    *,
-    task_title: str,
-    task_description: str,
-    path_globs: str,
-    mode: str,
-    write_hint: str,
-) -> str:
-    """Plan Worker 角色块。"""
-    data = load_prompt_module("plan", "worker")
-    return render_prompt(
-        str(data.get("role", "")),
-        task_title=task_title,
-        task_description=task_description,
-        path_globs=path_globs,
-        mode=mode,
-        write_hint=write_hint,
-    )
-
-
-def compose_plan_synthesize_system() -> str:
-    """Plan synthesize 节点 system 提示。"""
-    return prompt_text("plan", "synthesize", "system")
 
 
 def compose_thought_block_header(*, emit_plan_line: bool) -> str:

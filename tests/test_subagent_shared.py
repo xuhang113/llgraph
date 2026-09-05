@@ -17,9 +17,10 @@ def test_explore_profile_thread_suffix():
     assert prof.format_sub_thread("cli-abc", "a1b2") == "cli-abc:explore:a1b2"
 
 
-def test_worker_profile_thread_suffix():
+def test_unknown_profile_falls_back_to_general():
     prof = get_subagent_profile("worker")
-    assert prof.format_sub_thread("plan-xyz", "w1") == "plan-xyz:worker:w1"
+    assert prof.kind == "general"
+    assert prof.format_sub_thread("cli-xyz", "w1") == "cli-xyz:subagent:w1"
 
 
 def test_subagent_result_tool_output():

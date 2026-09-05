@@ -1,16 +1,8 @@
 import type { TreeNode } from '../../api/client';
 import { POST_STREAM_ACTIVE_MS } from './constants';
 
-/** plan-xxx:planner:v1 / plan-xxx:worker:w1 / cli-xxx:explore:id → 父 thread */
-export function planMainThreadFromSubThread(subThread: string): string {
-  const plannerIdx = subThread.indexOf(':planner:');
-  if (plannerIdx >= 0) {
-    return subThread.slice(0, plannerIdx);
-  }
-  const workerIdx = subThread.indexOf(':worker:');
-  if (workerIdx >= 0) {
-    return subThread.slice(0, workerIdx);
-  }
+/** cli-xxx:explore:id / cli-xxx:subagent:id → 父 thread */
+export function parentThreadFromSubThread(subThread: string): string {
   for (const marker of [':explore:', ':subagent:'] as const) {
     const idx = subThread.indexOf(marker);
     if (idx >= 0) {
@@ -30,16 +22,14 @@ export function shouldSuppressSessionTrace(
     return false;
   }
   if (selected) {
-    const main = planMainThreadFromSubThread(sessionThread);
+    const main = parentThreadFromSubThread(sessionThread);
     const viewing =
-      selected.thread_id === sessionThread ||
-      selected.thread_id === main ||
-      (selected.kind === 'worker' && selected.thread_id === sessionThread);
+      selected.thread_id === sessionThread || selected.thread_id === main;
     if (!viewing) {
       return false;
     }
   }
-  const candidates = [sessionThread, planMainThreadFromSubThread(sessionThread)];
+  const candidates = [sessionThread, parentThreadFromSubThread(sessionThread)];
   for (const key of candidates) {
     if (!activeStreams.has(key)) {
       continue;
@@ -52,11 +42,7 @@ export function shouldSuppressSessionTrace(
   return false;
 }
 
-export function isSubagentWorkerEvent(event: Record<string, unknown>): boolean {
-  return String(event.subgraph_kind || '') === 'worker';
-}
-
-/** Agent 内 spawn 的 explore / 通用 subagent（非 Plan worker） */
+/** Agent 内 spawn 的 explore / 通用 subagent */
 export function isExploreSubagentEvent(event: Record<string, unknown>): boolean {
   const kind = String(event.subgraph_kind || '');
   if (kind === 'explore' || kind === 'subagent') {
@@ -64,21 +50,4 @@ export function isExploreSubagentEvent(event: Record<string, unknown>): boolean 
   }
   const sub = String(event.sub_thread || '');
   return sub.includes(':explore:') || sub.includes(':subagent:');
-}
-
-export function isPlannerSubagentEvent(event: Record<string, unknown>): boolean {
-  return String(event.subgraph_kind || '') === 'planner';
-}
-
-export function eventMatchesWorkerTask(
-  event: Record<string, unknown>,
-  workerThread: string,
-  taskId: string,
-): boolean {
-  const sub = String(event.sub_thread || '');
-  if (sub && sub === workerThread) {
-    return true;
-  }
-  const tid = String(event.task_id || '');
-  return Boolean(tid && tid === taskId);
 }

@@ -16,7 +16,6 @@ from llgraph.core.llm_response import llm_response_text
 from llgraph.session.jsonl_read import open_jsonl_for_read
 from llgraph.session.session_meta import (
     _extract_human_content_from_jsonl_row,
-    _sync_plan_json_title_after_auto,
     extract_user_body_for_title,
     get_session_title,
     is_weak_auto_session_title,
@@ -167,7 +166,6 @@ def maybe_refresh_session_title_with_llm(
     ok, _ = set_session_title(workspace, thread_id, title, source="auto")
     if not ok:
         return None
-    _sync_plan_json_title_after_auto(workspace, thread_id, title)
     save_session_meta(workspace, thread_id, {"title_llm_refreshed": True})
     return get_session_title(workspace, thread_id)
 

@@ -8,20 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from llgraph.plan.plan_registry import discover_plan_sessions
-from llgraph.plan.plan_phase_resolve import resolve_plan_phase
-from llgraph.plan.plan_store import load_plan, load_task_result, pick_richer_plan
-from llgraph.plan.config import resolve_plan_settings
-from llgraph.plan.state import PlanPhase
-from llgraph.plan.workflow_view import GRAPH_DEFINITION, build_workflow_snapshot
-from llgraph.core.llm_response import normalize_stored_llm_text
-from llgraph.session.session_meta import load_session_meta
 from llgraph.session.session_registry import discover_sessions
-from llgraph.session.user_storage import (
-    session_edits_path,
-    session_messages_path,
-    session_thread_dir,
-)
+from llgraph.session.user_storage import session_edits_path
 
 
 def _mtime_iso(path: Path) -> str | None:
@@ -295,189 +283,6 @@ def list_edits(workspace: Path, thread_id: str) -> list[dict[str, Any]]:
     return rows
 
 
-def _plan_task_ids(plan: dict[str, Any]) -> set[str]:
-    tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
-    return {str(t.get("id")) for t in tasks if isinstance(t, dict) and t.get("id")}
-
-
-def _snapshot_task_ids(snapshot: dict[str, Any]) -> set[str]:
-    tasks = snapshot.get("tasks") if isinstance(snapshot.get("tasks"), list) else []
-    return {str(t.get("id")) for t in tasks if isinstance(t, dict) and t.get("id")}
-
-
-def _phase_rank(phase: str) -> int:
-    from llgraph.plan.plan_phase_resolve import _phase_rank as _rank
-
-    return _rank(phase)
-
-
-def _task_statuses(plan: dict[str, Any]) -> list[str]:
-    from llgraph.plan.plan_phase_resolve import task_statuses
-
-    return task_statuses(plan)
-
-
-def _resolve_plan_phase(
-    *,
-    plan_state: dict[str, Any],
-    meta: dict[str, Any],
-    plan: dict[str, Any],
-) -> str:
-    return resolve_plan_phase(plan_state=plan_state, meta=meta, plan=plan)
-
-
-def _snapshot_task_status_stale(snapshot: dict[str, Any], plan: dict[str, Any]) -> bool:
-    """snapshot 内 task status 与 plan.json 不一致。"""
-    snap_tasks = snapshot.get("tasks") if isinstance(snapshot.get("tasks"), list) else []
-    snap_by_id = {
-        str(t.get("id")): str(t.get("status") or "")
-        for t in snap_tasks
-        if isinstance(t, dict) and t.get("id")
-    }
-    for task in plan.get("tasks") or []:
-        if not isinstance(task, dict):
-            continue
-        tid = str(task.get("id") or "")
-        if not tid:
-            continue
-        if snap_by_id.get(tid) != str(task.get("status") or ""):
-            return True
-    return False
-
-
-def _workflow_current_node(plan_state: dict[str, Any], *, phase: str) -> str | None:
-    if phase == PlanPhase.COMPLETED:
-        return None
-    ws = plan_state.get("workflow_snapshot")
-    if isinstance(ws, dict) and ws.get("current_node"):
-        return str(ws.get("current_node"))
-    return None
-
-
-def _snapshot_node_status_stale(snapshot: dict[str, Any], phase: str) -> bool:
-    """completed 但 synthesize 仍 running 的旧 snapshot（汇总完成后未刷新节点态）。"""
-    if phase != PlanPhase.COMPLETED:
-        return False
-    for node in snapshot.get("nodes") or []:
-        if not isinstance(node, dict):
-            continue
-        if node.get("id") == "synthesize" and str(node.get("status") or "") == "running":
-            return True
-    return False
-
-
-def load_plan_detail(workspace: Path, thread_id: str) -> dict[str, Any]:
-    """
-    加载 Plan 详情（plan_state + plan.json + workflow）。
-
-    @param workspace 工作区根
-    @param thread_id plan-* thread
-    @return 详情 dict
-    """
-    settings = resolve_plan_settings(workspace)
-    thread_dir = session_thread_dir(workspace, thread_id)
-    plan_state = read_json_file(thread_dir / "plan_state.json") or {}
-    meta = load_session_meta(workspace, thread_id)
-    plan_id = str(plan_state.get("plan_id") or meta.get("plan_id") or "")
-
-    plan_inline = plan_state.get("plan") if isinstance(plan_state.get("plan"), dict) else None
-    plan_file = load_plan(workspace, plan_id, plans_dir=settings.plans_dir) if plan_id else None
-    plan = pick_richer_plan(plan_file, plan_inline)
-    phase = _resolve_plan_phase(plan_state=plan_state, meta=meta, plan=plan)
-
-    snapshot = plan_state.get("workflow_snapshot")
-    stale_snapshot = (
-        isinstance(snapshot, dict)
-        and snapshot
-        and _snapshot_task_ids(snapshot) != _plan_task_ids(plan)
-    )
-    phase_stale = isinstance(snapshot, dict) and snapshot and str(snapshot.get("phase") or "") != phase
-    node_stale = isinstance(snapshot, dict) and snapshot and _snapshot_node_status_stale(snapshot, phase)
-    task_stale = isinstance(snapshot, dict) and snapshot and _snapshot_task_status_stale(snapshot, plan)
-    if (
-        not isinstance(snapshot, dict)
-        or not snapshot
-        or stale_snapshot
-        or phase_stale
-        or node_stale
-        or task_stale
-    ):
-        ws = plan_state.get("workflow_snapshot") if isinstance(plan_state.get("workflow_snapshot"), dict) else {}
-        snapshot = build_workflow_snapshot(
-            thread_id=thread_id,
-            phase=phase,
-            plan=plan,
-            current_node=_workflow_current_node(plan_state, phase=phase),
-            current_task_id=plan_state.get("current_task_id") or ws.get("current_task_id"),
-        )
-    elif "graph_definition" not in snapshot:
-        snapshot = {**snapshot, "graph_definition": GRAPH_DEFINITION}
-
-    tasks = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
-    raw_report = plan_state.get("final_report")
-    final_report = None
-    if phase == PlanPhase.COMPLETED and raw_report:
-        final_report = normalize_stored_llm_text(raw_report)
-    return {
-        "thread_id": thread_id,
-        "plan_id": plan_id,
-        "title": str(plan.get("title") or meta.get("title") or thread_id),
-        "goal": str(plan.get("goal") or ""),
-        "phase": phase,
-        "plan": plan,
-        "plan_state": plan_state,
-        "workflow_snapshot": snapshot,
-        "final_report": final_report,
-        "error": plan_state.get("error"),
-        "tasks": tasks,
-        "meta": meta,
-        "updated_at": _mtime_iso(thread_dir / "plan_state.json"),
-    }
-
-
-def load_worker_detail(
-    workspace: Path,
-    thread_id: str,
-    task_id: str,
-) -> dict[str, Any]:
-    """
-    加载 Worker 任务详情。
-
-    @param workspace 工作区根
-    @param thread_id plan thread
-    @param task_id 如 w1
-    @return Worker 详情
-    """
-    settings = resolve_plan_settings(workspace)
-    detail = load_plan_detail(workspace, thread_id)
-    plan_id = detail["plan_id"]
-    result = load_task_result(workspace, plan_id, task_id, plans_dir=settings.plans_dir) if plan_id else None
-
-    subgraph_path = session_thread_dir(workspace, thread_id) / "subgraphs" / task_id / "messages.jsonl"
-    messages, msg_total = read_jsonl_lines(subgraph_path, offset=0, limit=200)
-    simplified = [simplify_message(m) for m in messages]
-
-    worker_thread = f"{thread_id}:worker:{task_id}"
-    edits = list_edits(workspace, worker_thread)
-
-    task_info: dict[str, Any] = {}
-    for t in detail.get("tasks") or []:
-        if isinstance(t, dict) and str(t.get("id")) == task_id:
-            task_info = t
-            break
-
-    return {
-        "thread_id": thread_id,
-        "task_id": task_id,
-        "worker_thread_id": worker_thread,
-        "task": task_info,
-        "result": result,
-        "messages": simplified,
-        "message_total": msg_total,
-        "edits": edits,
-    }
-
-
 def workspace_sessions_payload(workspace: Path) -> dict[str, Any]:
     """
     工作区下 Agent 会话列表。
@@ -488,19 +293,6 @@ def workspace_sessions_payload(workspace: Path) -> dict[str, Any]:
     sessions = discover_sessions(workspace)
     return {
         "sessions": [asdict(s) for s in sessions],
-    }
-
-
-def workspace_plans_payload(workspace: Path) -> dict[str, Any]:
-    """
-    工作区下 Plan 列表。
-
-    @param workspace 工作区根
-    @return plans 列表
-    """
-    plans = discover_plan_sessions(workspace)
-    return {
-        "plans": [asdict(p) for p in plans],
     }
 
 
@@ -570,13 +362,12 @@ def _agent_subagent_children(workspace: Path, thread_id: str) -> list[dict[str, 
 
 def build_session_tree(workspace: Path) -> dict[str, Any]:
     """
-    构建工作区会话树（Agent + Plan + Worker / Subagent 子节点）。
+    构建工作区会话树（Agent + Subagent 子节点）。
 
     @param workspace 工作区根
     @return 树形结构
     """
     agents = discover_sessions(workspace)
-    plans = discover_plan_sessions(workspace)
     agent_nodes = [
         {
             "kind": "agent",
@@ -588,30 +379,5 @@ def build_session_tree(workspace: Path) -> dict[str, Any]:
         }
         for s in agents
     ]
-    plan_nodes: list[dict[str, Any]] = []
-    for p in plans:
-        children = [
-            {
-                "kind": "worker",
-                "thread_id": f"{p.thread_id}:worker:{t.id}",
-                "task_id": t.id,
-                "title": t.title,
-                "status": t.status,
-                "children": [],
-            }
-            for t in p.task_stubs
-        ]
-        plan_nodes.append(
-            {
-                "kind": "plan",
-                "thread_id": p.thread_id,
-                "plan_id": p.plan_id,
-                "title": p.title,
-                "title_full": p.title,
-                "phase": p.phase,
-                "updated_at": p.updated_at,
-                "children": children,
-            }
-        )
-    return {"agents": agent_nodes, "plans": plan_nodes}
+    return {"agents": agent_nodes}
 

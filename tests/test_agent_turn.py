@@ -92,36 +92,3 @@ def test_thinking_only_exhausted_steps_goes_fallback() -> None:
     assert route_after_agent(state) == "turn_fallback"
 
 
-def test_planner_visible_json_ends_turn() -> None:
-    from llgraph.plan.subgraphs.routing import planner_deliverable_complete
-
-    plan_json = (
-        '{"title": "T", "tasks": [{"id": "w1", "title": "a"}, {"id": "w2", "title": "b"}]}'
-    )
-    msg = AIMessage(
-        content=[{"type": "text", "text": f"```json\n{plan_json}\n```"}],
-    )
-    state = {"messages": [HumanMessage(content="hi"), msg], "remaining_steps": 2}
-    assert planner_deliverable_complete(msg)
-    assert route_after_agent(state, complete_on_thinking_if=planner_deliverable_complete) == "__end__"
-
-
-def test_planner_thinking_json_does_not_end_turn() -> None:
-    from llgraph.plan.subgraphs.routing import planner_deliverable_complete
-
-    plan_json = (
-        '{"title": "T", "tasks": [{"id": "w1", "title": "a"}, {"id": "w2", "title": "b"}]}'
-    )
-    msg = AIMessage(content=[{"type": "thinking", "thinking": f"plan:\n```json\n{plan_json}\n```"}])
-    state = {"messages": [HumanMessage(content="hi"), msg], "remaining_steps": 10}
-    assert not planner_deliverable_complete(msg)
-    assert route_after_agent(state, complete_on_thinking_if=planner_deliverable_complete) == "think_nudge"
-
-
-def test_planner_thinking_without_json_still_loops() -> None:
-    from llgraph.plan.subgraphs.routing import planner_deliverable_complete
-
-    msg = AIMessage(content=[{"type": "thinking", "thinking": "还在调研，没有 JSON"}])
-    state = {"messages": [HumanMessage(content="hi"), msg], "remaining_steps": 10}
-    assert not planner_deliverable_complete(msg)
-    assert route_after_agent(state, complete_on_thinking_if=planner_deliverable_complete) == "think_nudge"

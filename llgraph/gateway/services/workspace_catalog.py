@@ -80,23 +80,20 @@ def _recent_sort_key(marker_data: dict, session_updated: str | None) -> str:
 def _workspace_record(ctx_dir: Path, slug: str, ws_path: str) -> WorkspaceRecord:
     sessions_dir = ctx_dir / "sessions"
     session_count = 0
-    plan_count = 0
     latest: str | None = None
     if sessions_dir.is_dir():
         for sess in sessions_dir.iterdir():
             if not sess.is_dir():
                 continue
             session_count += 1
-            if sess.name.startswith("plan-"):
-                plan_count += 1
-            mtime = _mtime_iso(sess / "plan_state.json") or _mtime_iso(sess / "messages.jsonl")
+            mtime = _mtime_iso(sess / "messages.jsonl")
             if mtime and (latest is None or mtime > latest):
                 latest = mtime
     return WorkspaceRecord(
         slug=slug,
         path=ws_path,
         session_count=session_count,
-        plan_count=plan_count,
+        plan_count=0,
         updated_at=latest,
     )
 

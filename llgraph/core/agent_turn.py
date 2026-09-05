@@ -18,8 +18,8 @@ FALLBACK_INCOMPLETE_TURN = (
 
 THINK_CONTINUE_NUDGE = (
     "[系统] 你上一轮仅在 thinking/reasoning 中推理，未输出用户可见的正文 text。"
-    "请基于已有思考，在本轮助手消息的 **正文 text** 中给出完整答复"
-    "（Plan 模式须在正文输出 JSON 代码块）。勿再次 thinking-only 结束。"
+    "请基于已有思考，在本轮助手消息的 **正文 text** 中给出完整答复。"
+    "勿再次 thinking-only 结束。"
 )
 
 RouteAfterAgent = Literal[

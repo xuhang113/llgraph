@@ -72,16 +72,10 @@ def build_subagent_system_prompt(
     allow_write: bool,
 ) -> str:
     """Agent 工具规范 + 角色块。"""
-    from llgraph.config.survey_settings import survey_interactive_enabled
-
     base = build_system_prompt(
         runtime.workspace,
         allow_write=allow_write,
         web_search_enabled=runtime.web_search_enabled,
-        survey_interactive_enabled=survey_interactive_enabled(
-            runtime.workspace,
-            runtime.context_session,
-        ),
     )
     if runtime.sandbox_policy is not None and runtime.sandbox_policy.enabled:
         from llgraph.config.sandbox_settings import format_sandbox_config_hint
@@ -92,26 +86,6 @@ def build_subagent_system_prompt(
             f"{format_sandbox_config_hint(runtime.workspace)}"
         )
     return f"{base}{role_block}"
-
-
-def _parse_worker_like_summary(raw: str) -> tuple[str, str, list[str]]:
-    """尝试从 worker JSON 抽取 summary/status/files_changed。"""
-    from llgraph.plan.nodes.planner import _extract_plan_json_raw
-
-    blob = _extract_plan_json_raw(raw or "")
-    if not blob.strip():
-        return (raw or "").strip(), "ok", []
-    try:
-        data = json.loads(blob)
-    except json.JSONDecodeError:
-        return (raw or "").strip(), "ok", []
-    if not isinstance(data, dict):
-        return (raw or "").strip(), "ok", []
-    summary = str(data.get("summary") or "").strip() or (raw or "").strip()
-    status = str(data.get("status") or "ok").strip() or "ok"
-    files = data.get("files_changed")
-    paths = [str(p) for p in files] if isinstance(files, list) else []
-    return summary, status, paths
 
 
 def run_subagent(
@@ -132,7 +106,7 @@ def run_subagent(
     启动一轮隔离子 Agent，返回摘要级结果。
 
     @param parent 父运行时（未 fork）
-    @param kind explore | worker | planner | general
+    @param kind explore | general
     @param user_prompt 指派任务（完整上下文由调用方写入 prompt）
     @param sub_id 子 id；空则自动生成
     @param role_block 覆盖 Profile 角色块
@@ -223,7 +197,7 @@ def run_subagent(
         system_prompt,
         workspace=child.workspace,
         thread_key=sub_thread,
-        subgraph_kind=prof.kind if prof.kind in ("planner", "worker") else None,
+        subgraph_kind=None,
     )
 
     try:
@@ -243,17 +217,11 @@ def run_subagent(
         status = "failed"
 
     messages = collect_subgraph_messages(subgraph, sub_thread)
-    if prof.kind in ("planner", "worker") and not (raw or "").strip():
-        raw = extract_subagent_result_text(messages, subgraph_kind=prof.kind)
+    if not (raw or "").strip():
+        raw = extract_subagent_result_text(messages, subgraph_kind=None)
 
     summary = (raw or "").strip()
     files_changed = edit_tracker.unique_paths() if edit_tracker is not None else []
-    if prof.kind == "worker":
-        summary, parsed_status, parsed_files = _parse_worker_like_summary(raw or "")
-        if parsed_status:
-            status = parsed_status
-        if parsed_files:
-            files_changed = parsed_files
 
     register_subagent_child(
         parent.workspace,

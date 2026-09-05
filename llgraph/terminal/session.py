@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,7 +11,7 @@ from llgraph.session.session_edits import SessionEditTracker
 from llgraph.display.trace_display import TraceSession
 from llgraph.terminal.banner import print_terminal_session_banner
 from llgraph.terminal.keys import MSG_GOODBYE, MSG_INTERRUPT_EXIT, is_exit_command
-from llgraph.terminal.output import emit, emit_error, emit_milestone, emit_ok, emit_warn, write_dialog_line
+from llgraph.terminal.output import emit, emit_error, emit_ok, emit_warn
 from llgraph.display.trace_sink import StdoutTraceSink
 from llgraph.core.write_failure_tracker import WriteFailureTracker
 
@@ -140,47 +139,6 @@ def _handle_meta(params: TerminalSessionParams, text: str, *, last_user: str) ->
     )
 
 
-def _maybe_survey_followup(
-    params: TerminalSessionParams,
-    assistant_text: str,
-    *,
-    raw_assistant_text: str | None = None,
-) -> None:
-    """
-    问卷确认后自动续聊。
-
-    @param params 会话参数
-    @param assistant_text 展示用助手回复
-    @param raw_assistant_text 含 survey 块的原文（解析用）
-    """
-    from llgraph.survey.survey_prompt import resolve_survey_from_assistant, try_run_survey_followup
-    from llgraph.config.survey_settings import survey_followup_enabled
-
-    if not survey_followup_enabled(params.workspace, params.context_session):
-        return
-    parse_text = (raw_assistant_text or assistant_text or "").strip()
-    if not parse_text:
-        return
-    if resolve_survey_from_assistant(parse_text) is None:
-        return
-    emit_milestone("检测到确认问卷，请在下方菜单中选择（Esc 取消）…")
-    allow_write = (
-        params.agent_session.allow_write
-        if params.agent_session is not None
-        else params.allow_write
-    )
-    followup = try_run_survey_followup(
-        parse_text,
-        workspace=params.workspace,
-        context_session=params.context_session,
-        allow_write=allow_write,
-    )
-    if not followup:
-        return
-    emit_milestone("正在将确认结果提交给 Agent…")
-    _run_turn(params, followup)
-
-
 def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
     """
     处理一条用户输入。
@@ -217,11 +175,6 @@ def _process_user_message(params: TerminalSessionParams, text: str) -> bool:
         return True
     if params.agent_session is not None:
         params.agent = params.agent_session.agent
-    _maybe_survey_followup(
-        params,
-        reply,
-        raw_assistant_text=params.trace_session.last_turn_raw_reply or reply,
-    )
     return True
 
 

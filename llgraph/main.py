@@ -74,20 +74,14 @@ def _run_interactive(
     sandbox_cli_enabled: bool | None = None,
     no_spill: bool = False,
 ) -> None:
-    """交互会话（经典终端，支持与 Plan 模式切换）。"""
-    from llgraph.terminal.mode_loop import AgentPlanLoopContext, run_agent_plan_loop
-    from llgraph.terminal.session import TerminalSessionParams
+    """交互会话（经典终端）。"""
+    from llgraph.terminal.session import TerminalSessionParams, run_terminal_session
 
     if agent_session is None:
         raise RuntimeError("交互模式需要 agent_session")
 
-    session_hints: dict[str, str | None] = {
-        "opening": opening_message,
-        "resume": resume_hint or None,
-    }
-
-    def terminal_params_factory() -> TerminalSessionParams:
-        params = TerminalSessionParams(
+    run_terminal_session(
+        TerminalSessionParams(
             agent=agent_session.agent,
             workspace=workspace,
             thread_id=agent_session.thread_id,
@@ -100,31 +94,9 @@ def _run_interactive(
             watch_active=watch_active,
             web_search_enabled=web_search_enabled,
             mcp_summary=mcp_summary,
-            resume_hint=session_hints.get("resume") or "",
+            resume_hint=resume_hint or "",
             memory_kind=memory_kind,
-            opening_message=session_hints.get("opening"),
-        )
-        session_hints["opening"] = None
-        session_hints["resume"] = None
-        return params
-
-    run_agent_plan_loop(
-        AgentPlanLoopContext(
-            workspace=workspace,
-            agent_session=agent_session,
-            terminal_params_factory=terminal_params_factory,
-            session_hints=session_hints,
-            plan_common={
-                "trace_session": trace_session,
-                "context_session": context_session,
-                "allow_write": allow_write,
-                "mcp_tools": mcp_tools or [],
-                "sandbox_policy": sandbox_policy,
-                "web_search_enabled": web_search_enabled,
-                "watch_active": watch_active,
-                "mcp_summary": mcp_summary,
-                "memory_kind": memory_kind,
-            },
+            opening_message=opening_message,
         )
     )
 
@@ -145,11 +117,6 @@ def main() -> None:
         from llgraph.cli.search_cli import main as search_main
 
         search_main(sys.argv[2:])
-        return
-    if len(sys.argv) >= 2 and sys.argv[1] == "plan":
-        from llgraph.cli.plan_cli import main as plan_main
-
-        plan_main(sys.argv[2:])
         return
 
     parser = argparse.ArgumentParser(
@@ -187,7 +154,7 @@ def main() -> None:
         "--delete-session",
         default=None,
         metavar="ID",
-        help="删除指定 thread_id 会话落盘后退出（cli-* 或 plan-*，Plan 含 Worker 级联）",
+        help="删除指定 thread_id 会话落盘后退出（cli-*）",
     )
     parser.add_argument(
         "--purge-sessions",
@@ -275,11 +242,6 @@ def main() -> None:
         "--log-console",
         action="store_true",
         help="将向量检索 [vector] 日志同时输出到终端 stderr",
-    )
-    parser.add_argument(
-        "--no-survey",
-        action="store_true",
-        help="禁用交互式 survey（助手 followup 确认/写前弹窗；适合长期非交互 Agent）",
     )
     parser.add_argument(
         "--model",
@@ -373,12 +335,6 @@ def main() -> None:
             file=sys.stderr,
             flush=True,
         )
-
-    if args.no_survey:
-        from llgraph.config.survey_settings import set_survey_cli_disabled
-
-        set_survey_cli_disabled(True)
-        print("[llgraph] Survey 交互已禁用（--no-survey）", file=sys.stderr, flush=True)
 
     if args.init_config or args.init_config_force:
         try:

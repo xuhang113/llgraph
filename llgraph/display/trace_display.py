@@ -15,7 +15,6 @@ from llgraph.core.tool_invoke_timing import read_tool_message_elapsed
 from llgraph.display.assistant_content import AssistantTurnContent, build_assistant_turn_content
 from llgraph.display.execution_log import _usage_dict_from_mapping
 from llgraph.session.session_run_log import UserCancelledError
-from llgraph.survey.survey_prompt import strip_survey_for_display
 
 DEFAULT_PREVIEW_LINES = 4
 STEP_INLINE_PREVIEW_LINES = 3
@@ -712,9 +711,6 @@ class TurnTracePrinter:
         self._tool_names: list[str] = []
         self._steps: list[TraceStepRecord] = []
         self._pending_usage: StepUsage | None = None
-        from llgraph.survey.survey_prompt import SurveyStreamFilter
-
-        self._survey_filter = SurveyStreamFilter()
         self._stream_open = False
 
     def _line(self, text: str = "") -> None:
@@ -1112,7 +1108,6 @@ class TurnTracePrinter:
         workspace: Path | None = None,
         context_session: Any | None = None,
     ) -> None:
-        self._survey_filter.reset()
         if self._session.is_silent():
             return
         if self._session.mode == TraceMode.REPLY:
@@ -1335,8 +1330,7 @@ class TurnTracePrinter:
         elapsed = time.perf_counter() - self._step_start
         self._printed_final_header = True
         self._streamed_reply = True
-        self._survey_filter.reset()
-        visible = self._survey_filter.feed(cleaned)
+        visible = cleaned
         if not visible.strip():
             visible = cleaned.strip()
         if not visible:
@@ -1380,7 +1374,7 @@ class TurnTracePrinter:
         """
         输出助手正文（Rich/ANSI 渲染后经 _trace_line，与步骤摘要同路径）。
 
-        @param text 过滤 survey 后的正文
+        @param text 助手正文
         """
         if not text.strip():
             return
@@ -1441,7 +1435,7 @@ class TurnTracePrinter:
         # steps 折叠：trace 侧栏仍等整段再注册步骤；Web 主聊天通过 stream_delta 流式展示
         if self._session.shows_process() and not self._session.is_verbose():
             self._final_text += chunk_text
-            visible = self._survey_filter.feed(chunk_text)
+            visible = chunk_text
             if visible and web_stream:
                 if not _user_visible_reply_text(visible):
                     return
@@ -1465,7 +1459,7 @@ class TurnTracePrinter:
             self._printed_final_header = True
         self._streamed_reply = True
         self._final_text += chunk_text
-        visible = self._survey_filter.feed(chunk_text)
+        visible = chunk_text
         if visible:
             if not _user_visible_reply_text(visible):
                 return
@@ -1484,9 +1478,6 @@ class TurnTracePrinter:
 
         if not self._session.is_silent():
             if self._printed_final_header:
-                tail = self._survey_filter.flush()
-                if tail and not self._reply_body_printed:
-                    self._print_reply_body(tail)
                 self._stream_end()
             if not self._reply_body_printed and self._final_text.strip():
                 body = _user_visible_reply_text(self._final_text)

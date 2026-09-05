@@ -7,8 +7,6 @@ interface FileChangesProps {
   slug: string;
   mode: FileChangesMode;
   sessionThreadId: string;
-  planThreadId?: string;
-  taskId?: string;
   refreshKey?: number;
   onChangesUpdated?: () => void;
 }
@@ -50,8 +48,6 @@ export default function ComposerDock({
             slug={fileChanges.slug}
             mode={fileChanges.mode}
             sessionThreadId={fileChanges.sessionThreadId}
-            planThreadId={fileChanges.planThreadId}
-            taskId={fileChanges.taskId}
             busy={busy}
             onStop={onStop}
             onChangesUpdated={fileChanges.onChangesUpdated}

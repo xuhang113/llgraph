@@ -42,7 +42,6 @@ llgraph 交互帮助
   /help              本帮助（完整说明: /help full）
   /help deps         可选 pip 依赖：已装/缺失与安装命令
   /paste, /p         多行粘贴（--- 或连按两次回车结束）
-  /plan run [补充]   Agent 聊好后进 Plan（附带会话摘录）；/plan list | /plan switch <id>
   /session           Agent 会话（/session use|new|title|delete|current）
   /sessions          列出 Agent 会话
   exit               退出
@@ -64,7 +63,6 @@ llgraph 交互帮助
   /watch on|off      索引文件监听
   /model [名|reset|refresh]
   /config            agent.json 路径
-  /survey off|on|status
 
 【规则与技能】
   /rule [on|off <id>]
@@ -84,7 +82,7 @@ llgraph 交互帮助
   {mcp_line}
   依赖: {deps_hint}
 
-详情: /plan  /session  /trace  /log  |  完整帮助: /help full
+详情: /session  /trace  /log  |  完整帮助: /help full
 """
     emit_report(text.strip())
 
@@ -118,14 +116,12 @@ llgraph 完整帮助
 
   /help, help, ?     精简帮助；/help full 本页；/help deps 可选依赖
   /paste, /p         多行粘贴模式
-  /plan              Plan 规划（/plan help）；Agent 内 /plan [目标] 进入
   /trace             过程展示说明（/trace all|steps|reply|none|step|token|stats）
   /log               向量检索日志与执行日志
   /context           上下文分项占用
   /tools             内置工具与 MCP
   /todos             本会话任务清单
   /config            agent.json 配置路径
-  /survey            followup 开关
   /sessions          列出 Agent 会话
   /session           会话切换与子命令（/session 查看详情）
   /model             模型列表与切换
@@ -153,7 +149,6 @@ llgraph 完整帮助
 【启动参数】
   llgraph -C <目录> -w --model <名> --trace all|steps|reply|none
   llgraph --list-sessions -C .   列出 Agent 会话
-  llgraph plan --list-plans      列出 Plan 会话
   llgraph index / search         索引与检索调试
 
 【Rule / Skill 目录】
@@ -165,7 +160,6 @@ llgraph 完整帮助
   ~/.llgraph/context/<工作区>/sessions/<thread_id>/messages.jsonl
   llgraph -C <工作区> --thread-id cli-xxx
   会话内: /session use <id>  |  /session new
-  Plan: /plan switch plan-xxx  |  llgraph plan --thread-id plan-xxx
 """
     emit_report(text.strip())
 

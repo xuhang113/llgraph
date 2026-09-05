@@ -109,7 +109,7 @@ def emit_block(
     render_markdown: bool = False,
 ) -> None:
     """
-    输出多行报告块（/help、/plan results 等元命令；默认仅分色，不 Rich）。
+    输出多行报告块（/help 等元命令；默认仅分色，不 Rich）。
 
     @param text 多行 Markdown/纯文本原文
     @param colorize 是否套用 terminal_theme 分色

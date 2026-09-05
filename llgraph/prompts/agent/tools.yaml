@@ -1,10 +1,10 @@
 # 工具使用
 
 tools_read_indexed: |
-  list_directory、glob_files、grep_files、search_code_parallel、search_code_semantic、search_workspace、read_file、read_files、search_session_history、manage_memory、search_memory、todo_write、run_shell_command、await_shell、get_current_utc_time、spawn_subagent、query_plans
+  list_directory、glob_files、grep_files、search_code_parallel、search_code_semantic、search_workspace、read_file、read_files、search_session_history、manage_memory、search_memory、todo_write、run_shell_command、await_shell、get_current_utc_time、spawn_subagent
 
 tools_read_no_index: |
-  list_directory、glob_files、grep_files、search_workspace、search_files、read_file、read_files、search_session_history、manage_memory、search_memory、todo_write、run_shell_command、await_shell、get_current_utc_time、spawn_subagent、query_plans
+  list_directory、glob_files、grep_files、search_workspace、search_files、read_file、read_files、search_session_history、manage_memory、search_memory、todo_write、run_shell_command、await_shell、get_current_utc_time、spawn_subagent
 
 tool_selection_summary: |
   # 使用工具

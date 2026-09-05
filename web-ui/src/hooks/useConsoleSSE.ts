@@ -1,10 +1,5 @@
 import type { Dispatch, MutableRefObject, SetStateAction } from 'react';
-import {
-  api,
-  type PlanDetail,
-  type SurveySpec,
-  type TreeNode,
-} from '../api/client';
+import { type TreeNode } from '../api/client';
 import type { ChatMessage } from '../components/console/ChatThread';
 import type { TraceStep } from '../types/trace';
 import {
@@ -23,9 +18,7 @@ import {
   preferRicherAgentChat,
 } from '../utils/fetchEnrichedAgentChat';
 import { clearPendingUserMessage } from '../utils/pendingUserMessage';
-import { buildPlanChatMessages } from '../utils/planChat';
 import type { TraceLine } from '../pages/console/types';
-import { planExecutionAllowWrite } from '../pages/console/planHelpers';
 import {
   appendPanelTraceTurn,
   pushCompletedTraceTurn,
@@ -38,62 +31,7 @@ import {
   releaseTurnOpen,
   traceLineSeenInCurrentTurn,
 } from '../pages/console/traceUtils';
-import { parseWorkerMessages } from '../pages/console/workerUtils';
-import {
-  eventMatchesWorkerTask,
-  isExploreSubagentEvent,
-  isPlannerSubagentEvent,
-  isSubagentWorkerEvent,
-} from '../pages/console/sseHelpers';
-import {
-  applyPendingConfirmHead,
-  ingestPlanConfirmPayload,
-  ingestSurveyConfirm,
-  ingestTaskStepConfirm,
-} from '../utils/pendingConfirmUi';
-
-function resolvePlanThreadForEvent(
-  sel: TreeNode | null,
-  eventThread: string,
-  workerView: boolean,
-  workerPlanThread: string,
-): string {
-  if (sel?.kind === 'plan') {
-    return sel.thread_id;
-  }
-  if (workerView && workerPlanThread) {
-    return workerPlanThread;
-  }
-  if (
-    eventThread.startsWith('plan-')
-    && !eventThread.includes(':planner:')
-    && !eventThread.includes(':worker:')
-  ) {
-    return eventThread;
-  }
-  return eventThread;
-}
-
-function selectionMatchesConfirmThread(
-  sel: TreeNode | null,
-  confirmThread: string,
-  eventThread: string,
-  workerPlanThread: string,
-): boolean {
-  if (!sel) {
-    return false;
-  }
-  if (sel.kind === 'agent') {
-    return sel.thread_id === confirmThread || sel.thread_id === eventThread;
-  }
-  if (sel.kind === 'plan') {
-    return sel.thread_id === confirmThread;
-  }
-  if (sel.kind === 'worker') {
-    return workerPlanThread === confirmThread;
-  }
-  return false;
-}
+import { isExploreSubagentEvent } from '../pages/console/sseHelpers';
 
 export type ConsoleSSEDeps = {
   slug: string;
@@ -109,8 +47,6 @@ export type ConsoleSSEDeps = {
   panelTraceTurnsRef: MutableRefObject<import('../types/trace').TraceTurn[]>;
   traceLinesRef: MutableRefObject<TraceLine[]>;
   traceStepsRef: MutableRefObject<TraceStep[]>;
-  surveyDismissedRef: MutableRefObject<string | null>;
-  taskStepDismissedRef: MutableRefObject<string | null>;
   traceTurnStartRef: MutableRefObject<number>;
   streamedRef: MutableRefObject<boolean>;
   traceFlushedRef: MutableRefObject<boolean>;
@@ -125,14 +61,7 @@ export type ConsoleSSEDeps = {
   setPanelTraceTurns: Dispatch<SetStateAction<import('../types/trace').TraceTurn[]>>;
   setStreamText: Dispatch<SetStateAction<string>>;
   setMessages: Dispatch<SetStateAction<ChatMessage[]>>;
-  setPlanDetail: Dispatch<SetStateAction<PlanDetail | null>>;
-  setAllowWrite: Dispatch<SetStateAction<boolean>>;
-  setSurvey: Dispatch<SetStateAction<SurveySpec | null>>;
-  setPlanConfirm: Dispatch<SetStateAction<Record<string, unknown> | null>>;
-  setTaskStepConfirm: Dispatch<SetStateAction<string | null>>;
   setFileChangesTick: Dispatch<SetStateAction<number>>;
-  ensurePlanSubscription: (planThread: string) => void;
-  maybeReleasePlanSubscription: (planThread: string) => void;
   finalizeLiveTrace: (threadId?: string) => void;
   refreshTree: () => void;
   bumpContextRefresh: () => void;
@@ -141,7 +70,6 @@ export type ConsoleSSEDeps = {
 export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
   const {
     slug,
-    selected,
     selectedRef,
     stoppedThreadsRef,
     turnOpenRef,
@@ -153,8 +81,6 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
     panelTraceTurnsRef,
     traceLinesRef,
     traceStepsRef,
-    surveyDismissedRef,
-    taskStepDismissedRef,
     traceTurnStartRef,
     streamedRef,
     setBusy,
@@ -168,14 +94,7 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
     setPanelTraceTurns,
     setStreamText,
     setMessages,
-    setPlanDetail,
-    setAllowWrite,
-    setSurvey,
-    setPlanConfirm,
-    setTaskStepConfirm,
     setFileChangesTick,
-    ensurePlanSubscription,
-    maybeReleasePlanSubscription,
     finalizeLiveTrace,
     refreshTree,
     bumpContextRefresh,
@@ -183,7 +102,6 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
 
   return (event: Record<string, unknown>, eventThread: string) => {
     const type = String(event.type || '');
-    // 子 Agent 启动/结束登记：侧栏需立即出现入口（不等 turn end）
     if (type === 'subagent_started' || type === 'subagent_updated') {
       refreshTree();
       return;
@@ -199,25 +117,9 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       return;
     }
     const sel = selectedRef.current;
-    const planMainThread = sel?.kind === 'plan' ? sel.thread_id : '';
-    const isPlanPlannerThread =
-      Boolean(planMainThread) &&
-      (eventThread.startsWith(`${planMainThread}:planner:`) ||
-        (isPlannerSubagentEvent(event) &&
-          String(event.sub_thread || eventThread).startsWith(`${planMainThread}:planner:`)));
-    const planView =
-      sel?.kind === 'plan' && (sel.thread_id === eventThread || isPlanPlannerThread);
-    const workerPlanThread =
-      sel?.kind === 'worker' ? sel.thread_id.split(':worker:')[0] : '';
-    const workerTaskId =
-      sel?.kind === 'worker'
-        ? sel.task_id || sel.thread_id.split(':worker:')[1] || ''
-        : '';
-    const workerView =
-      sel?.kind === 'worker' &&
-      (eventThread === sel.thread_id || eventThread === workerPlanThread);
-    const agentView = sel?.kind === 'agent' && eventThread === sel.thread_id;
-    const viewing = planView || workerView || agentView;
+    const agentView =
+      (sel?.kind === 'agent' || sel?.kind === 'subagent') && eventThread === sel.thread_id;
+    const viewing = agentView;
     const traceEventTypes = new Set([
       'trace_line',
       'trace_step',
@@ -228,33 +130,8 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       'turn_start',
       'turn_done',
     ]);
-    const isWorkerTrace =
-      isSubagentWorkerEvent(event) && traceEventTypes.has(type);
-    const tracePanelThread = workerView
-      ? sel!.thread_id
-      : String(event.sub_thread || eventThread);
+    const tracePanelThread = String(event.sub_thread || eventThread);
 
-    if (planView && isWorkerTrace) {
-      if (slug && event.sub_thread) {
-        const sub = String(event.sub_thread);
-        if (type === 'trace_line') {
-          const line = String(event.text || '');
-          if (line.trim()) {
-            appendTracePanelCacheLine(slug, sub, line);
-          }
-        } else if (type === 'trace_step') {
-          const raw = event.step as Record<string, unknown> | undefined;
-          if (raw) {
-            appendTracePanelCacheStep(slug, sub, parseTraceStep(raw));
-          }
-        }
-      }
-      if (type !== 'plan_state' && type !== 'plan_job' && type !== 'end' && type !== 'error' && type !== 'interrupt') {
-        return;
-      }
-    }
-
-    // Agent 主会话：explore/subagent 明细只写子 thread cache，禁止污染对话区 live
     if (agentView && isExploreSubagentEvent(event) && traceEventTypes.has(type)) {
       const sub = String(event.sub_thread || '').trim();
       if (slug && sub) {
@@ -275,164 +152,26 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       }
     }
 
-    if (
-      planView &&
-      (isPlannerSubagentEvent(event) || isPlanPlannerThread) &&
-      traceEventTypes.has(type)
-    ) {
-      const sub = String(event.sub_thread || eventThread);
-      if (slug && sub) {
-        if (type === 'trace_line') {
-          const line = String(event.text || '');
-          if (line.trim()) {
-            appendTracePanelCacheLine(slug, sub, line);
-            const entry = { id: `p-${Date.now()}-${Math.random()}`, text: line };
-            setPanelTraceLines((prev) => {
-              const next = [...prev, entry];
-              panelTraceLinesRef.current = next;
-              return next;
-            });
-          }
-        } else if (type === 'trace_step') {
-          const raw = event.step as Record<string, unknown> | undefined;
-          if (raw) {
-            const step = parseTraceStep(raw);
-            appendTracePanelCacheStep(slug, sub, step);
-            setPanelTraceSteps((prev) => {
-              const idx = prev.findIndex((s) => s.step_id === step.step_id);
-              const next =
-                idx >= 0
-                  ? prev.map((s, i) => (i === idx ? step : s))
-                  : [...prev, step];
-              panelTraceStepsRef.current = next;
-              return next;
-            });
-          }
-        } else if (type === 'turn_start') {
-          if (claimTurnStart(sub, turnOpenRef.current)) {
-            const entry = {
-              id: `turn-sep-${Date.now()}`,
-              text: `─── 本轮 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })} ───`,
-            };
-            appendTracePanelCacheLine(slug, sub, entry.text);
-            setPanelTraceLines((prev) => {
-              const next = [...prev, entry];
-              panelTraceLinesRef.current = next;
-              return next;
-            });
-          }
-        }
-      }
-      if (type !== 'plan_state' && type !== 'plan_job' && type !== 'end' && type !== 'error' && type !== 'interrupt') {
-        return;
-      }
-    }
-
-    if (workerView && isWorkerTrace && !eventMatchesWorkerTask(event, sel!.thread_id, workerTaskId)) {
-      return;
-    }
-
     if (type === 'turn_start') {
       runningThreadsRef.current.add(eventThread);
       if (agentView) {
         setBusy(true);
       }
-      if (
-        eventThread.startsWith('plan-') &&
-        !eventThread.includes(':planner:') &&
-        !eventThread.includes(':worker:')
-      ) {
-        ensurePlanSubscription(eventThread);
-      }
     } else if (type === 'end') {
-      const isPlanMain =
-        eventThread.startsWith('plan-') &&
-        !eventThread.includes(':planner:') &&
-        !eventThread.includes(':worker:');
-      if (isPlanMain && slug) {
-        void api
-          .plan(slug, eventThread)
-          .then((detail) => {
-            if (!detail.job?.running) {
-              runningThreadsRef.current.delete(eventThread);
-              streamAbortRef.current.delete(eventThread);
-            } else {
-              runningThreadsRef.current.add(eventThread);
-            }
-            if (
-              selectedRef.current?.kind === 'plan' &&
-              selectedRef.current.thread_id === eventThread
-            ) {
-              setPlanDetail(detail);
-              setBusy(Boolean(detail.job?.running));
-            }
-          })
-          .catch(() => {
-            runningThreadsRef.current.delete(eventThread);
-            streamAbortRef.current.delete(eventThread);
-          });
-      } else {
-        runningThreadsRef.current.delete(eventThread);
-        streamAbortRef.current.delete(eventThread);
-        streamLastEventAtRef.current.delete(eventThread);
-        releaseTurnOpen(eventThread, turnOpenRef.current);
-        stoppedThreadsRef.current.delete(eventThread);
-        const selNow = selectedRef.current;
-        if (selNow?.kind === 'agent' && selNow.thread_id === eventThread) {
-          setBusy(false);
-        }
-        if (slug && eventThread.startsWith('cli-')) {
-          clearPendingUserMessage(slug, eventThread);
-        }
-      }
-      maybeReleasePlanSubscription(eventThread);
-    }
-
-    const pendingUiSetters = { setSurvey, setPlanConfirm, setTaskStepConfirm };
-    const maybeApplyPending = (confirmThread: string) => {
+      runningThreadsRef.current.delete(eventThread);
+      streamAbortRef.current.delete(eventThread);
+      streamLastEventAtRef.current.delete(eventThread);
+      releaseTurnOpen(eventThread, turnOpenRef.current);
+      stoppedThreadsRef.current.delete(eventThread);
+      const selNow = selectedRef.current;
       if (
-        slug
-        && selectionMatchesConfirmThread(sel, confirmThread, eventThread, workerPlanThread)
+        (selNow?.kind === 'agent' || selNow?.kind === 'subagent') &&
+        selNow.thread_id === eventThread
       ) {
-        applyPendingConfirmHead(slug, confirmThread, pendingUiSetters, {
-          surveyDismissedId: surveyDismissedRef.current,
-          taskStepDismissedId: taskStepDismissedRef.current,
-        });
+        setBusy(false);
       }
-    };
-
-    if (slug) {
-      if ((type === 'survey' || type === 'turn_done') && event.survey) {
-        if (event.replay !== true) {
-          ingestSurveyConfirm(slug, eventThread, event.survey as SurveySpec);
-        }
-        maybeApplyPending(eventThread);
-      }
-      if (type === 'interrupt') {
-        const payload = event.payload as Record<string, unknown> | undefined;
-        if (payload?.type === 'plan_confirm') {
-          const planThread = resolvePlanThreadForEvent(
-            sel,
-            eventThread,
-            workerView,
-            workerPlanThread,
-          );
-          ingestPlanConfirmPayload(slug, planThread, payload);
-          maybeApplyPending(planThread);
-        } else if (payload?.type === 'task_step_confirm') {
-          const planThread = resolvePlanThreadForEvent(
-            sel,
-            eventThread,
-            workerView,
-            workerPlanThread,
-          );
-          const taskId = String(payload.task_id || '');
-          if (taskId) {
-            ingestTaskStepConfirm(slug, planThread, taskId);
-            taskStepDismissedRef.current = null;
-            maybeApplyPending(planThread);
-          }
-        }
+      if (slug && eventThread.startsWith('cli-')) {
+        clearPendingUserMessage(slug, eventThread);
       }
     }
 
@@ -458,8 +197,6 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
         if (raw) {
           appendTracePanelCacheStep(slug, eventThread, parseTraceStep(raw));
         }
-      } else if (type === 'turn_done' || type === 'survey') {
-        /* steps 已由 trace_step 增量写入；turn_done 不再重复合并 */
       } else if (type === 'end') {
         refreshTree();
       }
@@ -471,7 +208,6 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       traceTurnStartRef.current = Date.now();
       setTraceActivitySec(0);
       setCurrentTurnDurationSec(null);
-      // 刷新重连的 replay 不得清掉 session trace 已恢复的完整步骤
       if (event.replay === true) {
         turnOpenRef.current.add(eventThread);
       } else if (claimTurnStart(eventThread, turnOpenRef.current)) {
@@ -577,18 +313,14 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
         if (agentView && step.kind === 'reply') {
           const replyPreview = formatAgentChatDisplayText(extractReplyTextFromTraceStep(step));
           if (isUserVisibleAssistantText(replyPreview)) {
-            // 步骤模式下 reply 常整段到达、无 stream_delta；必须写入 messages，
-            // 不能只放 streamText（turn_done 清流后对话区会空白）。
             setMessages((prev) => appendAssistantReplyIfMissing(prev, replyPreview));
             streamedRef.current = true;
             setStreamText(replyPreview);
           }
         }
       }
-    } else if (type === 'turn_done' || type === 'survey') {
-      const isReplay = event.replay === true;
-      if (isReplay) {
-        maybeApplyPending(eventThread);
+    } else if (type === 'turn_done') {
+      if (event.replay === true) {
         return;
       }
       const fallbackSteps = parseTraceSteps(event.trace_steps);
@@ -637,65 +369,43 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       const effectiveReply = isUserVisibleAssistantText(fallbackReply)
         ? fallbackReply
         : (replyFromSteps[replyFromSteps.length - 1] || '');
-      if (agentView) {
-        setBusy(false);
-        setThinkingText('');
-        setTraceActivitySec(0);
-        if (isUserVisibleAssistantText(effectiveReply)) {
-          setMessages((prev) => appendAssistantReplyIfMissing(prev, effectiveReply));
-        }
-        // 先清流式区：正文已在 messages
-        setStreamText('');
-        if (slug && sel?.kind === 'agent' && sel.thread_id === eventThread) {
-          void fetchEnrichedAgentChatMessages(slug, eventThread, {
-            fallbackReply: effectiveReply,
-            liveLines: panelTraceLinesRef.current,
-            liveSteps: stepPool,
-            liveTurns: panelTraceTurnsRef.current,
+      setBusy(false);
+      setThinkingText('');
+      setTraceActivitySec(0);
+      if (isUserVisibleAssistantText(effectiveReply)) {
+        setMessages((prev) => appendAssistantReplyIfMissing(prev, effectiveReply));
+      }
+      setStreamText('');
+      if (slug && agentView && sel?.thread_id === eventThread) {
+        void fetchEnrichedAgentChatMessages(slug, eventThread, {
+          fallbackReply: effectiveReply,
+          liveLines: panelTraceLinesRef.current,
+          liveSteps: stepPool,
+          liveTurns: panelTraceTurnsRef.current,
+        })
+          .then((parsed) => {
+            if (selectedRef.current?.thread_id !== eventThread) {
+              return;
+            }
+            setMessages((prev) => preferRicherAgentChat(prev, parsed));
           })
-            .then((parsed) => {
-              if (selectedRef.current?.thread_id !== eventThread) {
-                return;
-              }
-              setMessages((prev) => preferRicherAgentChat(prev, parsed));
-            })
-            .catch(() => {});
-        }
-      } else {
-        setStreamText('');
-        if (isUserVisibleAssistantText(effectiveReply)) {
-          setMessages((prev) => appendAssistantReplyIfMissing(prev, effectiveReply));
-        }
+          .catch(() => {});
       }
       streamedRef.current = false;
-      maybeApplyPending(eventThread);
-      if (selected?.kind === 'agent' || selected?.kind === 'plan' || selected?.kind === 'worker') {
-        setFileChangesTick((n) => n + 1);
-      }
+      setFileChangesTick((n) => n + 1);
       bumpContextRefresh();
     } else if (type === 'title_updated') {
       refreshTree();
     } else if (type === 'interrupt') {
       const payload = event.payload as Record<string, unknown>;
-      if (payload?.type === 'tasks_incomplete') {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `intr-${Date.now()}`,
-            role: 'system',
-            text: String(payload.message || '仍有未完成任务，可在 Plan 面板继续执行'),
-          },
-        ]);
-      } else if (payload?.type === 'user_stop') {
+      if (payload?.type === 'user_stop') {
         stoppedThreadsRef.current.delete(eventThread);
         runningThreadsRef.current.delete(eventThread);
         streamAbortRef.current.delete(eventThread);
         streamLastEventAtRef.current.delete(eventThread);
         releaseTurnOpen(eventThread, turnOpenRef.current);
-        finalizeLiveTrace(
-          agentView ? eventThread : tracePanelThread,
-        );
-        if (sel?.kind === 'agent' && sel.thread_id === eventThread) {
+        finalizeLiveTrace(eventThread);
+        if (agentView && sel?.thread_id === eventThread) {
           setBusy(false);
           setStreamText('');
           setThinkingText('');
@@ -710,90 +420,16 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
           ]);
         }
       }
-    } else if (type === 'plan_job') {
-      const running = Boolean(event.running);
-      const jobError = event.error != null ? String(event.error) : null;
-      const planThreadForJob =
-        planView && sel?.kind === 'plan'
-          ? sel.thread_id
-          : workerView
-            ? workerPlanThread
-            : eventThread.startsWith('plan-') &&
-                !eventThread.includes(':planner:') &&
-                !eventThread.includes(':worker:')
-              ? eventThread
-              : '';
-      if (running && planThreadForJob) {
-        runningThreadsRef.current.add(planThreadForJob);
-        setBusy(true);
-      } else if (!running && planThreadForJob) {
-        runningThreadsRef.current.delete(planThreadForJob);
-      }
-      setPlanDetail((prev) =>
-        prev ? { ...prev, job: { running, error: jobError } } : prev,
-      );
-      if (planThreadForJob && slug) {
-        void api
-          .plan(slug, planThreadForJob)
-          .then((detail) => {
-            setPlanDetail(detail);
-            if (planExecutionAllowWrite(detail)) {
-              setAllowWrite(true);
-            }
-            if (!detail.job?.running) {
-              setBusy(false);
-            }
-          })
-          .catch(() => {});
-      }
-      if (workerView && slug && workerTaskId) {
-        void Promise.all([
-          api.worker(slug, workerPlanThread, workerTaskId),
-          api.plan(slug, workerPlanThread),
-        ]).then(([data, detail]) => {
-          setPlanDetail(detail);
-          const parsed = parseWorkerMessages(data);
-          setMessages(parsed.chat);
-          refreshTree();
-        }).catch(() => {});
-      }
-    } else if (type === 'plan_done') {
-      setFileChangesTick((n) => n + 1);
-      if (slug && selected?.kind === 'plan' && eventThread === selected.thread_id) {
-        api.plan(slug, selected.thread_id).then(async (detail) => {
-          setPlanDetail(detail);
-          try {
-            const data = await api.messages(slug, selected.thread_id);
-            setMessages(buildPlanChatMessages(detail, data.messages || []));
-          } catch {
-            setMessages(buildPlanChatMessages(detail));
-          }
-        }).catch(() => {});
-      }
-      refreshTree();
-      bumpContextRefresh();
-    } else if (type === 'plan_state') {
-      if (sel?.kind === 'plan' && slug) {
-        api.plan(slug, sel.thread_id).then(setPlanDetail);
-      }
-      if (sel?.kind === 'worker' && slug) {
-        const pt = sel.thread_id.split(':worker:')[0];
-        api.plan(slug, pt).then(setPlanDetail);
-      }
     } else if (type === 'error') {
       setMessages((prev) => [
         ...prev,
         { id: `err-${Date.now()}`, role: 'system', text: `**错误:** ${event.message}` },
       ]);
-      if (sel?.kind === 'plan' && slug) {
-        api.plan(slug, sel.thread_id).then(setPlanDetail).catch(() => {});
-      }
     } else if (type === 'end') {
       finalizeLiveTrace(tracePanelThread);
       runningThreadsRef.current.delete(eventThread);
       streamAbortRef.current.delete(eventThread);
       streamLastEventAtRef.current.delete(eventThread);
-      // Plan busy 以 plan_job / detail.job.running 为准；仅 agent 的 end 清 busy
       if (agentView && sel?.thread_id === eventThread) {
         setBusy(false);
       }
@@ -803,5 +439,5 @@ export function createHandleSSEEvent(deps: ConsoleSSEDeps) {
       refreshTree();
       bumpContextRefresh();
     }
-  }
+  };
 }
