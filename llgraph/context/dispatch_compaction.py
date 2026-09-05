@@ -21,7 +21,7 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage, ToolMessage
 
-from llgraph.context.context_compressor import estimate_tokens
+from llgraph.context.context_compressor import estimate_text_tokens
 from llgraph.context.context_settings import ContextSettings
 
 # 出站已压缩/拦截短文案：不占预算，也不再二次归档
@@ -225,7 +225,7 @@ def _heavy_tool_slots(
         if tool_content_is_compact(content):
             continue
         slots.append(
-            (idx, str(getattr(msg, "tool_call_id", "") or ""), estimate_tokens(content))
+            (idx, str(getattr(msg, "tool_call_id", "") or ""), estimate_text_tokens(content))
         )
     return slots
 

@@ -312,6 +312,38 @@ def test_prefix_report_detects_history_rewrite() -> None:
     assert report.first_changed_index == 1
 
 
+def test_text_token_estimate_matches_message_estimate() -> None:
+    """estimate_text_tokens 必须与 estimate_tokens 同一口径。"""
+    from llgraph.context.context_compressor import estimate_text_tokens, estimate_tokens
+
+    body = "x" * 30_000
+    assert estimate_text_tokens(body) == 10_000
+    assert estimate_text_tokens(body) == estimate_tokens(
+        [ToolMessage(content=body, tool_call_id="t", name="grep_files")]
+    )
+
+
+def test_compaction_plan_does_not_scan_tool_text_per_char() -> None:
+    """性能回归：曾把整段正文当消息列表传给 estimate_tokens，逐字符走 isinstance。
+
+    30 轮工具链（约 36 万字符）出站规划从 4ms 被拖到 366ms。正确实现每次约 0.5ms，
+    误用版每次约 58ms；阈值取 20ms，既留 40x 机器余量又能卡住这种量级的回退。
+    """
+    import time
+
+    settings = _settings(dispatch_keep_full_tool_messages=6)
+    messages: list = [HumanMessage(content="q")]
+    for i in range(30):
+        messages += _grep_round(i, chars=12_000)
+
+    plan_dispatch_compaction(messages, settings, thread_id=None)
+    started = time.perf_counter()
+    for _ in range(5):
+        plan_dispatch_compaction(messages, settings, thread_id=None)
+    per_call_ms = (time.perf_counter() - started) / 5 * 1000
+    assert per_call_ms < 20, f"出站压缩规划过慢: {per_call_ms:.1f}ms"
+
+
 def test_default_settings_enable_hysteresis(tmp_path: Path) -> None:
     """默认配置必须带滞回，否则等于回到每步击穿缓存。"""
     (tmp_path / ".llgraph").mkdir()

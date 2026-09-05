@@ -47,6 +47,19 @@ class CompressReport:
         return max(0.0, 1.0 - self.after_tokens / self.before_tokens)
 
 
+def estimate_text_tokens(text: str) -> int:
+    """
+    单段文本的 token 估算（与 estimate_tokens 同一启发式）。
+
+    estimate_tokens 接的是**消息列表**：误传字符串会逐字符走一遍 isinstance 分支，
+    30 轮工具链能把出站组装从 4ms 拖到 366ms。需要估单段正文时用本函数。
+
+    @param text 文本
+    @return 估算 token
+    """
+    return max(1, len(text) // 3)
+
+
 def estimate_tokens(messages: list[Any]) -> int:
     """
     启发式 token 估算（字符数 / 3）。
