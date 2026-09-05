@@ -83,6 +83,21 @@ def test_empty_store_does_not_open_lancedb(memory_workspace: Path) -> None:
     connect.assert_not_called()
 
 
+def test_existing_but_empty_lance_dir_still_skips_lancedb(memory_workspace: Path) -> None:
+    """后台整理会 ensure_memory_dirs 建出空目录；空目录同样属于「确定为空」。"""
+    from llgraph.memory.paths import ensure_memory_dirs, memory_lance_uri
+
+    user_id, workspace_key, _ = workspace_identity(memory_workspace)
+    ensure_memory_dirs(user_id, workspace_key)
+    lance_dir = Path(memory_lance_uri(user_id, workspace_key))
+    assert lance_dir.is_dir() and not list(lance_dir.iterdir())
+    assert memory_store_is_definitely_empty(user_id, workspace_key)
+
+    with patch("llgraph.memory.store.connect_memory_db") as connect:
+        assert list_memory_rows(user_id, workspace_key, status="active") == []
+    connect.assert_not_called()
+
+
 def test_store_with_rows_is_not_reported_empty(memory_workspace: Path) -> None:
     with patch("llgraph.memory.write.embed_memory_text", return_value=[0.5] * 8):
         upsert_memory(memory_workspace, content="项目用 uv 管依赖", kind="pref")
