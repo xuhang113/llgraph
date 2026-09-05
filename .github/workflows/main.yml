@@ -2,7 +2,7 @@ name: Cloud Agent auto upgrade
 
 on:
   schedule:
-    # 北京时间每天 10:00、22:00（UTC 02:00、14:00）
+    # 北京时间每天 10:00（UTC 02:00）
     - cron: "0 2 * * *"
   workflow_dispatch:
 
@@ -21,69 +21,208 @@ jobs:
         run: |
           python3 - <<'PY'
           import base64, json, os, sys, urllib.error, urllib.request
-
           key = os.environ.get("CURSOR_API_KEY", "").strip()
           if not key:
               print("缺少仓库 Secret: CURSOR_API_KEY", file=sys.stderr)
               sys.exit(1)
+          auth = "Basic " + base64.b64encode((key + ":").encode()).decode()
 
-          body = {
-              "name": "llgraph auto upgrade",
-              "prompt": {
-                  "text": (
-                      "你在仓库 xuhang113/llgraph 的 cursor/auto_upgrade 分支上工作。"
-                      "这是专门给 Agent 自由发挥的长期实验分支，不是保守热修分支。\n"
-                      "直接在当前分支提交，不要开新分支，不要创建 PR/MR。\n\n"
-                      "产品定位：llgraph 是终端侧的 Cursor 式 Agent（LangGraph ReAct +"
-                      " OpenAI 兼容网关 + CLI/Web Console）。对照文档 docs/cursor-agent.md、"
-                      "docs/项目结构.md、docs/模块说明.md。对标市面商用 Agent："
-                      "Cursor Agent、Claude Code、Codex CLI、Gemini CLI 等，"
-                      "目标是让 llgraph 在真实改代码场景里越来越接近它们。\n\n"
-                      "本轮北星（按影响力选一件做深，允许为此做大范围重构）：\n"
-                      "1. 速度：首 token、工具循环、检索、索引、上下文组装、启动耗时。\n"
-                      "2. 性能：token 浪费、重复读文件、无效工具调用、上下文膨胀、并发/批处理。\n"
-                      "3. 稳定性：工具失败恢复、死循环、会话损坏、压缩丢上下文、并发竞态、崩溃。\n"
-                      "4. 商用体验：计划/多 Agent、记忆连续性、改码命中率、MCP/Skills/Rules、"
-                      "可观测性、CLI/Web 交互是否像成熟产品。\n\n"
-                      "工作方式：\n"
-                      "- 先 git log / git diff origin/main...HEAD，看本分支已有方向，接着做，不要推倒重来。\n"
-                      "- 先定位当前相对商用 Agent 最大的一个缺口，再下手；一次提交围绕同一个主题。\n"
-                      "- 允许重构模块边界、重写热点路径、删掉过时抽象；不要为了炫技无关 rename/纯格式化。\n"
-                      "- 改完必须让相关测试通过；没有测试的核心路径要补最小回归测试。\n"
-                      "- 提交后分支仍可安装、可启动 Agent（pip install -e 与现有 CLI 入口不要弄坏）。\n"
-                      "- 提交信息写清：对标了什么、为什么更快/更稳、怎么验证。\n"
-                      "- 若判断本轮没有高价值改动，不要硬改，在总结里写下一步该攻哪。\n"
+          def call(method, path, payload=None, fatal=True):
+              data = None if payload is None else json.dumps(payload).encode("utf-8")
+              req = urllib.request.Request(
+                  "https://api.cursor.com" + path,
+                  data=data,
+                  headers={"Content-Type": "application/json", "Authorization": auth},
+                  method=method,
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as resp:
+                      return resp.read().decode("utf-8")
+              except urllib.error.HTTPError as e:
+                  err = e.read().decode("utf-8", errors="replace")
+                  print(err, file=sys.stderr)
+                  if fatal:
+                      sys.exit(1)
+                  return None
+
+          # 用量页上的 claude-opus-5-thinking-high / extra-high 是结算名，不能当 model.id。
+          # Create Agent 只接受 GET /v1/models 里某一条 variants 的完整 id+params。
+          # Ultra：优先 Opus 5 Extra High（effort=xhigh）。
+          model = {"id": "claude-opus-5"}
+          catalog_raw = call("GET", "/v1/models", fatal=False)
+          catalog_item = None
+          if catalog_raw:
+              catalog = json.loads(catalog_raw)
+              items = catalog.get("items") or catalog.get("models") or []
+              ids = [i.get("id") for i in items if isinstance(i, dict) and i.get("id")]
+              prefer = ["claude-opus-5", "claude-opus-4-8"]
+              picked = next((p for p in prefer if p in ids), None)
+              if not picked:
+                  picked = next((i for i in ids if "opus-5" in i and "thinking" not in i), None)
+              if not picked:
+                  picked = next((i for i in ids if "opus-4-8" in i or "opus-4.8" in i), None)
+              if picked:
+                  model["id"] = picked
+              catalog_item = next((i for i in items if i.get("id") == model["id"]), None)
+              print("catalog opus ids:", [i for i in ids if "opus" in i])
+              if catalog_item:
+                  print(
+                      "picked item:",
+                      json.dumps(
+                          {
+                              k: catalog_item.get(k)
+                              for k in ("id", "displayName", "parameters", "variants", "aliases")
+                          },
+                          ensure_ascii=False,
+                      ),
                   )
-              },
-              "repos": [
-                  {
-                      "url": "https://github.com/xuhang113/llgraph",
-                      "startingRef": "cursor/auto_upgrade",
-                  }
-              ],
-              "workOnCurrentBranch": True,
-              "autoCreatePR": False,
+
+          def params_map(variant):
+              return {
+                  p.get("id"): p.get("value")
+                  for p in (variant.get("params") or [])
+                  if isinstance(p, dict)
+              }
+
+          def variant_score(variant):
+              params = params_map(variant)
+              name = (variant.get("displayName") or "").lower()
+              score = 0
+              effort = (params.get("effort") or "").lower()
+              if effort in ("xhigh", "extra-high", "extra_high", "extrahigh"):
+                  score += 20
+              elif effort == "max":
+                  score += 12
+              elif effort == "high":
+                  score += 8
+              if params.get("thinking") == "true":
+                  score += 4
+              if params.get("fast") in (None, "false"):
+                  score += 2
+              if any(k in name for k in ("extra high", "extra-high", "xhigh")):
+                  score += 10
+              elif "high" in name and "fast" not in name:
+                  score += 3
+              if variant.get("isDefault"):
+                  score += 1
+              if params.get("fast") == "true":
+                  score -= 4
+              return score
+
+          def model_from_variant(item, variant):
+              out = {"id": item.get("id") or model["id"]}
+              params = variant.get("params") if variant else None
+              if params:
+                  out["params"] = params
+              return out
+
+          candidates = []
+          if catalog_item:
+              variants = catalog_item.get("variants") or []
+              if variants:
+                  ranked = sorted(variants, key=variant_score, reverse=True)
+                  candidates.append(model_from_variant(catalog_item, ranked[0]))
+                  default = next((v for v in variants if v.get("isDefault")), variants[0])
+                  fallback = model_from_variant(catalog_item, default)
+                  if fallback != candidates[0]:
+                      candidates.append(fallback)
+          if (model["id"] or "").startswith("claude-opus-"):
+              candidates.append({
+                  "id": model["id"],
+                  "params": [
+                      {"id": "thinking", "value": "true"},
+                      {"id": "context", "value": "1m"},
+                      {"id": "effort", "value": "xhigh"},
+                      {"id": "fast", "value": "false"},
+                  ],
+              })
+              candidates.append({
+                  "id": model["id"],
+                  "params": [
+                      {"id": "thinking", "value": "true"},
+                      {"id": "effort", "value": "xhigh"},
+                      {"id": "fast", "value": "false"},
+                  ],
+              })
+              candidates.append({
+                  "id": model["id"],
+                  "params": [
+                      {"id": "thinking", "value": "true"},
+                      {"id": "context", "value": "1m"},
+                      {"id": "effort", "value": "high"},
+                      {"id": "fast", "value": "false"},
+                  ],
+              })
+              candidates.append({
+                  "id": model["id"],
+                  "params": [
+                      {"id": "thinking", "value": "true"},
+                      {"id": "effort", "value": "high"},
+                      {"id": "fast", "value": "false"},
+                  ],
+              })
+          candidates.append({"id": model["id"]})
+
+          seen = set()
+          unique = []
+          for cand in candidates:
+              key = json.dumps(cand, sort_keys=True)
+              if key in seen:
+                  continue
+              seen.add(key)
+              unique.append(cand)
+          candidates = unique
+          prompt = {
+              "text": (
+                  "你在仓库 xuhang113/llgraph 的 cursor/auto_upgrade 分支上工作。"
+                  "这是专门给 Agent 自由发挥的长期实验分支，不是保守热修分支。\n"
+                  "直接在当前分支提交，不要开新分支，不要创建 PR/MR。\n\n"
+                  "产品定位：llgraph 是终端侧的 Cursor 式 Agent（LangGraph ReAct +"
+                  " OpenAI 兼容网关 + CLI/Web Console）。对照文档 docs/cursor-agent.md、"
+                  "docs/项目结构.md、docs/模块说明.md。对标市面商用 Agent："
+                  "Cursor Agent、Claude Code、Codex CLI、Gemini CLI 等，"
+                  "目标是让 llgraph 在真实改代码场景里越来越接近它们。\n\n"
+                  "本轮北星（按影响力选一件做深，允许为此做大范围重构）：\n"
+                  "1. 速度：首 token、工具循环、检索、索引、上下文组装、启动耗时。\n"
+                  "2. 性能：token 浪费、重复读文件、无效工具调用、上下文膨胀、并发/批处理。\n"
+                  "3. 稳定性：工具失败恢复、死循环、会话损坏、压缩丢上下文、并发竞态、崩溃。\n"
+                  "4. 商用体验：计划/多 Agent、记忆连续性、改码命中率、MCP/Skills/Rules、"
+                  "可观测性、CLI/Web 交互是否像成熟产品。\n\n"
+                  "工作方式：\n"
+                  "- 先 git log / git diff origin/main...HEAD，看本分支已有方向，接着做，不要推倒重来。\n"
+                  "- 先定位当前相对商用 Agent 最大的一个缺口，再下手；一次提交围绕同一个主题。\n"
+                  "- 允许重构模块边界、重写热点路径、删掉过时抽象；不要为了炫技无关 rename/纯格式化。\n"
+                  "- 改完必须让相关测试通过；没有测试的核心路径要补最小回归测试。\n"
+                  "- 提交后分支仍可安装、可启动 Agent（pip install -e 与现有 CLI 入口不要弄坏）。\n"
+                  "- 提交信息写清：对标了什么、为什么更快/更稳、怎么验证。\n"
+                  "- 若判断本轮没有高价值改动，不要硬改，在总结里写下一步该攻哪。\n"
+              )
           }
-
-          req = urllib.request.Request(
-              "https://api.cursor.com/v1/agents",
-              data=json.dumps(body).encode("utf-8"),
-              headers={
-                  "Content-Type": "application/json",
-                  "Authorization": "Basic "
-                  + base64.b64encode(f"{key}:".encode()).decode(),
-              },
-              method="POST",
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=60) as resp:
-                  raw = resp.read().decode("utf-8")
-          except urllib.error.HTTPError as e:
-              print(e.read().decode("utf-8", errors="replace"), file=sys.stderr)
+          raw = None
+          for cand in candidates:
+              print("using model:", json.dumps(cand, ensure_ascii=False))
+              body = {
+                  "name": "llgraph auto upgrade",
+                  "model": cand,
+                  "prompt": prompt,
+                  "repos": [
+                      {
+                          "url": "https://github.com/xuhang113/llgraph",
+                          "startingRef": "cursor/auto_upgrade",
+                      }
+                  ],
+                  "workOnCurrentBranch": True,
+                  "autoCreatePR": False,
+              }
+              raw = call("POST", "/v1/agents", body, fatal=False)
+              if raw:
+                  break
+              print("create failed for this variant, trying next", file=sys.stderr)
+          if not raw:
+              print("all model variants failed", file=sys.stderr)
               sys.exit(1)
-
           print(raw)
           url = (json.loads(raw).get("agent") or {}).get("url")
           if url:
-              print(f"Agent URL: {url}")
+              print("Agent URL: " + url)
           PY
