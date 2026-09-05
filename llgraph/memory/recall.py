@@ -150,6 +150,13 @@ def recall_memories(
     user_id, workspace_key, _ = workspace_identity(workspace)
     kinds = ACTIVE_KINDS
 
+    # 先读候选行：向量检索与此处过滤同表同条件（user/workspace/status=active/kinds），
+    # 候选为空时向量检索必然也为空，无需为此加载 embedding 模型（本地冷启动约 1.5s）。
+    keyword_rows = list_memory_rows(user_id, workspace_key, status="active", kinds=kinds)
+    if not keyword_rows:
+        report.elapsed_ms = (time.perf_counter() - t0) * 1000
+        return [], report
+
     qvec: list[float] = []
     vector_hits: list[dict] = []
     try:
@@ -163,7 +170,6 @@ def recall_memories(
         qvec = []
 
     terms = build_search_terms(topic=q, keywords=q) or [q]
-    keyword_rows = list_memory_rows(user_id, workspace_key, status="active", kinds=kinds)
     keyword_scored = sorted(
         keyword_rows,
         key=lambda r: _keyword_score(str(r.get("content", "")), terms),
