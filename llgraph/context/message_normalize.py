@@ -125,10 +125,10 @@ def prepare_messages_for_llm_dispatch(
     from llgraph.core.user_message_content import prepare_messages_for_multimodal_dispatch
 
     cleaned = prepare_messages_for_multimodal_dispatch(cleaned)
-    if workspace is not None:
-        from llgraph.context.runtime_context import get_active_thread_id
+    from llgraph.context.runtime_context import get_active_thread_id
 
-        thread_id = get_active_thread_id()
+    thread_id = get_active_thread_id()
+    if workspace is not None:
         if thread_id:
             from llgraph.context.conversation_anchor import (
                 ensure_messages_include_conversation_anchor,
@@ -150,7 +150,12 @@ def prepare_messages_for_llm_dispatch(
         )
 
         ctx_settings = resolve_context_settings(workspace)
-        cleaned = prune_tool_messages_for_dispatch(cleaned, workspace, ctx_settings)
+        cleaned = prune_tool_messages_for_dispatch(
+            cleaned,
+            workspace,
+            ctx_settings,
+            thread_id=thread_id,
+        )
         cleaned = invalidate_reads_after_writes_for_dispatch(cleaned)
         cleaned = dedupe_read_tool_messages_for_dispatch(cleaned, ctx_settings)
     ordered = reorder_pinned_session_messages(cleaned)
@@ -179,7 +184,11 @@ def prepare_messages_for_llm_dispatch(
         )
 
         redact_settings = resolve_outbound_redact_settings(workspace)
-        return redact_messages_for_dispatch(with_soft, redact_settings)
+        with_soft = redact_messages_for_dispatch(with_soft, redact_settings)
+
+    from llgraph.context.dispatch_compaction import record_dispatch_prefix
+
+    record_dispatch_prefix(with_soft, thread_id=thread_id)
     return with_soft
 
 

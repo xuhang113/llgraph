@@ -33,14 +33,6 @@ _ARCHIVED_MARKERS = (
     "已 superseded",
     "已替换",
 )
-# 出站已压缩/拦截短文案：不占 recency 名额，也不再二次归档
-_COMPACT_TOOL_MARKERS = (
-    "[历史",
-    "[工具结果已落盘",
-    "[llgraph] 重复工具已拦截",
-    "[llgraph] 重复失败已拦截",
-    "已 superseded",
-)
 
 
 def _tool_content_is_archived(content: str) -> bool:
@@ -312,11 +304,6 @@ def maybe_prune_tools_during_react(
     return report
 
 
-def _tool_content_is_compact(content: str) -> bool:
-    """@param content 工具正文 @return 是否已是短指针/拦截文案"""
-    return any(marker in content for marker in _COMPACT_TOOL_MARKERS)
-
-
 def pinned_write_success_indices(
     messages: list[BaseMessage],
     *,
@@ -346,62 +333,76 @@ def pinned_write_success_indices(
 def dispatch_keep_tool_indices(
     messages: list[BaseMessage],
     settings: ContextSettings,
+    *,
+    thread_id: str | None = None,
 ) -> set[int]:
     """
     出站应保留全文的 ToolMessage 下标。
 
-    始终按 recency 保留最近 N 条**重**工具结果（不等满窗压力），再钉住
-    写入快照与被引用项。轻量指针/拦截文案不占 N。
+    压缩由「纪元水位」决定而非 recency 滑窗：全文重结果在高水位以下时一条都不新压，
+    出站字节与上一步逐字节相同，prompt cache 整段命中；跨过高水位才一次压到低水位。
+    轻量指针/拦截文案不占预算；写入快照按路径钉住最新一份；被引用项在尚未压缩前延后压缩。
 
     @param messages 出站消息
     @param settings 上下文配置
+    @param thread_id 会话线程（记压缩水位，保证不回退）；None 时为纯函数模式
     @return 保留下标
     """
+    from llgraph.context.dispatch_compaction import (
+        plan_dispatch_compaction,
+        tool_content_is_compact,
+    )
+
     tool_indices = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
     if not tool_indices:
         return set()
 
-    heavy: list[int] = []
-    light: set[int] = set()
-    for idx in tool_indices:
-        msg = messages[idx]
-        content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
-        if _tool_content_is_compact(content):
-            light.add(idx)
-        else:
-            heavy.append(idx)
-
+    light = {
+        idx
+        for idx in tool_indices
+        if tool_content_is_compact(
+            messages[idx].content
+            if isinstance(messages[idx].content, str)
+            else str(messages[idx].content or "")
+        )
+    }
     keep_n = max(1, settings.dispatch_keep_full_tool_messages)
-    keep_indices = set(heavy[-keep_n:]) if heavy else set()
-    keep_indices |= light
-    keep_indices |= pinned_write_success_indices(
-        messages,
-        cap=max(4, keep_n),
-    )
-    keep_indices |= _protected_cited_indices(
+    pinned = pinned_write_success_indices(messages, cap=max(4, keep_n))
+    protected = _protected_cited_indices(
         messages,
         settings,
         pressure=0.0,
-        already_kept=keep_indices,
+        already_kept=light | pinned,
     )
-    return keep_indices
+    plan = plan_dispatch_compaction(
+        messages,
+        settings,
+        thread_id=thread_id,
+        pinned=pinned,
+        protected=protected,
+    )
+    return set(tool_indices) - set(plan.compact_indices)
 
 
 def prune_tool_messages_for_dispatch(
     messages: list[BaseMessage],
     workspace: Path,
     settings: ContextSettings,
+    *,
+    thread_id: str | None = None,
 ) -> list[BaseMessage]:
     """
     发往模型前裁剪 tool 链（不修改 MemorySaver / 落盘）。
 
-    对标 Cursor / Claude Code 动态上下文：本问内旧 grep/read 出站改指针，
-    **不等** token 窗口压力；最近 N 条重结果 + 写入快照 + 被引用项保留全文。
+    对标 Claude Code / Codex CLI：出站按「压缩纪元」而非每步滑窗——全文重结果在
+    高水位以下一条都不新压，跨过高水位才一次压到低水位。这样工具循环里除压缩那一步，
+    出站前缀逐字节不变，prompt cache 整段命中（TTFT 与 input 计费都省）。
     模型若再调相同 read/grep，由 tool_loop_guard 短路径返回摘录。
 
     @param messages 已 canonical / repair 后的消息
     @param workspace 工作区根
     @param settings 上下文配置
+    @param thread_id 会话线程（记压缩水位，保证压缩单调不回退）
     @return 出站用消息列表
     """
     if not settings.dispatch_tool_chain_compress:
@@ -411,7 +412,7 @@ def prune_tool_messages_for_dispatch(
     if not tool_indices:
         return messages
 
-    keep_indices = dispatch_keep_tool_indices(messages, settings)
+    keep_indices = dispatch_keep_tool_indices(messages, settings, thread_id=thread_id)
     if keep_indices.issuperset(tool_indices):
         return messages
 

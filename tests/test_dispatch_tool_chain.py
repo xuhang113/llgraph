@@ -46,6 +46,10 @@ def _settings(**overrides: object) -> ContextSettings:
         compress_summary_chunk_chars=120_000,
         dispatch_tool_chain_compress=True,
         dispatch_keep_full_tool_messages=2,
+        # 本文件断言的是旧 recency 滑窗语义：滞回 1.0 即「每步压到低水位」
+        dispatch_full_tool_hysteresis=1.0,
+        dispatch_full_tool_budget_tokens=1_000_000,
+        dispatch_compact_low_ratio=0.4,
         dispatch_dedupe_read_paths=True,
         grep_context_lines=5,
         grep_max_inline_chars=48000,

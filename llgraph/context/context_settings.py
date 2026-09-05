@@ -38,6 +38,9 @@ class ContextSettings:
     compress_summary_chunk_chars: int
     dispatch_tool_chain_compress: bool
     dispatch_keep_full_tool_messages: int
+    dispatch_full_tool_hysteresis: float
+    dispatch_full_tool_budget_tokens: int
+    dispatch_compact_low_ratio: float
     read_tool_result_max_chars: int
     read_file_max_bytes: int
     read_file_max_lines: int
@@ -100,8 +103,23 @@ CONTEXT_CONFIG_DOCS: dict[str, str] = {
         "出站始终按 recency 压缩（不对齐满窗压力）；写入成功快照按路径钉住最新一份。"
     ),
     "dispatch_keep_full_tool_messages": (
-        "dispatch_tool_chain_compress 时出站保留全文的**重** ToolMessage 条数（auto 默认 6）；"
-        "短指针/重复拦截不占名额。"
+        "dispatch_tool_chain_compress 触发压缩后，出站保留全文的**重** ToolMessage 条数"
+        "（低水位，auto 默认 6）；短指针/重复拦截不占名额。"
+    ),
+    "dispatch_full_tool_hysteresis": (
+        "出站压缩的条数滞回倍数（默认 2.5）：全文重结果达到 "
+        "dispatch_keep_full_tool_messages × 该倍数才压缩一次，压到低水位。\n"
+        "  Anthropic prompt cache 按精确前缀命中，每步改写历史都会击穿缓存；"
+        "滞回让压缩变成低频纪元事件，纪元内出站字节不变、整段命中缓存。\n"
+        "  设为 1.0 即退化为旧的 recency 滑窗（每步都压、每步都击穿）。"
+    ),
+    "dispatch_full_tool_budget_tokens": (
+        "出站保留全文的**重** ToolMessage 估算 token 高水位；"
+        "默认按模型窗口取 12%（夹在 8k~48k）。超过即压缩到 "
+        "dispatch_compact_low_ratio × 该值。"
+    ),
+    "dispatch_compact_low_ratio": (
+        "触发压缩后压到的低水位比例（默认 0.4）；比例越小压缩越狠、纪元越长、缓存命中越久。"
     ),
     "spill_exempt_tools": "不参与落盘的工具名；默认空（read_file/read_files 超长也会落盘+指针）。",
     "tool_result_max_chars": "grep/shell 等工具 spill 阈值（auto 默认 12000）。",
@@ -166,6 +184,9 @@ def format_context_config_help(workspace: Path | None = None) -> str:
         "keep_recent_tool_messages",
         "dispatch_tool_chain_compress",
         "dispatch_keep_full_tool_messages",
+        "dispatch_full_tool_hysteresis",
+        "dispatch_full_tool_budget_tokens",
+        "dispatch_compact_low_ratio",
     )
     for key in order:
         doc = CONTEXT_CONFIG_DOCS.get(key, "")
@@ -185,6 +206,9 @@ def format_context_config_help(workspace: Path | None = None) -> str:
                 f"  auto_compress_ratio: {settings.auto_compress_ratio}",
                 f"  dispatch_tool_chain_compress: {settings.dispatch_tool_chain_compress}",
                 f"  dispatch_keep_full_tool_messages: {settings.dispatch_keep_full_tool_messages}",
+                f"  dispatch_full_tool_hysteresis: {settings.dispatch_full_tool_hysteresis}",
+                f"  dispatch_full_tool_budget_tokens: {settings.dispatch_full_tool_budget_tokens}",
+                f"  dispatch_compact_low_ratio: {settings.dispatch_compact_low_ratio}",
             ]
         )
     return "\n".join(lines).strip()
@@ -396,6 +420,25 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     except (TypeError, ValueError):
         dispatch_keep_tools = default_dispatch_keep_tools
 
+    hysteresis_raw = ctx.get("dispatch_full_tool_hysteresis", 2.5)
+    try:
+        dispatch_full_tool_hysteresis = min(8.0, max(1.0, float(hysteresis_raw)))
+    except (TypeError, ValueError):
+        dispatch_full_tool_hysteresis = 2.5
+
+    default_full_tool_budget = min(48_000, max(8_000, int(max_tokens * 0.12)))
+    budget_raw = ctx.get("dispatch_full_tool_budget_tokens", default_full_tool_budget)
+    try:
+        dispatch_full_tool_budget_tokens = max(2_000, int(budget_raw))
+    except (TypeError, ValueError):
+        dispatch_full_tool_budget_tokens = default_full_tool_budget
+
+    low_ratio_raw = ctx.get("dispatch_compact_low_ratio", 0.4)
+    try:
+        dispatch_compact_low_ratio = min(0.95, max(0.05, float(low_ratio_raw)))
+    except (TypeError, ValueError):
+        dispatch_compact_low_ratio = 0.4
+
     dedupe_reads = ctx.get("dispatch_dedupe_read_paths", is_auto_compress_strategy(compress_strategy))
     if isinstance(dedupe_reads, str):
         dispatch_dedupe_read_paths = dedupe_reads.strip().lower() not in ("0", "false", "no")
@@ -499,6 +542,9 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         compress_summary_chunk_chars=compress_summary_chunk_chars,
         dispatch_tool_chain_compress=bool(dispatch_chain_compress),
         dispatch_keep_full_tool_messages=dispatch_keep_tools,
+        dispatch_full_tool_hysteresis=dispatch_full_tool_hysteresis,
+        dispatch_full_tool_budget_tokens=dispatch_full_tool_budget_tokens,
+        dispatch_compact_low_ratio=dispatch_compact_low_ratio,
         dispatch_dedupe_read_paths=dispatch_dedupe_read_paths,
         grep_context_lines=grep_context_lines,
         grep_max_inline_chars=grep_max_inline_chars,

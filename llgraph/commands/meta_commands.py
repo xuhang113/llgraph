@@ -49,8 +49,18 @@ def _print_trace_stats(
     spill = agent_session.context_spill if agent_session else None
     spilled_bytes = spill.spilled_bytes_on_disk() if spill else 0
     spill_count = spill.spill_count() if spill else 0
-    # 启发式：system + 首轮 user 约可缓存前缀
-    cacheable = min(messages_tokens, int(messages_tokens * 0.15)) if messages_tokens else 0
+    # 实测：相邻两次出站的公共前缀（prompt cache 真正能命中的部分）
+    from llgraph.context.dispatch_compaction import (
+        format_prefix_stability,
+        last_dispatch_prefix_report,
+    )
+
+    prefix_report = last_dispatch_prefix_report(
+        agent_session.thread_id if agent_session else None
+    )
+    cacheable = (
+        int(messages_tokens * prefix_report.stable_ratio) if prefix_report else 0
+    )
 
     emit_report(
         format_spill_stats(
@@ -60,6 +70,7 @@ def _print_trace_stats(
             cacheable_prefix_estimate=cacheable,
         )
     )
+    emit(format_prefix_stability(prefix_report), colorize=True)
     spill_dir = workspace / ".llgraph" / "context" / "tool-results"
     emit(f"落盘目录: {spill_dir}", colorize=True)
     try:
