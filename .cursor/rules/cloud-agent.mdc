@@ -1,0 +1,13 @@
+---
+description: Cloud Agent 开工/收工与 changelog
+alwaysApply: true
+---
+
+# Cloud Agent
+
+- 开工：`AGENTS.md` → `changelog/` 最近 3 条 → 下手文件
+- 人手轮：只做点名需求。定时轮：速度 / 性能 / 稳定性 / 商用体验里选一件做深
+- 先看 changelog 再动手，不要推倒重来
+- 收工必须新增 changelog；没有高价值切口只写下一步
+- 禁止提交密钥、`.env`、网关令牌
+- 改完相关测试要通过，CLI 入口不要弄坏
