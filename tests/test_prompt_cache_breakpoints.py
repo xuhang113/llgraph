@@ -190,3 +190,111 @@ def test_cache_hit_ratio_is_high_on_append_only_loop(steps: int) -> None:
         total += len(cb)
     if steps >= 5:
         assert hit / total > 0.6, f"命中块占比过低: {hit}/{total}"
+
+
+def _readable_prefix_per_step(workspace: Path, steps: int, chars: int) -> tuple[list[int], float]:
+    """走真实出站管线，按 Anthropic 语义算每步能读回多少块。
+
+    Anthropic 在断点位置写下的条目覆盖块 [0, B]，下一次请求只有自己的 [0, B]
+    与之逐字节全等才能读回该条目——不是任意最长公共前缀。
+
+    @param workspace 工作区根（提供 .llgraph/agent.json）
+    @param steps 工具循环步数
+    @param chars 每步工具正文字符数
+    @return (每步可读回块数, 总可读字符占比)
+    """
+    from llgraph.context.dispatch_compaction import reset_dispatch_compaction_state
+    from llgraph.context.message_normalize import prepare_messages_for_llm_dispatch
+    from llgraph.context.runtime_context import set_active_thread_id
+
+    reset_dispatch_compaction_state()
+    set_active_thread_id("cache-growth")
+    try:
+        history: list = [HumanMessage(content="逐个读模块，找出 token 刷新逻辑")]
+        entries: list[tuple[int, list[str]]] = []
+        readable: list[int] = []
+        total = read_total = 0
+
+        for i in range(steps):
+            outbound = prepare_messages_for_llm_dispatch(
+                history,
+                agent_system_content="你是 llgraph。" + "规范。" * 100,
+                workspace=workspace,
+                model_id="claude-sonnet-4-6",
+            )
+            system, _formatted = _format_messages(outbound)
+            seq = _flatten_with_system(system, outbound)
+            bodies = [h for h, _bp in seq]
+            sizes = [len(h) for h in bodies]
+            msg_bps = sum(1 for _h, bp in _flatten(outbound) if bp)
+            assert msg_bps <= MAX_MESSAGE_BREAKPOINTS, f"第 {i} 步消息级断点超预算: {msg_bps}"
+
+            best = 0
+            for upto, prefix in entries:
+                if upto + 1 > best and bodies[: upto + 1] == prefix:
+                    best = upto + 1
+            readable.append(best)
+            read_total += sum(sizes[:best])
+            total += sum(sizes)
+            for pos, (_h, bp) in enumerate(seq):
+                if bp:
+                    entries.append((pos, bodies[: pos + 1]))
+
+            history = [
+                *history,
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {"name": "read_file", "args": {"target_file": f"src/m{i}.py"}, "id": f"c{i}"}
+                    ],
+                ),
+                ToolMessage(
+                    content=f"--- src/m{i}.py ---\n" + f"line{i} " * (chars // 7),
+                    tool_call_id=f"c{i}",
+                    name="read_file",
+                ),
+            ]
+        return readable, read_total / total
+    finally:
+        set_active_thread_id(None)
+        reset_dispatch_compaction_state()
+
+
+def _flatten_with_system(system: object, messages: list) -> list[tuple[str, bool]]:
+    """system 块 + 消息块，即 Anthropic 缓存前缀里除 tools 外的全部内容。"""
+    out: list[tuple[str, bool]] = []
+    if isinstance(system, list):
+        for block in system:
+            body = {k: v for k, v in block.items() if k != "cache_control"}
+            out.append(
+                (
+                    json.dumps(body, sort_keys=True, ensure_ascii=False),
+                    bool(block.get("cache_control")),
+                )
+            )
+    elif system:
+        out.append((str(system), False))
+    return [*out, *_flatten(messages)]
+
+
+@pytest.mark.parametrize("chars", [3_000, 12_000])
+def test_readable_cache_prefix_grows_with_conversation(tmp_path: Path, chars: int) -> None:
+    """核心回归：可读回的缓存前缀必须随对话**增长**，不能冻结在开头。
+
+    这是原实现真正的失效形态，且两个修复缺一不可，所以必须走完整出站管线来测：
+    - 断点打在 ephemeral 尾巴上 → 每步的条目下一步都作废，永远只读回 system 那 1 块；
+    - recency 滑窗每步改写历史 → 断点修好了也只在头几步有效，之后塌回 2 块。
+    修好后是「锯齿上升」：纪元内逐步增长，压缩那一步回落到本轮 user 断点再重新爬。
+    """
+    (tmp_path / ".llgraph").mkdir()
+    (tmp_path / ".llgraph" / "agent.json").write_text(
+        json.dumps({"context": {"dispatch_keep_full_tool_messages": 3}}), encoding="utf-8"
+    )
+
+    readable, ratio = _readable_prefix_per_step(tmp_path, steps=12, chars=chars)
+
+    third = len(readable) // 3
+    early, late = max(readable[:third]), max(readable[-third:])
+    assert late > early * 2, f"可读前缀未随对话增长（前段 {early} 块 → 后段 {late} 块）: {readable}"
+    # 冻结形态下这个比值只有 4% 上下；修好后实测约 70%
+    assert ratio > 0.5, f"缓存可读字符占比过低: {ratio:.1%}，每步可读块数 {readable}"
