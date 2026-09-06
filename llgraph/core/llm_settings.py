@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from llgraph.config.config import ENV_MODEL, get_llgraph_settings
+from llgraph.config.config import ENV_MODEL, resolve_configured_model
 from llgraph.config.edit_settings import load_agent_config
 
 DEFAULT_MAX_TOKENS = 16_384
@@ -64,8 +64,7 @@ def resolve_effective_model(workspace: Path | None = None) -> str:
         if isinstance(raw, str) and raw.strip():
             return raw.strip()
 
-    settings = get_llgraph_settings()
-    return settings["model"]
+    return resolve_configured_model()
 
 
 def resolve_llm_settings(workspace: Path | None = None) -> LlmSettings:
@@ -116,7 +115,7 @@ def format_model_status(workspace: Path) -> str:
     @return 多行说明
     """
     effective = resolve_effective_model(workspace)
-    env_model = get_llgraph_settings()["model"]
+    env_model = resolve_configured_model()
     lines = [
         f"当前模型: {effective}",
     ]
@@ -158,7 +157,7 @@ def format_model_banner_suffix(workspace: Path) -> str:
     cfg = load_agent_config(workspace)
     llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
     if isinstance(llm_cfg.get("model"), str) and llm_cfg.get("model", "").strip():
-        env_model = get_llgraph_settings()["model"]
+        env_model = resolve_configured_model()
         if effective != env_model:
             return f"{effective}（工作区 agent.json llm.model；env 为 {env_model}）"
         return f"{effective}（工作区 agent.json llm.model）"

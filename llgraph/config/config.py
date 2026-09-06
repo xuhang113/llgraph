@@ -18,7 +18,15 @@ ENV_API_BASE_URL = "LLGRAPH_API_BASE_URL"
 ENV_API_KEY = "LLGRAPH_API_KEY"
 ENV_MODEL = "LLGRAPH_MODEL"
 
+# 置 1 时只认进程内已 export 的变量，不读磁盘 env 文件（单测隔离用）
+ENV_IGNORE_ENV_FILES = "LLGRAPH_IGNORE_ENV_FILES"
+
 DEFAULT_MODEL = "claude-opus-4-6"
+
+
+def env_files_ignored() -> bool:
+    """@return 是否跳过磁盘 env 文件（只认已 export 的变量）"""
+    return os.getenv(ENV_IGNORE_ENV_FILES, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def load_llgraph_env() -> None:
@@ -27,11 +35,28 @@ def load_llgraph_env() -> None:
     1. ~/.config/llgraph/llgraph.env
     2. 项目根目录 .env（llgraph 仓库内，可选）
     3. 当前 shell 已 export 的变量保持不变
+
+    置 ``LLGRAPH_IGNORE_ENV_FILES=1`` 时两个文件都不读。
     """
+    if env_files_ignored():
+        return
     if LLGRAPH_ENV_FILE.is_file():
         load_dotenv(LLGRAPH_ENV_FILE, override=False)
     if _PROJECT_ENV.is_file():
         load_dotenv(_PROJECT_ENV, override=True)
+
+
+def resolve_configured_model() -> str:
+    """
+    读取配置的模型 id；缺网关凭据也不报错。
+
+    模型名与凭据是两件事：上下文窗口、dispatch profile、缓存键、trace 展示
+    都只需要模型名，不该因为没配 key 就崩。
+
+    @return 模型 id；未配置时为 DEFAULT_MODEL
+    """
+    load_llgraph_env()
+    return os.getenv(ENV_MODEL, DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
 
 def get_llgraph_settings() -> dict[str, str]:
@@ -40,10 +65,9 @@ def get_llgraph_settings() -> dict[str, str]:
 
     @return base_url、api_key、model
     """
-    load_llgraph_env()
+    model = resolve_configured_model()
     base_url = os.getenv(ENV_API_BASE_URL, "").strip()
     api_key = os.getenv(ENV_API_KEY, "").strip()
-    model = os.getenv(ENV_MODEL, DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
     missing: list[str] = []
     if not base_url:
