@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 import time
 
+from langchain_core.messages import BaseMessage
+
 from llgraph.core.react_limits import resolve_agent_max_turns
 from llgraph.core.react_graph import build_react_graph
 
@@ -455,8 +457,6 @@ def invoke_agent(
     recent_messages: list[BaseMessage] | None = None
     edited_paths: list[str] | None = None
     if with_memory:
-        from langchain_core.messages import BaseMessage
-
         try:
             state = agent.get_state({"configurable": {"thread_id": thread_id}})
             recent_messages = list((state.values or {}).get("messages") or [])

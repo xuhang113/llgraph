@@ -12,6 +12,9 @@ from llgraph.memory.paths import workspace_identity
 from llgraph.memory.store import list_memory_rows
 from llgraph.memory.write import delete_memory, upsert_memory
 
+# 记忆落盘走 LanceDB，属可选依赖：pip install 'llgraph[index]'
+pytest.importorskip("lancedb", reason="需要可选依赖 lancedb")
+
 
 @pytest.fixture
 def memory_workspace(tmp_path: Path) -> Path:

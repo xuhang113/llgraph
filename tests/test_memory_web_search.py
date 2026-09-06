@@ -32,6 +32,7 @@ def test_memory_status_disabled_counts(memory_workspace: Path, monkeypatch) -> N
 
 
 def test_search_browse_and_query(memory_workspace: Path, monkeypatch) -> None:
+    pytest.importorskip("lancedb", reason="需要可选依赖 lancedb")
     monkeypatch.setenv("USER", "web-user")
     with patch("llgraph.memory.write.embed_memory_text", return_value=[0.5] * 8):
         upsert_memory(memory_workspace, content="使用简体中文回复", kind="pref")

@@ -4,12 +4,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from llgraph.context.context_stats import collect_context_usage
 from llgraph.context.context_session import ContextSession
 from llgraph.core.agent_session import AgentSessionContext
-from llgraph.web.server.app import _resolve_session_kind
+
+# Web Console 属可选依赖：pip install 'llgraph[web]'
+pytest.importorskip("fastapi", reason="需要可选依赖 fastapi")
+
+from llgraph.web.server.app import _resolve_session_kind  # noqa: E402
 
 
 def test_resolve_session_kind_from_cli_prefix(tmp_path: Path) -> None:

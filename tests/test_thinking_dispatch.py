@@ -32,6 +32,14 @@ def _thinking_plus_text_messages() -> list:
     ]
 
 
+def _last_ai(prepared: list) -> AIMessage:
+    """取出站消息里最后一条 assistant（尾部可能挂 system-reminder）。"""
+    for msg in reversed(prepared):
+        if isinstance(msg, AIMessage):
+            return msg
+    raise AssertionError("出站消息里没有 AIMessage")
+
+
 @pytest.fixture(autouse=True)
 def _reset_runtime_thinking() -> None:
     set_runtime_thinking(None)
@@ -92,8 +100,7 @@ def test_thinking_only_persisted_by_model(
         workspace=None,
         model_id=model_id,
     )
-    ai = prepared[-1]
-    assert isinstance(ai, AIMessage)
+    ai = _last_ai(prepared)
     meta = (ai.additional_kwargs or {}).get("llgraph") or {}
     has_meta = "我在规划" in str(meta.get("thinking_text") or "")
     assert has_meta is expect_thinking_text
@@ -109,8 +116,7 @@ def test_claude_thinking_on_rehydrates_native_block() -> None:
         workspace=None,
         model_id="claude-sonnet-4-6",
     )
-    ai = prepared[-1]
-    content = ai.content
+    content = _last_ai(prepared).content
     assert isinstance(content, list)
     assert any(
         isinstance(b, dict) and b.get("type") == "thinking"
@@ -140,7 +146,7 @@ def test_thinking_plus_text_reasoning_by_model(
         workspace=None,
         model_id=model_id,
     )
-    ai = prepared[-1]
+    ai = _last_ai(prepared)
     if isinstance(ai.content, str):
         assert ai.content == "hello"
     else:

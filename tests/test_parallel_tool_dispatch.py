@@ -15,6 +15,7 @@ from llgraph.core.gateway_kimi_patch import (
     patch_gateway_kimi_reasoning_payload,
 )
 from llgraph.core.llm import create_gateway_llm
+from llgraph.core.llm_settings import set_runtime_model
 from llgraph.core.model_thinking import set_runtime_thinking
 from llgraph.core.model_thinking_profile import (
     apply_thinking_dispatch_overrides,
@@ -106,7 +107,10 @@ def _http_payload_for_model(model_id: str, messages: list) -> list[dict]:
         workspace=WORKSPACE,
         model_id=model_id,
     )
+    # HTTP 层注入按 llm.model 判定，客户端必须建在被测模型上
+    set_runtime_model(model_id)
     llm = create_gateway_llm(WORKSPACE)
+    assert llm.model == model_id
     payload = llm._get_request_payload(prepared)
     formatted = payload.get("messages")
     assert isinstance(formatted, list)
@@ -114,10 +118,12 @@ def _http_payload_for_model(model_id: str, messages: list) -> list[dict]:
 
 
 @pytest.fixture(autouse=True)
-def _reset_runtime_thinking() -> None:
+def _reset_runtime_overrides() -> None:
     set_runtime_thinking(None)
+    set_runtime_model(None)
     yield
     set_runtime_thinking(None)
+    set_runtime_model(None)
 
 
 @pytest.mark.parametrize("model_id", CATALOG_MODELS)
@@ -151,6 +157,8 @@ def test_apply_thinking_dispatch_override_keeps_expand_false() -> None:
 
 @pytest.mark.parametrize("model_id", ["kimi-k2.6", "deepseek-v4-flash", "glm-5"])
 def test_kimi_style_models_reasoning_on_bundled_tool_assistant(model_id: str) -> None:
+    """thinking 开启时，这几家要求 tool 轮 assistant 带回 reasoning，否则网关 400。"""
+    set_runtime_thinking(True)
     formatted = _http_payload_for_model(model_id, _parallel_tool_round())
     missing = missing_reasoning_on_formatted_tool_assistants(
         formatted,

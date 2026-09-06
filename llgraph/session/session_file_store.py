@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, messages_from_dict, messages_to_dict
 
 from llgraph.core.user_message_content import strip_inline_images_from_messages
 from llgraph.session.jsonl_read import open_jsonl_for_read
 from llgraph.session.user_storage import session_messages_path, session_thread_dir, user_sessions_root
+
+if TYPE_CHECKING:
+    from llgraph.context.context_session import ContextSession
 
 
 def save_session_messages(
