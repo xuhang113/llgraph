@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches:
+      - main
+      - cursor/auto_upgrade
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        # web extra 供 Web Console 用例；lancedb 等重依赖缺失时用例自行 skip
+        run: |
+          python -m pip install -U pip
+          python -m pip install -e ".[web]" pytest ruff
+
+      - name: Lint
+        run: python -m ruff check llgraph tests
+
+      - name: Test
+        # 单测不读磁盘 env 文件、不打真网关（见 tests/conftest.py）
+        run: python -m pytest -q
+
+      - name: CLI 可启动
+        run: |
+          python -m llgraph --help > /dev/null
+          python -c "import llgraph.main"
