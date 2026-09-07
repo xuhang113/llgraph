@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from llgraph.core.agent import rebuild_agent_preserving_memory
 from llgraph.core.agent_session import AgentSessionContext
 from llgraph.config.web_search_settings import (
     resolve_web_search_settings,
@@ -58,6 +57,9 @@ def set_session_web_search_mode(
         ok, err = validate_web_search_ready(agent_session.workspace)
         if not ok:
             return False, err
+
+    # 延迟导入：core.agent 是冷启动最重的一条链，只有真正重建 Agent 时才拉
+    from llgraph.core.agent import rebuild_agent_preserving_memory
 
     write_mode = agent_session.allow_write
     rebuild_agent_preserving_memory(

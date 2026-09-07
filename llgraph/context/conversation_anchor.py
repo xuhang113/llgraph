@@ -10,7 +10,6 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
-from llgraph.core.llm import create_gateway_llm
 from llgraph.session.session_manifest import (
     _rel_workspace_path,
     conversation_anchor_json_path,
@@ -534,6 +533,10 @@ def _invoke_anchor_summary_llm(
     @param model_name 压缩用模型
     @return 章节增量
     """
+    # 延迟导入：create_gateway_llm 会拉起 langchain_anthropic + anthropic（约 0.5s），
+    # 只有真正调压缩 LLM 时才需要，不能拖慢 CLI 冷启动。
+    from llgraph.core.llm import create_gateway_llm
+
     llm = create_gateway_llm(workspace)
     if model_name:
         llm = llm.bind(model=model_name)

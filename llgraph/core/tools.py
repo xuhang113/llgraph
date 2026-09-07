@@ -16,8 +16,7 @@ from llgraph.core.todo_tools import create_todo_tools
 from llgraph.session.session_history_tools import create_session_history_tools
 from llgraph.core.shell_tools import create_shell_tools
 from llgraph.core.web_search_tools import create_web_search_tools
-from llgraph.config.mcp_config import resolve_mcp_settings
-from llgraph.core.mcp_tools import McpToolRegistry, create_mcp_tools
+from llgraph.core.mcp_bundle import load_mcp_tool_bundle
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.core.write_failure_tracker import WriteFailureTracker
 from llgraph.core.workspace import WorkspaceContext
@@ -103,33 +102,5 @@ def get_agent_tools(
     return apply_spill_to_tools(tools, context_spill)
 
 
-def load_mcp_tool_bundle(
-    workspace: Path,
-    *,
-    allow_write: bool = False,
-) -> tuple[list, McpToolRegistry | None, str]:
-    """
-    加载 MCP 工具与 registry。
-
-    失败可降级：不抛异常，仅跳过失败 Server；不影响 Agent 其它工具。
-
-    @param workspace 工作区根
-    @param allow_write 是否允许 MCP 写类工具
-    @return (tools, registry, summary)
-    """
-    from llgraph.config.mcp_config import format_mcp_summary
-
-    try:
-        settings = resolve_mcp_settings(workspace, allow_write=allow_write)
-    except Exception as exc:
-        return [], None, f"MCP: 配置解析失败（已跳过）{exc}"
-
-    try:
-        tools, registry = create_mcp_tools(settings)
-    except Exception as exc:
-        return [], None, f"MCP: 加载失败（已跳过，不影响其它功能）{exc}"
-
-    summary = format_mcp_summary(settings)
-    if registry is not None:
-        summary = registry.summary()
-    return tools, registry, summary
+# 实现已挪到 llgraph.core.mcp_bundle（冷启动不想为它拉整条工具链）；此处保留老 import 路径
+__all__ = ["get_agent_tools", "get_current_utc_time", "load_mcp_tool_bundle"]

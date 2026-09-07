@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from llgraph.core.agent import rebuild_agent_preserving_memory
 from llgraph.core.agent_session import AgentSessionContext
 from llgraph.context.context_session import ContextSession
 from llgraph.config.edit_settings import resolve_edit_settings
@@ -134,6 +133,8 @@ def set_session_write_mode(
         allow_write=enabled,
     )
     agent_session.sandbox_policy = sandbox_policy
+
+    from llgraph.core.agent import rebuild_agent_preserving_memory
 
     rebuild_agent_preserving_memory(
         agent_session,

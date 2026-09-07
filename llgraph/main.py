@@ -1,4 +1,12 @@
-"""命令行入口：运行 Gateway-backed LangGraph Agent。"""
+"""命令行入口：运行 Gateway-backed LangGraph Agent。
+
+本模块顶层只 import 标准库与 `trace_mode`（纯 Enum）。
+`llgraph.core.agent` / `trace_display` / 会话落盘等重链路一律函数内延迟 import：
+`--help`、`--list-sessions`、`llgraph index|search|web` 不该为了打印一行
+而先付 1s 的 langchain + anthropic SDK import。
+"""
+
+from __future__ import annotations
 
 import argparse
 import logging
@@ -6,17 +14,16 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from llgraph.core.agent import build_agent
-from llgraph.config.edit_settings import resolve_edit_settings
-from llgraph.core.write_failure_tracker import WriteFailureTracker
-from llgraph.core.agent_session import AgentSessionContext
-from llgraph.config.config import load_llgraph_env
-from llgraph.context.context_session import ContextSession
-from llgraph.session.session_edits import SessionEditTracker
-from llgraph.display.trace_display import TraceMode, TraceSession, parse_trace_mode
-from llgraph.config.workspace_config import init_user_llgraph, init_workspace_llgraph
+from llgraph.display.trace_mode import TraceMode, parse_trace_mode
+
+if TYPE_CHECKING:
+    from llgraph.context.context_session import ContextSession
+    from llgraph.core.agent_session import AgentSessionContext
+    from llgraph.core.write_failure_tracker import WriteFailureTracker
+    from llgraph.display.trace_display import TraceSession
+    from llgraph.session.session_edits import SessionEditTracker
 
 
 def _run_once(
@@ -251,6 +258,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    from llgraph.config.config import load_llgraph_env
+
     load_llgraph_env()
 
     workspace = Path(args.workspace or os.getcwd()).expanduser().resolve()
@@ -337,6 +346,8 @@ def main() -> None:
         )
 
     if args.init_config or args.init_config_force:
+        from llgraph.config.workspace_config import init_workspace_llgraph
+
         try:
             copied = init_workspace_llgraph(
                 workspace,
@@ -360,6 +371,8 @@ def main() -> None:
             return
 
     if args.init_user_config or args.init_user_config_force:
+        from llgraph.config.workspace_config import init_user_llgraph
+
         try:
             user_copied = init_user_llgraph(force=args.init_user_config_force)
         except FileNotFoundError as exc:
@@ -379,6 +392,7 @@ def main() -> None:
         ):
             return
 
+    from llgraph.display.trace_display import TraceSession
     from llgraph.terminal.markdown_render import markdown_render_enabled, resolve_rich_from_env
 
     initial_mode = parse_trace_mode(args.trace) or TraceMode.STEPS
@@ -419,6 +433,8 @@ def main() -> None:
             flush=True,
         )
 
+    from llgraph.context.context_session import ContextSession
+
     context_session = ContextSession()
 
     from llgraph.code_index.index_watch import (
@@ -440,7 +456,11 @@ def main() -> None:
     start_memory_consolidate_scheduler()
     attach_memory_scheduler_shutdown()
 
+    from llgraph.config.edit_settings import resolve_edit_settings
     from llgraph.context.context_spill import ContextSpill
+    from llgraph.core.agent_session import AgentSessionContext
+    from llgraph.core.write_failure_tracker import WriteFailureTracker
+    from llgraph.session.session_edits import SessionEditTracker
 
     edit_tracker: SessionEditTracker | None = None
     write_failure_tracker: WriteFailureTracker | None = None
@@ -449,7 +469,7 @@ def main() -> None:
     context_spill: ContextSpill | None = None
     agent_session: AgentSessionContext | None = None
     try:
-        from llgraph.core.tools import load_mcp_tool_bundle
+        from llgraph.core.mcp_bundle import load_mcp_tool_bundle
 
         mcp_tools, mcp_registry, mcp_summary = load_mcp_tool_bundle(
             workspace,
@@ -482,6 +502,8 @@ def main() -> None:
             def _on_changed(rel: str) -> None:
                 if watch_service is not None:
                     watch_service.notify_changed(rel)
+
+            from llgraph.core.agent import build_agent
 
             agent = build_agent(
                 with_memory=with_memory,
@@ -567,19 +589,32 @@ def main() -> None:
             ):
                 sess.watch_service.notify_changed(rel)
 
-        agent = build_agent(
-            with_memory=True,
-            workspace_root=workspace,
-            allow_write=allow_write,
-            edit_tracker=edit_tracker if allow_write else None,
-            on_file_changed=on_file_changed if allow_write else None,
-            mcp_tools=mcp_tools,
-            context_spill=context_spill,
-            write_failure_tracker=write_failure_tracker,
-            web_search_enabled=web_search_enabled,
-            context_session=context_session,
-            sandbox_policy=sandbox_policy,
-        )
+        # 凭据缺失要在 banner 之前就报错（延迟构建会把 RuntimeError 推到首轮）
+        from llgraph.config.config import get_llgraph_settings
+
+        get_llgraph_settings()
+
+        def _build_interactive_agent() -> Any:
+            from llgraph.core.agent import build_agent
+
+            return build_agent(
+                with_memory=True,
+                workspace_root=workspace,
+                allow_write=allow_write,
+                edit_tracker=edit_tracker if allow_write else None,
+                on_file_changed=on_file_changed if allow_write else None,
+                mcp_tools=mcp_tools,
+                context_spill=context_spill,
+                write_failure_tracker=write_failure_tracker,
+                web_search_enabled=web_search_enabled,
+                context_session=context_session,
+                sandbox_policy=sandbox_policy,
+            )
+
+        from llgraph.runtime.agent_warmup import LazyAgent
+
+        # 交互模式：banner / 提示符先出来，Agent 在后台线程建，首轮再阻塞等它
+        agent = LazyAgent(_build_interactive_agent)
         agent_session = AgentSessionContext(
             agent=agent,
             workspace=workspace,

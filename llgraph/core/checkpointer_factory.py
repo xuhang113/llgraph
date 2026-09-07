@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Any
-
-from langgraph.checkpoint.memory import MemorySaver
+from typing import TYPE_CHECKING, Any
 
 from llgraph.session.user_storage import cleanup_obsolete_session_storage
 
+if TYPE_CHECKING:
+    from langgraph.checkpoint.memory import MemorySaver
+
 _CHECKPOINTER_LOCK = threading.Lock()
-_MEMORY_SAVERS: dict[str, MemorySaver] = {}
+_MEMORY_SAVERS: dict[str, "MemorySaver"] = {}
 
 
 def create_checkpointer(
@@ -32,6 +33,10 @@ def create_checkpointer(
     """
     if not with_memory:
         return None
+
+    # 延迟导入：langgraph.checkpoint 会拉起 langgraph 主链（约 0.19s），
+    # 而 checkpointer_kind() 这类纯文案查询根本用不到它。
+    from langgraph.checkpoint.memory import MemorySaver
 
     cleanup_obsolete_session_storage(workspace.expanduser().resolve())
 

@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
-from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from llgraph.context.context_message_split import split_messages_for_compress_strategy
 from llgraph.context.context_settings import is_auto_compress_strategy, resolve_context_settings
@@ -131,6 +130,9 @@ def replace_agent_messages(agent: Any, config: dict[str, Any], messages: list[Ba
     @param config configurable thread 配置
     @param messages 替换后的完整消息链
     """
+    # 延迟导入：langgraph.graph 约 0.27s，只有真正改 agent 状态时才需要。
+    from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
     agent.update_state(
         config,
         {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *messages]},

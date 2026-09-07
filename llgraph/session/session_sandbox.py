@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from llgraph.config.sandbox_settings import resolve_sandbox_settings
-from llgraph.core.agent import rebuild_agent_preserving_memory
 from llgraph.core.agent_session import AgentSessionContext
 from llgraph.sandbox.policy import build_sandbox_policy
 
@@ -67,6 +66,8 @@ def set_session_sandbox_mode(
     if enabled and not new_policy.enabled:
         warning = new_policy.startup_warning()
         return False, warning or "沙箱后端不可用，无法启用。"
+
+    from llgraph.core.agent import rebuild_agent_preserving_memory
 
     write_mode = agent_session.allow_write
     rebuild_agent_preserving_memory(
