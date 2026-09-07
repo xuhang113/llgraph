@@ -1,7 +1,9 @@
 # 2026-09-07 冷启动：提示符 1.04s → 0.24s
 
-选题：**速度（启动耗时）**。changelog 已有方向都在工具层与首 token 前奏
-（`test_invoke_prelude_latency` 等），启动这一段没人碰过，量了一下是最大的一块。
+选题：**速度（启动耗时）**。接 `2026-09-05-first-token-prelude.md` 结尾点名的那条线：
+「`import llgraph.core.agent` 单独就要 2.2s，是敲下回车到出提示符之间的固定成本，
+可考虑按需延迟」。上一轮把首 token 前奏从 1503ms 打到 34ms 之后，启动这一段
+就成了单笔最大的墙钟，而且此前没人碰过。
 
 先量再改。同机采样：`llgraph --help` 1174ms，交互 time-to-banner 1040ms，
 其中真正干活（sandbox / watch / MCP / build_agent）只有 72ms —— **93% 是 import**。
@@ -97,7 +99,8 @@
 - `tests/test_agent_warmup.py`：转发透明、并发只建一次、后台成功被复用、
   后台失败在主线程原样抛出。
 
-手工：`545 passed, 4 skipped`；`ruff check` 通过；`pip install -e .` 重装后
+手工：`python -m pytest -q` 全绿（装了 `.[web]` 时 548 passed / 3 skipped）；
+`ruff check llgraph tests` 通过；`pip install -e .` 重装后
 `llgraph --help` / `python -m llgraph` / `--once` / `--thread-id` 恢复 /
 `--list-sessions` / `/context` / `/tools` / `/write on` / `/model` 均正常；
 banner 输出与改前逐字符一致（仅随机 thread_id 不同）；
@@ -111,7 +114,11 @@ banner 输出与改前逐字符一致（仅随机 thread_id 不同）；
 - 带 MCP Server 时多出的 ~0.2s 是真在起 stdio 子进程 + 建 StructuredTool，
   属于功能开销。要动就得改成「首轮再连 MCP」，会牵动 `/tools` 展示与工具注册时序，
   **本轮不碰**。
-- 没有做「启动即开 prewarm 线程」这类看着聪明其实无效的优化（GIL），
-  下一轮别再往这个方向试。
+- 没有做「启动即开 prewarm 线程去抢 import」这类看着聪明其实无效的优化：
+  GIL 下 import 是 CPU 密集，主线程同时也在 import，并发不会更快。
+  收益只可能来自「把重活挪到主线程空闲等输入之后」，下一轮别再往前者试。
+- 上一轮提到的 `build_agent` 里 19 个工具的 pydantic schema 生成没有再优化：
+  它现在整体落在 `LazyAgent` 后台线程里，已经不在用户等待路径上，
+  **不要**为它去改工具 schema 的定义方式。
 - 下一轮建议换赛道：**稳定性**（工具失败恢复 / 压缩丢上下文 / 并发竞态）
   或**商用体验**（计划-多 Agent、记忆连续性）。速度这条线的低垂果实已经摘完。
