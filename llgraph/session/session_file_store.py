@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +17,11 @@ from llgraph.session.user_storage import session_messages_path, session_thread_d
 
 if TYPE_CHECKING:
     from llgraph.context.context_session import ContextSession
+
+_LOG = logging.getLogger(__name__)
+
+CORRUPT_BACKUP_PREFIX = "corrupt-"
+_MAX_CORRUPT_BACKUPS = 3
 
 
 def save_session_messages(
@@ -100,6 +107,66 @@ def read_session_message_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
     return rows, dropped
 
 
+def quarantine_corrupt_messages(path: Path) -> Path | None:
+    """
+    把解析不了的 messages.jsonl 原始字节另存一份再让流程继续。
+
+    本轮结束时 `persist_agent_session` 会用 Agent 状态全量覆盖这个文件，
+    坏字节一旦被覆盖就再也捞不回来了；先留一份副本，人工还能救。
+
+    @param path messages.jsonl 路径
+    @return 副本路径；失败返回 None
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    backup = path.with_name(f"{path.name}.{CORRUPT_BACKUP_PREFIX}{stamp}")
+    try:
+        if backup.exists():
+            return backup
+        backup.write_bytes(path.read_bytes())
+    except OSError:
+        return None
+    _prune_corrupt_backups(path)
+    return backup
+
+
+def _prune_corrupt_backups(path: Path) -> None:
+    prefix = f"{path.name}.{CORRUPT_BACKUP_PREFIX}"
+    try:
+        backups = sorted(
+            (p for p in path.parent.iterdir() if p.name.startswith(prefix)),
+            key=lambda p: p.name,
+        )
+    except OSError:
+        return
+    for stale in backups[:-_MAX_CORRUPT_BACKUPS]:
+        try:
+            stale.unlink()
+        except OSError:
+            continue
+
+
+def _recover_messages(path: Path) -> tuple[list[BaseMessage], int]:
+    """
+    读 messages.jsonl 并尽量恢复；有坏行时先留原始副本。
+
+    @param path messages.jsonl 路径
+    @return (可用消息, 丢弃条数)
+    """
+    rows, dropped_rows = read_session_message_rows(path)
+    loaded, dropped_msgs = _messages_from_rows(rows)
+    dropped = dropped_rows + dropped_msgs
+    if not dropped:
+        return loaded, 0
+    backup = quarantine_corrupt_messages(path)
+    _LOG.warning(
+        "会话历史有 %d 条无法解析，已跳过并保留 %d 条；原始副本: %s",
+        dropped,
+        len(loaded),
+        backup or "(保留失败)",
+    )
+    return loaded, dropped
+
+
 def _messages_from_rows(rows: list[dict[str, Any]]) -> tuple[list[BaseMessage], int]:
     """
     行 → 消息对象，逐行兜底。
@@ -136,8 +203,7 @@ def load_session_messages(workspace: Path, thread_id: str) -> list[BaseMessage]:
     path = session_messages_path(workspace, thread_id)
     if not path.is_file():
         return []
-    rows, dropped_rows = read_session_message_rows(path)
-    loaded, dropped_msgs = _messages_from_rows(rows)
+    loaded, dropped = _recover_messages(path)
     if not loaded:
         return []
     from llgraph.context.message_canonical import to_canonical_v2_messages
@@ -147,7 +213,7 @@ def load_session_messages(workspace: Path, thread_id: str) -> list[BaseMessage]:
     from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
 
     with_anchor = ensure_messages_include_conversation_anchor(workspace, thread_id, cleaned)
-    if stripped or with_anchor != cleaned or dropped_rows or dropped_msgs:
+    if stripped or with_anchor != cleaned or dropped:
         save_session_messages(workspace, thread_id, with_anchor)
     return with_anchor
 
@@ -181,8 +247,7 @@ def restore_session_to_agent(
     path = session_messages_path(workspace, thread_id)
     if not path.is_file():
         return 0
-    rows, dropped_rows = read_session_message_rows(path)
-    raw_messages, dropped_msgs = _messages_from_rows(rows)
+    raw_messages, dropped = _recover_messages(path)
     if not raw_messages:
         return 0
 
@@ -191,7 +256,7 @@ def restore_session_to_agent(
     from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
 
     messages = ensure_messages_include_conversation_anchor(workspace, thread_id, messages)
-    if report.changed or stripped or dropped_rows or dropped_msgs:
+    if report.changed or stripped or dropped:
         save_session_messages(workspace, thread_id, messages)
 
     config = {"configurable": {"thread_id": thread_id}}

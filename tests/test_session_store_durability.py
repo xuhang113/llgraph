@@ -22,7 +22,9 @@ from llgraph.session.atomic_store import (
     sweep_stale_temp_files,
 )
 from llgraph.session.session_file_store import (
+    CORRUPT_BACKUP_PREFIX,
     load_session_messages,
+    quarantine_corrupt_messages,
     read_session_message_rows,
     save_session_messages,
 )
@@ -106,6 +108,37 @@ def test_truncated_tail_line_keeps_earlier_history(tmp_path: Path) -> None:
     # 读到坏行会顺手改写回干净的一份，下次读不再有坏行
     _rows, dropped = read_session_message_rows(path)
     assert dropped == 0
+
+
+def test_unrecoverable_history_is_quarantined_before_overwrite(tmp_path: Path) -> None:
+    """整份读不出来也不能静默清空：原始字节先留一份，本轮覆盖写才不算毁数据。"""
+    path = session_messages_path(tmp_path, THREAD)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    garbage = '{"type":"human","data":{\n{"nope"\n'
+    path.write_text(garbage, encoding="utf-8")
+
+    assert load_session_messages(tmp_path, THREAD) == []
+
+    backups = [p for p in path.parent.iterdir() if CORRUPT_BACKUP_PREFIX in p.name]
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == garbage
+
+
+def test_quarantine_keeps_at_most_three_backups(tmp_path: Path) -> None:
+    path = session_messages_path(tmp_path, THREAD)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("坏字节", encoding="utf-8")
+    for i in range(5):
+        stale = path.with_name(f"{path.name}.{CORRUPT_BACKUP_PREFIX}2026010{i}T000000")
+        stale.write_text(f"old {i}", encoding="utf-8")
+
+    fresh = quarantine_corrupt_messages(path)
+    assert fresh is not None and fresh.read_text(encoding="utf-8") == "坏字节"
+
+    kept = sorted(p for p in path.parent.iterdir() if CORRUPT_BACKUP_PREFIX in p.name)
+    assert len(kept) == 3, "副本不能无限堆积"
+    assert fresh in kept
+    assert [p.read_text(encoding="utf-8") for p in kept[:2]] == ["old 3", "old 4"], "只留最近的"
 
 
 def test_garbage_middle_line_drops_only_that_line(tmp_path: Path) -> None:
