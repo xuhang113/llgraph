@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from llgraph.config.edit_settings import EditSettings, resolve_edit_settings
+from llgraph.session.atomic_store import atomic_write_json, atomic_write_text
 from llgraph.session.user_storage import (
     migrate_legacy_workspace_session_dir,
     resolve_session_storage_dir,
@@ -104,10 +105,7 @@ class SessionEditTracker:
                 "workspace": str(self.workspace),
                 "started_at": datetime.now(timezone.utc).isoformat(),
             }
-            meta_path.write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            atomic_write_json(meta_path, meta)
 
     def _load_persisted_edits(self) -> None:
         """从 edits.jsonl 恢复记录。"""
@@ -172,7 +170,8 @@ class SessionEditTracker:
         if not full.is_file():
             return
         try:
-            snap_path.write_text(full.read_text(encoding="utf-8"), encoding="utf-8")
+            # 快照是 /undo 的唯一原文来源，半截快照会把回滚变成毁文件
+            atomic_write_text(snap_path, full.read_text(encoding="utf-8"))
         except OSError:
             pass
 
@@ -301,7 +300,7 @@ class SessionEditTracker:
             )
             if payload:
                 payload += "\n"
-            self._edits_path.write_text(payload, encoding="utf-8")
+            atomic_write_text(self._edits_path, payload)
         except OSError:
             pass
 

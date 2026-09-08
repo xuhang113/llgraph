@@ -172,13 +172,13 @@ def _export_session_archive(
     from llgraph.session.session_manifest import session_archive_jsonl_path
 
     path = session_archive_jsonl_path(workspace, session_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        with path.open("w", encoding="utf-8") as handle:
-            for msg in messages:
-                handle.write(json.dumps(_message_to_dict(msg), ensure_ascii=False) + "\n")
+        from llgraph.session.atomic_store import atomic_write_jsonl
+
+        # 压缩前的全量归档：写坏就等于压缩掉的上下文彻底找不回来
+        atomic_write_jsonl(path, (_message_to_dict(msg) for msg in messages))
         return str(path)
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return None
 
 

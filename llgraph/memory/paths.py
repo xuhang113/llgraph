@@ -132,11 +132,12 @@ def load_memory_meta(user_id: str, workspace_key: str) -> dict:
 
 def save_memory_meta(user_id: str, workspace_key: str, patch: dict) -> None:
     """合并写入 memory_meta.json。"""
+    from llgraph.session.atomic_store import atomic_write_json
+
     path = memory_meta_path(user_id, workspace_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
     existing = load_memory_meta(user_id, workspace_key)
     existing.update(patch)
-    path.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(path, existing)
 
 
 def workspace_identity(workspace: Path, *, user_id: str | None = None) -> tuple[str, str, str]:

@@ -108,15 +108,13 @@ def write_live_progress(workspace: Path, payload: dict[str, Any]) -> None:
     path = live_progress_path(workspace)
     data = dict(payload)
     data["updated_at"] = datetime.now(timezone.utc).isoformat()
-    tmp = path.with_suffix(".tmp")
+    from llgraph.session.atomic_store import atomic_write_json
+
     try:
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        try:
-            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            pass
+        # 固定 tmp 名会被并发索引进程互相截断，改用带 pid/线程 的唯一 tmp
+        atomic_write_json(path, data, indent=None)
+    except (OSError, TypeError, ValueError):
+        pass
 
 
 def read_live_progress(workspace: Path) -> dict[str, Any] | None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +14,7 @@ from llgraph.context.context_session import ContextSession
 from llgraph.loaders.rules_loader import discover_rules
 from llgraph.loaders.skills_loader import SkillEntry, discover_skills
 from llgraph.context.message_normalize import reorder_pinned_session_messages
+from llgraph.session.atomic_store import atomic_write_json
 from llgraph.session.user_storage import session_messages_path, user_sessions_root
 
 SESSION_MANIFEST_TAG = "<session-manifest>"
@@ -285,10 +285,9 @@ def write_session_manifest_json(
     """
     path = session_manifest_json_path(workspace, thread_id)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(path, payload)
         return _rel_workspace_path(workspace, path)
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return None
 
 

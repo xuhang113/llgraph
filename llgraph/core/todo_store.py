@@ -19,6 +19,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from llgraph.context.chat_history_repair import ai_message_tool_calls
 from llgraph.context.investigate_harness import is_ephemeral_harness_human
 from llgraph.context.runtime_context import get_active_thread_id
+from llgraph.session.atomic_store import atomic_write_text
 from llgraph.session.user_storage import session_todos_path
 
 TODO_TOOL_NAME = "todo_write"
@@ -153,7 +154,6 @@ def save_todo_state(workspace: Path, thread_id: str, state: TodoState) -> None:
     @param state 清单
     """
     path = session_todos_path(workspace, thread_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "updated_at": state.updated_at or _utc_now(),
         "todos": [
@@ -161,9 +161,7 @@ def save_todo_state(workspace: Path, thread_id: str, state: TodoState) -> None:
             for item in state.todos
         ],
     }
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def _state_from_dict(data: dict[str, Any]) -> TodoState:

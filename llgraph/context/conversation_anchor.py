@@ -174,10 +174,11 @@ def save_anchor_sections(
         "sections": {key: sections.get(key, "") for key in ANCHOR_SECTION_KEYS},
     }
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        from llgraph.session.atomic_store import atomic_write_json
+
+        atomic_write_json(path, payload)
         return str(path)
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return None
 
 

@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from llgraph.session.atomic_store import atomic_write_text
 from llgraph.session.user_storage import session_thread_dir
 
 
@@ -42,7 +43,6 @@ def register_subagent_child(
     if not sub_thread:
         return
     path = subagents_registry_path(workspace, parent_thread_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
     existing = load_subagent_children(workspace, parent_thread_id)
     now = time.time()
     row = {
@@ -65,7 +65,7 @@ def register_subagent_child(
             next_rows.append(item)
     if not replaced:
         next_rows.append(row)
-    path.write_text(
+    atomic_write_text(
+        path,
         json.dumps({"children": next_rows}, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
     )

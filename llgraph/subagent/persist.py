@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from llgraph.session.atomic_store import atomic_write_text
 from llgraph.session.user_storage import session_messages_path, session_thread_dir
 
 
@@ -39,10 +40,8 @@ def persist_subagent_messages(
     primary: Path | None = None
     if sub_thread and sub_thread.strip():
         primary = session_messages_path(workspace, sub_thread.strip())
-        primary.parent.mkdir(parents=True, exist_ok=True)
-        primary.write_text(text, encoding="utf-8")
+        atomic_write_text(primary, text)
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in key.strip()) or "sub"
     mirror = session_thread_dir(workspace, parent_thread_id) / "subagents" / safe / "messages.jsonl"
-    mirror.parent.mkdir(parents=True, exist_ok=True)
-    mirror.write_text(text, encoding="utf-8")
+    atomic_write_text(mirror, text)
     return primary or mirror

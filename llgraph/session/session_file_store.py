@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, messages_from_dict, messages_to_dict
 
 from llgraph.core.user_message_content import strip_inline_images_from_messages
+from llgraph.session.atomic_store import atomic_write_jsonl
 from llgraph.session.jsonl_read import open_jsonl_for_read
 from llgraph.session.user_storage import session_messages_path, session_thread_dir, user_sessions_root
 
@@ -33,13 +34,10 @@ def save_session_messages(
         return None
     path = session_messages_path(workspace, thread_id)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as handle:
-            for item in messages_to_dict(messages):
-                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+        atomic_write_jsonl(path, messages_to_dict(messages))
         _write_session_meta(workspace, thread_id, len(messages))
         return str(path)
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return None
 
 
@@ -70,32 +68,77 @@ def save_agent_session_messages(
     return path
 
 
-def load_session_messages(workspace: Path, thread_id: str) -> list[BaseMessage]:
+def read_session_message_rows(path: Path) -> tuple[list[dict[str, Any]], int]:
     """
-    从 messages.jsonl 加载对话。
+    容错读取 messages.jsonl 的行。
 
-    @param workspace 工作区根
-    @param thread_id 会话 ID
-    @return 消息列表；无文件或解析失败返回空列表
+    单行坏掉（旧版非原子写留下的半截尾行、外部编辑器截断）只丢那一行，
+    不再整份丢弃——否则一次意外退出就报废整个会话历史。
+
+    @param path messages.jsonl 路径
+    @return (可用行, 丢弃行数)
     """
-    path = session_messages_path(workspace, thread_id)
-    if not path.is_file():
-        return []
     rows: list[dict[str, Any]] = []
+    dropped = 0
     try:
         with open_jsonl_for_read(path) as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
                     continue
-                rows.append(json.loads(line))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return []
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    dropped += 1
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+                else:
+                    dropped += 1
+    except OSError:
+        return [], dropped
+    return rows, dropped
+
+
+def _messages_from_rows(rows: list[dict[str, Any]]) -> tuple[list[BaseMessage], int]:
+    """
+    行 → 消息对象，逐行兜底。
+
+    整批 `messages_from_dict` 失败时退化成逐行转换，坏行单独丢弃。
+
+    @param rows 已解析的 jsonl 行
+    @return (消息列表, 丢弃行数)
+    """
     if not rows:
-        return []
+        return [], 0
     try:
-        loaded = list(messages_from_dict(rows))
+        return list(messages_from_dict(rows)), 0
     except Exception:
+        pass
+    loaded: list[BaseMessage] = []
+    dropped = 0
+    for row in rows:
+        try:
+            loaded.extend(messages_from_dict([row]))
+        except Exception:
+            dropped += 1
+    return loaded, dropped
+
+
+def load_session_messages(workspace: Path, thread_id: str) -> list[BaseMessage]:
+    """
+    从 messages.jsonl 加载对话。
+
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @return 消息列表；无文件或全部无法解析时返回空列表
+    """
+    path = session_messages_path(workspace, thread_id)
+    if not path.is_file():
+        return []
+    rows, dropped_rows = read_session_message_rows(path)
+    loaded, dropped_msgs = _messages_from_rows(rows)
+    if not loaded:
         return []
     from llgraph.context.message_canonical import to_canonical_v2_messages
 
@@ -104,7 +147,7 @@ def load_session_messages(workspace: Path, thread_id: str) -> list[BaseMessage]:
     from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
 
     with_anchor = ensure_messages_include_conversation_anchor(workspace, thread_id, cleaned)
-    if stripped or with_anchor != cleaned:
+    if stripped or with_anchor != cleaned or dropped_rows or dropped_msgs:
         save_session_messages(workspace, thread_id, with_anchor)
     return with_anchor
 
@@ -138,20 +181,9 @@ def restore_session_to_agent(
     path = session_messages_path(workspace, thread_id)
     if not path.is_file():
         return 0
-    rows: list[dict] = []
-    try:
-        with open_jsonl_for_read(path) as handle:
-            for line in handle:
-                line = line.strip()
-                if line:
-                    rows.append(json.loads(line))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return 0
-    if not rows:
-        return 0
-    try:
-        raw_messages = list(messages_from_dict(rows))
-    except Exception:
+    rows, dropped_rows = read_session_message_rows(path)
+    raw_messages, dropped_msgs = _messages_from_rows(rows)
+    if not raw_messages:
         return 0
 
     messages, report = to_canonical_v2_messages(raw_messages)
@@ -159,7 +191,7 @@ def restore_session_to_agent(
     from llgraph.context.conversation_anchor import ensure_messages_include_conversation_anchor
 
     messages = ensure_messages_include_conversation_anchor(workspace, thread_id, messages)
-    if report.changed or stripped:
+    if report.changed or stripped or dropped_rows or dropped_msgs:
         save_session_messages(workspace, thread_id, messages)
 
     config = {"configurable": {"thread_id": thread_id}}

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from llgraph.session.atomic_store import atomic_write_json
 from llgraph.session.user_storage import session_thread_dir
 
 LAST_RUN_FILENAME = "last_run.json"
@@ -168,8 +169,7 @@ def write_session_last_run(
         payload["error_message"] = message[:2000]
 
     path = last_run_path(workspace, thread_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(path, payload)
     _append_run_log(run_log_path(workspace, thread_id), payload)
     return payload
 

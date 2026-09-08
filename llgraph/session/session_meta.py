@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from llgraph.session.atomic_store import atomic_write_json
 from llgraph.session.jsonl_read import open_jsonl_for_read
 from llgraph.session.user_storage import session_messages_path, session_thread_dir, user_sessions_root
 
@@ -100,12 +101,8 @@ def save_session_meta(
     elif not had_activity and not str(merged.get("updated_at") or "").strip():
         merged["updated_at"] = now
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(merged, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
+        atomic_write_json(path, merged)
+    except (OSError, TypeError, ValueError):
         pass
 
 

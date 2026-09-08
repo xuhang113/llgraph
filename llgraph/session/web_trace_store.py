@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from llgraph.session.atomic_store import atomic_write_json
 from llgraph.session.user_storage import session_thread_dir
 
 WEB_TRACE_HISTORY_FILENAME = "web_trace_history.json"
@@ -95,8 +96,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(path, payload)
 
 
 def append_web_trace_turn(

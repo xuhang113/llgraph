@@ -17,6 +17,7 @@ from llgraph.context.search_result_clip import (
     is_search_tool,
     split_search_hit_blocks,
 )
+from llgraph.session.atomic_store import atomic_write_text
 
 # 单行错误/状态类结果不 spill
 _SHORT_RESULT_MAX_CHARS = 280
@@ -147,8 +148,8 @@ class ContextSpill:
 
         spill_path = self._next_spill_path(tool_name)
         try:
-            spill_path.parent.mkdir(parents=True, exist_ok=True)
-            spill_path.write_text(content, encoding="utf-8")
+            # 指针替换后正文只剩这一份，半截 spill 会被模型当成完整工具输出
+            atomic_write_text(spill_path, content)
         except OSError:
             return content
 
