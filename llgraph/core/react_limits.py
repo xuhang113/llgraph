@@ -15,6 +15,12 @@ DEFAULT_BATCH_TOOLS_NUDGE_AFTER = 3
 BATCH_TOOLS_NUDGE_AFTER_CAP = 20
 # 本问内相同参数的 read/grep/失败写 是否在 ToolNode 短路径拦截；默认开。
 DEFAULT_IDENTICAL_TOOL_GUARD = True
+# 同一路径连续写失败 N 次后回灌升级提示；0=关闭。
+DEFAULT_EDIT_FAILURE_HINT_AFTER = 2
+EDIT_FAILURE_HINT_AFTER_CAP = 20
+# 再多 N 次锁住该路径（须先 read_file 解锁）／彻底停写，相对提示阈值的偏移。
+EDIT_FAILURE_LOCK_OFFSET = 2
+EDIT_FAILURE_STOP_OFFSET = 4
 
 
 def parse_react_max_turns(raw: object, *, default: int = DEFAULT_REACT_MAX_TURNS) -> int:
@@ -141,3 +147,39 @@ def resolve_identical_tool_guard(workspace: Path | None) -> bool:
     cfg = load_agent_config(workspace)
     agent = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
     return parse_identical_tool_guard(agent.get("identical_tool_guard"))
+
+
+def parse_edit_failure_hint_after(
+    raw: object,
+    *,
+    default: int = DEFAULT_EDIT_FAILURE_HINT_AFTER,
+) -> int:
+    """
+    解析 edit_failure_escalation_after。
+
+    @param raw agent.json 原始值（False / 0 表示关闭）
+    @param default 缺省
+    @return 0～CAP；0=关闭
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return default if raw else 0
+    try:
+        return max(0, min(EDIT_FAILURE_HINT_AFTER_CAP, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_edit_failure_hint_after(workspace: Path | None) -> int:
+    """
+    同一路径连续写失败多少次后开始回灌升级提示。
+
+    @param workspace 工作区根；None 时用默认
+    @return 阈值；0=关闭
+    """
+    if workspace is None:
+        return DEFAULT_EDIT_FAILURE_HINT_AFTER
+    cfg = load_agent_config(workspace)
+    agent = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    return parse_edit_failure_hint_after(agent.get("edit_failure_escalation_after"))

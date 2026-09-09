@@ -13,7 +13,10 @@ from langgraph.prebuilt.tool_node import ToolNode
 from llgraph.context.chat_history_repair import ai_message_tool_calls
 from llgraph.core.code_index_tools import _DUPLICATE_PARALLEL_MSG
 from llgraph.core.react_limits import (
+    EDIT_FAILURE_LOCK_OFFSET,
+    EDIT_FAILURE_STOP_OFFSET,
     resolve_batch_tools_nudge_after,
+    resolve_edit_failure_hint_after,
     resolve_identical_tool_guard,
 )
 from llgraph.core.tool_execution_context import set_tool_execution_messages
@@ -21,6 +24,10 @@ from llgraph.core.tool_invoke_timing import (
     attach_tool_timings_to_output,
     reset_tool_timings,
     wrap_tool_node_with_timing,
+)
+from llgraph.core.tool_failure_escalation import (
+    annotate_escalation_hints,
+    install_edit_failure_blocks,
 )
 from llgraph.core.tool_loop_guard import (
     clear_tool_loop_guard,
@@ -103,6 +110,29 @@ def maybe_append_batch_tools_hint(
         )
         return {**out, "messages": new_msgs}
     return out
+
+
+def maybe_annotate_edit_failures(
+    out: dict[str, Any],
+    *,
+    prior_messages: list[BaseMessage],
+    workspace: Path | None,
+) -> dict[str, Any]:
+    """
+    同一路径连续写失败达到阈值时，在失败结果末尾追加升级提示。
+
+    @param out ToolNode 输出
+    @param prior_messages 工具执行前的 state 消息
+    @param workspace 工作区
+    @return 可能改写后的 out
+    """
+    return annotate_escalation_hints(
+        out,
+        prior_messages=prior_messages,
+        hint_after=resolve_edit_failure_hint_after(workspace),
+        lock_offset=EDIT_FAILURE_LOCK_OFFSET,
+        stop_offset=EDIT_FAILURE_STOP_OFFSET,
+    )
 
 
 def _emit_tool_start_milestones(prior: list[BaseMessage]) -> None:
@@ -282,11 +312,24 @@ def build_tool_node(
                 remaining,
                 enabled=resolve_identical_tool_guard(workspace),
             )
+            install_edit_failure_blocks(
+                inner,
+                list(state.get("messages") or prior),
+                remaining,
+                hint_after=resolve_edit_failure_hint_after(workspace),
+                lock_offset=EDIT_FAILURE_LOCK_OFFSET,
+                stop_offset=EDIT_FAILURE_STOP_OFFSET,
+            )
             try:
                 out = attach_tool_timings_to_output(inner.invoke(state, config))
             finally:
                 clear_write_serialize_gate(inner)
                 clear_tool_loop_guard(inner)
+            out = maybe_annotate_edit_failures(
+                out,
+                prior_messages=list(state.get("messages") or prior),
+                workspace=workspace,
+            )
             out = maybe_append_batch_tools_hint(
                 out,
                 prior_messages=list(state.get("messages") or prior),
@@ -337,11 +380,24 @@ def build_tool_node(
                 remaining,
                 enabled=resolve_identical_tool_guard(workspace),
             )
+            install_edit_failure_blocks(
+                inner,
+                list(state.get("messages") or prior),
+                remaining,
+                hint_after=resolve_edit_failure_hint_after(workspace),
+                lock_offset=EDIT_FAILURE_LOCK_OFFSET,
+                stop_offset=EDIT_FAILURE_STOP_OFFSET,
+            )
             try:
                 out = attach_tool_timings_to_output(await inner.ainvoke(state, config))
             finally:
                 clear_write_serialize_gate(inner)
                 clear_tool_loop_guard(inner)
+            out = maybe_annotate_edit_failures(
+                out,
+                prior_messages=list(state.get("messages") or prior),
+                workspace=workspace,
+            )
             out = maybe_append_batch_tools_hint(
                 out,
                 prior_messages=list(state.get("messages") or prior),
