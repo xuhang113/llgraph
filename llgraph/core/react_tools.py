@@ -16,6 +16,7 @@ from llgraph.core.react_limits import (
     EDIT_FAILURE_LOCK_OFFSET,
     EDIT_FAILURE_STOP_OFFSET,
     resolve_batch_tools_nudge_after,
+    resolve_cross_turn_read_dedupe,
     resolve_edit_failure_hint_after,
     resolve_identical_tool_guard,
 )
@@ -133,6 +134,24 @@ def maybe_annotate_edit_failures(
         lock_offset=EDIT_FAILURE_LOCK_OFFSET,
         stop_offset=EDIT_FAILURE_STOP_OFFSET,
     )
+
+
+def _config_thread_id(config: RunnableConfig | None) -> str | None:
+    """
+    取本次运行的会话线程（跨轮 read 去重要据此查出站压缩水位）。
+
+    @param config 图运行配置
+    @return thread_id；取不到时回落到活跃线程
+    """
+    if isinstance(config, dict):
+        configurable = config.get("configurable")
+        if isinstance(configurable, dict):
+            tid = str(configurable.get("thread_id") or "").strip()
+            if tid:
+                return tid
+    from llgraph.context.runtime_context import get_active_thread_id
+
+    return get_active_thread_id() or None
 
 
 def _emit_tool_start_milestones(prior: list[BaseMessage]) -> None:
@@ -311,6 +330,9 @@ def build_tool_node(
                 list(state.get("messages") or prior),
                 remaining,
                 enabled=resolve_identical_tool_guard(workspace),
+                workspace=workspace,
+                thread_id=_config_thread_id(config),
+                cross_turn_reads=resolve_cross_turn_read_dedupe(workspace),
             )
             install_edit_failure_blocks(
                 inner,
@@ -379,6 +401,9 @@ def build_tool_node(
                 list(state.get("messages") or prior),
                 remaining,
                 enabled=resolve_identical_tool_guard(workspace),
+                workspace=workspace,
+                thread_id=_config_thread_id(config),
+                cross_turn_reads=resolve_cross_turn_read_dedupe(workspace),
             )
             install_edit_failure_blocks(
                 inner,

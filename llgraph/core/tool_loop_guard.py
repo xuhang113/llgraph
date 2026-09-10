@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -380,6 +381,20 @@ def tool_result_failed(name: str, content: str) -> bool:
     return any(m in text or m in lowered for m in _FAIL_MARKERS)
 
 
+def is_llgraph_placeholder(content: str) -> bool:
+    """
+    是否 llgraph 自己产生的占位正文（工具没有真正执行过）。
+
+    占位一律以 `[llgraph]` / `【llgraph` 开头；追加在真结果末尾的提示不在此列。
+    占位不进历史索引：否则「跨轮拦截 → 模型再试一次」的兜底会被本问精确去重吃掉，
+    模型既看不见旧正文、又永远读不到新正文。
+
+    @param content 工具返回正文
+    @return 是否占位
+    """
+    return str(content or "").lstrip().startswith(("[llgraph]", "【llgraph"))
+
+
 def _write_succeeded(name: str, content: str) -> bool:
     if name not in WRITE_TOOL_NAMES:
         return False
@@ -558,6 +573,8 @@ def build_history_index(messages: list[BaseMessage]) -> _HistoryIndex:
         if shape is None:
             continue
         content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
+        if is_llgraph_placeholder(content):
+            continue
         failed = tool_result_failed(shape.name, content)
         if _write_succeeded(shape.name, content):
             _invalidate_path(index, shape.path)
@@ -566,21 +583,116 @@ def build_history_index(messages: list[BaseMessage]) -> _HistoryIndex:
     return index
 
 
+@dataclass
+class _CarryReadContext:
+    """跨轮 read 去重所需的一次性上下文（禁用时全部为空）。"""
+
+    enabled: bool = False
+    workspace: Path | None = None
+    messages: list[BaseMessage] = field(default_factory=list)
+    carry: dict[str, Any] = field(default_factory=dict)
+    compacted_ids: frozenset[str] = frozenset()
+    write_paths: set[str] = field(default_factory=set)
+    skip_paths: set[str] = field(default_factory=set)
+
+    @classmethod
+    def build(
+        cls,
+        messages: list[BaseMessage],
+        *,
+        workspace: Path | None,
+        thread_id: str | None,
+        enabled: bool,
+    ) -> _CarryReadContext:
+        """@return 上下文；未启用或没有更早轮次时为禁用态"""
+        if not enabled or workspace is None:
+            return cls()
+        from llgraph.core.cross_turn_read_guard import (
+            collect_carry_reads,
+            cross_turn_blocked_paths,
+            last_real_user_index,
+            written_paths,
+        )
+
+        user_idx = last_real_user_index(messages)
+        if user_idx <= 0:
+            return cls()
+        carry = collect_carry_reads(messages, end_index=user_idx)
+        if not carry:
+            return cls()
+        from llgraph.context.dispatch_compaction import compacted_tool_call_ids
+
+        return cls(
+            enabled=True,
+            workspace=workspace,
+            messages=list(messages),
+            carry=carry,
+            compacted_ids=compacted_tool_call_ids(thread_id),
+            write_paths=written_paths(messages),
+            skip_paths=cross_turn_blocked_paths(messages, start_index=user_idx),
+        )
+
+    def block_body(self, shape: ToolShape) -> str | None:
+        """
+        @param shape 本次调用形态
+        @return 跨轮拦截正文；不该拦时 None
+        """
+        if not self.enabled or shape.kind != "read" or self.workspace is None:
+            return None
+        from llgraph.core.cross_turn_read_guard import (
+            coverages_still_valid,
+            find_carry_coverages,
+            format_cross_turn_read_block,
+        )
+
+        coverages = find_carry_coverages(
+            self.carry,
+            paths=shape.paths,
+            start=shape.start,
+            end=shape.end,
+            messages=self.messages,
+        )
+        if not coverages:
+            return None
+        if not coverages_still_valid(
+            coverages,
+            workspace=self.workspace,
+            compacted_ids=self.compacted_ids,
+            write_paths=self.write_paths,
+            skip_paths=self.skip_paths,
+        ):
+            return None
+        return format_cross_turn_read_block(coverages, tool_name=shape.name)
+
+
 def compute_blocked_tool_messages(
     messages: list[BaseMessage],
     calls: list[Any],
+    *,
+    workspace: Path | None = None,
+    thread_id: str | None = None,
+    cross_turn_reads: bool = False,
 ) -> dict[str, ToolMessage]:
     """
     计算本批应拦截的 tool_call_id → 占位 ToolMessage。
 
     @param messages 工具执行前的图消息
     @param calls 本批待执行 tool_calls
+    @param workspace 工作区根（跨轮 read 去重要拿磁盘核对；None 时关闭该层）
+    @param thread_id 会话线程（查出站压缩水位，判断历史正文是否还看得见）
+    @param cross_turn_reads 是否启用跨轮重复读拦截
     @return 拦截表
     """
     index = build_history_index(messages)
     write_paths = _batch_write_paths(calls)
     blocked: dict[str, ToolMessage] = {}
     seen_batch: dict[ToolFp, ToolRecord] = {}
+    carry = _CarryReadContext.build(
+        messages,
+        workspace=workspace,
+        thread_id=thread_id,
+        enabled=cross_turn_reads,
+    )
 
     for call in calls:
         shape = shape_from_call(call)
@@ -613,6 +725,11 @@ def compute_blocked_tool_messages(
             blocked[cid] = ToolMessage(content=body, tool_call_id=cid, name=name)
             continue
 
+        carry_body = carry.block_body(shape)
+        if carry_body is not None:
+            blocked[cid] = ToolMessage(content=carry_body, tool_call_id=cid, name=name)
+            continue
+
         seen_batch[shape.fp] = ToolRecord(
             shape=shape, call_id=cid, content="", failed=False
         )
@@ -625,12 +742,21 @@ def install_tool_loop_guard(
     calls: list[Any],
     *,
     enabled: bool = True,
+    workspace: Path | None = None,
+    thread_id: str | None = None,
+    cross_turn_reads: bool = False,
 ) -> None:
     """把本批拦截表挂到 ToolNode（跨线程可见）。"""
     if not enabled:
         inner._llgraph_loop_blocks = {}
         return
-    inner._llgraph_loop_blocks = compute_blocked_tool_messages(messages, calls)
+    inner._llgraph_loop_blocks = compute_blocked_tool_messages(
+        messages,
+        calls,
+        workspace=workspace,
+        thread_id=thread_id,
+        cross_turn_reads=cross_turn_reads,
+    )
 
 
 def clear_tool_loop_guard(inner: Any) -> None:

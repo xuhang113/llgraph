@@ -21,6 +21,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from llgraph.context.chat_history_repair import ai_message_tool_calls
 from llgraph.context.investigate_harness import is_ephemeral_harness_human
+from llgraph.core.cross_turn_read_guard import CROSS_TURN_READ_MARKER
 from llgraph.core.tool_loop_guard import (
     IDENTICAL_BLOCK_MARKER,
     IDENTICAL_FAIL_MARKER,
@@ -44,6 +45,7 @@ _INTERCEPT_MARKERS = (
     STOP_MARKER,
     IDENTICAL_BLOCK_MARKER,
     IDENTICAL_FAIL_MARKER,
+    CROSS_TURN_READ_MARKER,
 )
 
 _SIGNATURE_CHARS = 64

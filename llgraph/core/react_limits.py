@@ -15,6 +15,8 @@ DEFAULT_BATCH_TOOLS_NUDGE_AFTER = 3
 BATCH_TOOLS_NUDGE_AFTER_CAP = 20
 # 本问内相同参数的 read/grep/失败写 是否在 ToolNode 短路径拦截；默认开。
 DEFAULT_IDENTICAL_TOOL_GUARD = True
+# 跨轮重复读同一文件（磁盘逐行未变）是否短路径拦截；默认开。
+DEFAULT_CROSS_TURN_READ_DEDUPE = True
 # 同一路径连续写失败 N 次后回灌升级提示；0=关闭。
 DEFAULT_EDIT_FAILURE_HINT_AFTER = 2
 EDIT_FAILURE_HINT_AFTER_CAP = 20
@@ -147,6 +149,25 @@ def resolve_identical_tool_guard(workspace: Path | None) -> bool:
     cfg = load_agent_config(workspace)
     agent = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
     return parse_identical_tool_guard(agent.get("identical_tool_guard"))
+
+
+def resolve_cross_turn_read_dedupe(workspace: Path | None) -> bool:
+    """
+    是否拦截跨轮重复读（历史 read 与磁盘逐行一致时不再重复注入全文）。
+
+    受 identical_tool_guard 总开关约束：总开关关掉时本层也不生效。
+
+    @param workspace 工作区根；None 时用默认
+    @return 是否启用
+    """
+    if workspace is None:
+        return DEFAULT_CROSS_TURN_READ_DEDUPE
+    cfg = load_agent_config(workspace)
+    agent = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    return parse_identical_tool_guard(
+        agent.get("cross_turn_read_dedupe"),
+        default=DEFAULT_CROSS_TURN_READ_DEDUPE,
+    )
 
 
 def parse_edit_failure_hint_after(
