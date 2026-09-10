@@ -30,6 +30,7 @@ _COMPACT_TOOL_MARKERS = (
     "[工具结果已落盘",
     "[llgraph] 重复工具已拦截",
     "[llgraph] 重复失败已拦截",
+    "[llgraph] 跨轮重复读已拦截",
     "已 superseded",
 )
 
@@ -155,6 +156,25 @@ def _state_for(thread_id: str) -> _ThreadCompactionState:
         else:
             _STATES.move_to_end(thread_id)
         return state
+
+
+def compacted_tool_call_ids(thread_id: str | None) -> frozenset[str]:
+    """
+    本 thread 已被出站压缩过的 tool_call_id。
+
+    调用方（引用钉住 / 跨轮 read 去重）据此判断「那条全文还在不在出站里」：
+    压过的不许复活，否则前缀回退，prompt cache 与上下文双输。
+
+    @param thread_id 会话线程；None 时视为无压缩记录
+    @return 已压缩的 id 集合
+    """
+    if not thread_id:
+        return frozenset()
+    with _STATES_LOCK:
+        state = _STATES.get(thread_id)
+        if state is None:
+            return frozenset()
+        return frozenset(state.compacted_ids)
 
 
 def reset_dispatch_compaction_state(thread_id: str | None = None) -> None:

@@ -52,6 +52,7 @@ class ContextSettings:
     tool_prune_token_ratio: float
     protect_cited_tool_messages: bool
     max_protected_cited_tool_messages: int
+    max_pinned_referenced_tool_messages: int = 4
 
 
 def is_auto_compress_strategy(strategy: str) -> bool:
@@ -149,6 +150,12 @@ CONTEXT_CONFIG_DOCS: dict[str, str] = {
     ),
     "max_protected_cited_tool_messages": (
         "protect_cited_tool_messages 时，超出 recency 窗口额外保护的被引用条数上限（默认 8）。"
+    ),
+    "max_pinned_referenced_tool_messages": (
+        "被 llgraph 短指针（重复工具 / 跨轮重复读拦截）引用的历史工具结果，"
+        "钉住不裁剪不压缩的条数上限（默认 4；0=关闭）。\n"
+        "  指针说的是「你已在 tool_call_id=X 拿到过」，X 的全文被压掉就等于丢上下文；"
+        "已压过的条目不会因为一条晚到的引用而复活。"
     ),
     "grep_context_lines": "grep_files / ripgrep 每条命中上下附加上下文行数（auto 默认 5）。",
     "grep_max_inline_chars": (
@@ -481,6 +488,12 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
     except (TypeError, ValueError):
         max_protected_cited_tool_messages = 8
 
+    max_pinned_ref_raw = ctx.get("max_pinned_referenced_tool_messages", 4)
+    try:
+        max_pinned_referenced_tool_messages = max(0, min(32, int(max_pinned_ref_raw)))
+    except (TypeError, ValueError):
+        max_pinned_referenced_tool_messages = 4
+
     trigger_cap: int | None = None
     trigger_raw = ctx.get("compress_trigger_max_tokens")
     if trigger_raw is not None:
@@ -552,6 +565,7 @@ def resolve_context_settings(workspace: Path) -> ContextSettings:
         tool_prune_token_ratio=tool_prune_token_ratio,
         protect_cited_tool_messages=protect_cited_tool_messages,
         max_protected_cited_tool_messages=max_protected_cited_tool_messages,
+        max_pinned_referenced_tool_messages=max_pinned_referenced_tool_messages,
     )
 
 

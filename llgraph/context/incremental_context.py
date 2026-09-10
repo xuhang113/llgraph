@@ -21,6 +21,7 @@ from llgraph.context.read_segment_dedupe import (
     format_superseded_read_pointer,
     read_message_fully_superseded,
 )
+from llgraph.context.tool_result_pin import pinned_referenced_tool_indices
 
 _READ_TOOL_NAMES = frozenset({"read_file", "read_files"})
 _READ_PATH_HDR = re.compile(
@@ -184,6 +185,10 @@ def prune_stale_tool_messages(
     keep_indices |= _protected_cited_indices(
         messages, settings, pressure, already_kept=keep_indices
     )
+    keep_indices |= pinned_referenced_tool_indices(
+        messages,
+        cap=settings.max_pinned_referenced_tool_messages,
+    )
     if keep_indices.issuperset(tool_indices):
         return messages, 0
 
@@ -342,6 +347,8 @@ def dispatch_keep_tool_indices(
     压缩由「纪元水位」决定而非 recency 滑窗：全文重结果在高水位以下时一条都不新压，
     出站字节与上一步逐字节相同，prompt cache 整段命中；跨过高水位才一次压到低水位。
     轻量指针/拦截文案不占预算；写入快照按路径钉住最新一份；被引用项在尚未压缩前延后压缩。
+    被 llgraph 短指针引用过的结果（「你已在 tool_call_id=X 拿到过」）同样钉住：
+    指针只有在 X 的全文还在出站里时才成立；已压过的不许复活，否则前缀回退。
 
     @param messages 出站消息
     @param settings 上下文配置
@@ -349,6 +356,7 @@ def dispatch_keep_tool_indices(
     @return 保留下标
     """
     from llgraph.context.dispatch_compaction import (
+        compacted_tool_call_ids,
         plan_dispatch_compaction,
         tool_content_is_compact,
     )
@@ -368,6 +376,11 @@ def dispatch_keep_tool_indices(
     }
     keep_n = max(1, settings.dispatch_keep_full_tool_messages)
     pinned = pinned_write_success_indices(messages, cap=max(4, keep_n))
+    pinned |= pinned_referenced_tool_indices(
+        messages,
+        cap=settings.max_pinned_referenced_tool_messages,
+        exclude_ids=compacted_tool_call_ids(thread_id),
+    )
     protected = _protected_cited_indices(
         messages,
         settings,
