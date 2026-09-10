@@ -348,6 +348,27 @@ def test_gap_between_prior_reads_executes(tmp_path: Path) -> None:
     assert _blocked(msgs, calls, tmp_path) == {}
 
 
+def test_carry_scan_is_bounded(tmp_path: Path) -> None:
+    """护栏自身的解析成本要有上界：只回溯最近若干条 read 结果。"""
+    from llgraph.core.cross_turn_read_guard import collect_carry_reads
+
+    _write_module(tmp_path, _module_text(n=10))
+    msgs: list[BaseMessage] = []
+    for i in range(4):
+        rel = f"src/m{i}.py"
+        _write_module(tmp_path, _module_text(n=10), rel=rel)
+        msgs.append(_ai([_call(f"r{i}", "read_file", path=rel, start_line=1, end_line=20)]))
+        msgs.append(
+            ToolMessage(
+                content=_read_output(tmp_path, rel, start_line=1, end_line=20),
+                tool_call_id=f"r{i}",
+                name="read_file",
+            )
+        )
+    carry = collect_carry_reads(msgs, end_index=len(msgs), max_messages=2)
+    assert set(carry) == {"src/m2.py", "src/m3.py"}
+
+
 def test_read_files_needs_every_path_covered(tmp_path: Path) -> None:
     _write_module(tmp_path, _module_text())
     other = "src/other.py"
@@ -386,6 +407,60 @@ def test_dedupe_disabled_by_flag(tmp_path: Path) -> None:
     )
     assert resolve_cross_turn_read_dedupe(tmp_path) is False
     assert resolve_cross_turn_read_dedupe(None) is True
+
+
+# --- 真 ToolNode 端到端 -----------------------------------------------------
+
+
+def _node_config(thread_id: str) -> object:
+    """真 ToolNode 需要 langgraph 注入的 runtime；内部键变动时退回普通 config。"""
+    from langchain_core.runnables import ensure_config
+
+    configurable: dict[str, object] = {"thread_id": thread_id}
+    try:
+        from langgraph._internal._constants import CONFIG_KEY_RUNTIME
+        from langgraph.runtime import Runtime
+
+        configurable[CONFIG_KEY_RUNTIME] = Runtime()
+    except ImportError:  # pragma: no cover - langgraph 内部结构变动
+        pass
+    return ensure_config({"configurable": configurable})
+
+
+def test_tool_node_end_to_end_second_turn_read_short_circuits(tmp_path: Path) -> None:
+    """走生产链路：真 ToolNode + 真 read_file，第二问的重读不再执行真实工具。"""
+    import pytest
+
+    from llgraph.context.dispatch_compaction import reset_dispatch_compaction_state
+    from llgraph.core.react_tools import build_tool_node
+
+    _write_module(tmp_path, _module_text(n=200))
+    node = build_tool_node(create_filesystem_tools(WorkspaceContext(tmp_path)), workspace=tmp_path)
+    thread = "t-e2e-cross-turn"
+    reset_dispatch_compaction_state(thread)
+    calls_1 = [_call("e1", "read_file", path=REL, start_line=1, end_line=200)]
+    msgs: list[BaseMessage] = [HumanMessage(content="看 handler_3"), _ai(calls_1)]
+    try:
+        first = node.invoke({"messages": list(msgs)}, _node_config(thread))
+    except ValueError as exc:  # pragma: no cover - langgraph config 契约变动
+        pytest.skip(f"ToolNode 直接调用不可用: {exc}")
+    finally:
+        reset_dispatch_compaction_state(thread)
+
+    first_msgs = list(first.get("messages") or [])
+    assert len(first_msgs) == 1
+    assert first_msgs[0].content.startswith(f"--- {REL} (行 1-200")
+
+    calls_2 = [_call("e2", "read_file", path=REL, start_line=1, end_line=200)]
+    msgs = [*msgs, *first_msgs, HumanMessage(content="再改 handler_4"), _ai(calls_2)]
+    try:
+        second = node.invoke({"messages": list(msgs)}, _node_config(thread))
+    finally:
+        reset_dispatch_compaction_state(thread)
+    second_msgs = list(second.get("messages") or [])
+    assert len(second_msgs) == 1
+    assert second_msgs[0].content.startswith(CROSS_TURN_READ_MARKER)
+    assert len(second_msgs[0].content) * 5 < len(first_msgs[0].content)
 
 
 # --- 引用钉住 ---------------------------------------------------------------

@@ -35,6 +35,9 @@ CROSS_TURN_READ_MARKER = "[llgraph] 跨轮重复读已拦截"
 
 READ_TOOL_NAMES = frozenset({"read_file", "read_files"})
 
+# 最多回溯多少条历史 read 结果（护栏自身的解析成本上界）
+MAX_CARRY_READ_MESSAGES = 40
+
 # 已被掩码 / 落盘 / 拦截的正文：拿不到原文，不能当作去重依据
 _NON_FULL_PREFIXES = ("[历史", "[工具结果已落盘", "[llgraph]", "【llgraph")
 _BLOCKED_PATH_RE = re.compile(r"^-\s+`([^`]+)`", re.MULTILINE)
@@ -94,20 +97,27 @@ def collect_carry_reads(
     messages: list[BaseMessage],
     *,
     end_index: int,
+    max_messages: int = MAX_CARRY_READ_MESSAGES,
 ) -> dict[str, list[CarryRead]]:
     """
     收集**更早轮次**里仍是全文的 read 结果，按路径归档。
 
     只看 ToolMessage 正文（自带路径、行段与总行数），不必回溯 tool_calls 参数。
+    从近到远最多取 max_messages 条：解析是按字符线性的，长会话不该在每个
+    tools 节点上无界地重扫历史；更老的 read 早就被压缩，本来也不能当依据。
 
     @param messages 图消息
     @param end_index 只扫这个下标之前的消息（通常是最近一条真实 user）
+    @param max_messages 最多回溯的 read 结果条数
     @return 路径 → 文件块（按出现顺序，越后越新）
     """
     out: dict[str, list[CarryRead]] = {}
     if end_index <= 0:
         return out
-    for msg in messages[:end_index]:
+    picked: list[ToolMessage] = []
+    for msg in reversed(messages[:end_index]):
+        if len(picked) >= max_messages:
+            break
         if not isinstance(msg, ToolMessage):
             continue
         if str(getattr(msg, "name", "") or "") not in READ_TOOL_NAMES:
@@ -115,10 +125,12 @@ def collect_carry_reads(
         content = _tool_text(msg)
         if not _is_full_read_body(content):
             continue
-        cid = str(getattr(msg, "tool_call_id", "") or "").strip()
-        if not cid:
+        if not str(getattr(msg, "tool_call_id", "") or "").strip():
             continue
-        for block in parse_read_blocks(content):
+        picked.append(msg)
+    for msg in reversed(picked):
+        cid = str(getattr(msg, "tool_call_id", "") or "").strip()
+        for block in parse_read_blocks(_tool_text(msg)):
             out.setdefault(block.path, []).append(CarryRead(call_id=cid, block=block))
     return out
 
