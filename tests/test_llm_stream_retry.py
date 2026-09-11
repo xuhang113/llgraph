@@ -193,6 +193,28 @@ def test_stream_does_not_replay_after_visible_text(fast_retry_workspace: Path) -
     assert runnable.calls == 1
 
 
+def test_stream_replays_after_partial_tool_call(fast_retry_workspace: Path) -> None:
+    """半截 tool_call 没进 state 也没渲染给用户，丢掉重来比整轮作废划算。"""
+    from llgraph.core.react_invoke import _consume_runnable_stream
+
+    partial_call = AIMessageChunk(
+        content=[],
+        tool_call_chunks=[
+            {"name": "search_replace", "args": '{"file_path": "a.py"', "id": "call_1", "index": 0}
+        ],
+    )
+    runnable = _ScriptedRunnable(
+        fast_retry_workspace,
+        [
+            [partial_call, RemoteProtocolError("peer closed connection")],
+            [_text_chunk("ok")],
+        ],
+    )
+    response = _consume_runnable_stream(runnable, {"messages": []}, {})
+    assert runnable.calls == 2
+    assert "ok" in str(response.content)
+
+
 def test_fatal_error_not_replayed(fast_retry_workspace: Path) -> None:
     from llgraph.core.react_invoke import _consume_runnable_stream
 

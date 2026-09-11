@@ -131,12 +131,16 @@ class EmptyGatewayStreamError(RuntimeError):
 
 
 class StreamAttemptProgress:
-    """一次流式尝试里已经外发给终端 / Web 的内容（决定还能不能重放）。"""
+    """一次流式尝试里已经落到用户眼前的正文（决定还能不能重放）。
 
-    __slots__ = ("emitted_visible",)
+    只盯可见 text：thinking 与 tool_call 增量在失败时既没进 state，
+    终端也没把它们当答复渲染出来，重放最多多刷一段思考，比整轮作废划算。
+    """
+
+    __slots__ = ("emitted_reply_text",)
 
     def __init__(self) -> None:
-        self.emitted_visible = False
+        self.emitted_reply_text = False
 
 
 def _stream_once(
@@ -206,8 +210,9 @@ def _stream_once(
             if kind == "chunk":
                 response = _merge_stream_chunk(response, payload)
                 has_tools, has_text, has_thinking = _merged_response_progress(response)
+                if has_text:
+                    progress.emitted_reply_text = True
                 if has_tools or has_text:
-                    progress.emitted_visible = True
                     thinking_only_since = None
                 elif has_thinking:
                     if thinking_only_since is None:
@@ -275,9 +280,9 @@ def _consume_runnable_stream(
     """
     流式取一次 LLM 响应；网关瞬时故障时原样重放整次调用。
 
-    只在「本次尝试还没外发可见正文 / tool_call」时重放：已经流到终端的内容
-    不能重来一遍，否则用户会看到半截重复。thinking-only 的半截可以丢，
-    重放比整轮 ReAct 作废便宜得多。
+    只在「本次尝试还没流出可见正文」时重放：已经打到终端的答复不能重来一遍，
+    否则用户看到半截重复。thinking / 半截 tool_call 都可以丢掉重来，
+    重放比整轮 ReAct 连同前面十几个工具一起作废便宜得多。
 
     @return 聚合后的响应 chunk
     @raises UserCancelledError 用户 Stop / 多次重放后网关仍返回空
@@ -325,7 +330,7 @@ def _consume_runnable_stream(
             failures += 1
             blocked = (
                 reason is None
-                or progress.emitted_visible
+                or progress.emitted_reply_text
                 or failures >= policy.max_attempts
                 or not policy.enabled
             )
@@ -337,7 +342,7 @@ def _consume_runnable_stream(
                         detail={
                             "reason": reason,
                             "attempts": failures,
-                            "emitted_visible": progress.emitted_visible,
+                            "emitted_reply_text": progress.emitted_reply_text,
                         },
                     )
                 if isinstance(exc, EmptyGatewayStreamError):
