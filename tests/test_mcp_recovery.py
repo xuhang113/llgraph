@@ -100,6 +100,10 @@ class _FakeSession:
         self._script.calls.append(name)
         if self.dead:
             raise RuntimeError("Connection closed")
+        if name in self._script.gang_tools and not self._script.gang_done:
+            await self._script.join_gang()
+            self.dead = True
+            raise RuntimeError("Connection closed")
         if name in self._script.hang_tools:
             await asyncio.sleep(30)
         if name in self._script.killer_tools:
@@ -127,15 +131,37 @@ class _Script:
         error_tools: tuple[str, ...] = (),
         raise_tools: tuple[str, ...] = (),
         hang_tools: tuple[str, ...] = (),
+        gang_tools: tuple[str, ...] = (),
+        gang_size: int = 0,
         connect_fails_after: int = 10_000,
     ) -> None:
         self.killer_tools = set(killer_tools)
         self.error_tools = set(error_tools)
         self.raise_tools = set(raise_tools)
         self.hang_tools = set(hang_tools)
+        self.gang_tools = set(gang_tools)
+        self.gang_size = gang_size
+        self.gang_done = False
         self.connect_fails_after = connect_fails_after
         self.calls: list[str] = []
         self.connects = 0
+        self._gang_seen = 0
+        self._gang_gate: asyncio.Event | None = None
+
+    async def join_gang(self) -> None:
+        """卡住调用直到 gang_size 个线程都进来，再一起报连接断开。
+
+        并发回归必须**确定性地**造出「多个线程撞到同一次断开」：
+        让它们自然抢的话，运行时的锁会把后来者挡到重连之后，
+        去重逻辑一次都跑不到（本轮就是这么漏过一次变异验证的）。
+        """
+        if self._gang_gate is None:
+            self._gang_gate = asyncio.Event()
+        self._gang_seen += 1
+        if self._gang_seen >= self.gang_size:
+            self.gang_done = True
+            self._gang_gate.set()
+        await self._gang_gate.wait()
 
 
 class _FakeRuntime(_McpServerRuntime):
@@ -301,10 +327,10 @@ def test_failed_reconnect_marks_unavailable(script_runtime) -> None:
 
 
 def test_concurrent_failures_burn_one_reconnect(script_runtime) -> None:
-    """并发工具调度下多个线程撞到同一次断开，只应重启一次进程。"""
-    script = _Script()
+    """4 个线程撞到同一次断开：只重启一次进程，也不能把工具算成坏工具。"""
+    workers = 4
+    script = _Script(gang_tools=("read_query",), gang_size=workers)
     runtime = script_runtime(script, max_reconnects=3)
-    runtime._session.dead = True
 
     results: list[str] = []
     lock = threading.Lock()
@@ -314,15 +340,18 @@ def test_concurrent_failures_burn_one_reconnect(script_runtime) -> None:
         with lock:
             results.append(out)
 
-    threads = [threading.Thread(target=_worker) for _ in range(4)]
+    threads = [threading.Thread(target=_worker) for _ in range(workers)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=20)
 
-    assert results and all(out == "ok:read_query" for out in results)
+    assert len(results) == workers
+    # 一次断开不该让任何一个线程看到「这个工具坏了」
+    assert all(out == "ok:read_query" for out in results), results
     assert runtime._reconnects == 1
     assert script.connects == 2
+    assert runtime._tool_crashes.get("read_query") == 1
 
 
 def test_call_timeout_reconnects_without_replay(script_runtime) -> None:
