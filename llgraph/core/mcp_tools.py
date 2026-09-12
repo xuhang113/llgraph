@@ -6,6 +6,9 @@ import asyncio
 import json
 import logging
 import threading
+import time
+from concurrent.futures import Future
+from concurrent.futures import wait as futures_wait
 from pathlib import Path
 from typing import Any
 
@@ -18,9 +21,41 @@ from llgraph.core.mcp_compat import (
     tool_description,
     tool_input_schema,
 )
+from llgraph.core.mcp_health import (
+    REASON_DISCONNECTED,
+    REASON_TIMEOUT,
+    classify_mcp_failure,
+    format_reconnected_no_replay,
+    format_tool_crashes_server,
+    format_unavailable,
+    replay_allowed,
+)
 from llgraph.permissions.mcp import is_write_mcp_tool
 
 logger = logging.getLogger(__name__)
+
+# 同一个工具把 Server 打挂这么多次后只封这个工具，不封整个 Server
+_TOOL_CRASH_LIMIT = 2
+# 等 future 时的取消轮询步长：让用户按 Stop 不必等满 timeout_sec
+_CANCEL_POLL_SEC = 0.2
+
+
+class _McpCallTimeout(Exception):
+    """本次 MCP 调用超过 timeout_sec（与工具自身抛的超时区分开）。"""
+
+
+class _McpCallCancelled(Exception):
+    """等待期间用户请求了 Stop。"""
+
+
+def _cancel_requested() -> bool:
+    """@return 当前会话是否已请求停止；取不到状态时按未取消处理"""
+    try:
+        from llgraph.core.react_invoke import agent_cancel_requested
+
+        return agent_cancel_requested()
+    except Exception:
+        return False
 
 # Server / 工具中文备注（展示给 Agent 与 Web「工具」页）
 _MCP_SERVER_ZH: dict[str, str] = {
@@ -115,18 +150,33 @@ class _McpArgumentsJson(BaseModel):
 
 
 class _McpServerRuntime:
-    """单 MCP Server 长连接（独立线程 + asyncio loop）。"""
+    """单 MCP Server 长连接（独立线程 + asyncio loop），带子进程挂掉后的重连。"""
 
-    def __init__(self, config: McpServerConfig, *, timeout_sec: float) -> None:
+    def __init__(
+        self,
+        config: McpServerConfig,
+        *,
+        timeout_sec: float,
+        max_reconnects: int = 3,
+    ) -> None:
         self.config = config
         self.timeout_sec = timeout_sec
+        self.max_reconnects = max(0, int(max_reconnects))
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
         self._error: str | None = None
         self._tools: list[Any] = []
+        self._tool_desc: dict[str, str] = {}
         self._session = None
         self._stdio_ctx = None
+        # 重连状态：并发工具调度下会有多个线程同时撞到同一次断开
+        self._state_lock = threading.RLock()
+        self._generation = 0
+        self._reconnects = 0
+        self._unavailable_reason = ""
+        self._tool_crashes: dict[str, int] = {}
+        self._tool_crash_gen: dict[str, int] = {}
 
     def start(self) -> bool:
         """
@@ -134,6 +184,9 @@ class _McpServerRuntime:
 
         @return 是否成功
         """
+        with self._state_lock:
+            self._ready = threading.Event()
+            self._error = None
         self._thread = threading.Thread(
             target=self._thread_main, name=f"mcp-{self.config.name}", daemon=True
         )
@@ -147,7 +200,11 @@ class _McpServerRuntime:
             except Exception:
                 pass
             return False
-        return self._error is None
+        if self._error is not None:
+            return False
+        with self._state_lock:
+            self._generation += 1
+        return True
 
     def _thread_main(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -201,6 +258,9 @@ class _McpServerRuntime:
         await self._session.initialize()
         listed = await self._session.list_tools()
         self._tools = list(listed.tools)
+        # 重连后仍要能判断「这是不是写类工具」，描述先存一份
+        for item in self._tools:
+            self._tool_desc[str(getattr(item, "name", ""))] = tool_description(item)
 
     async def _shutdown_async(self) -> None:
         if self._session is not None:
@@ -222,29 +282,216 @@ class _McpServerRuntime:
 
     def call_tool_sync(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """
-        同步调用 MCP 工具。
+        同步调用 MCP 工具；子进程挂掉时重连一次再决定是否重放。
+
+        判定不可用之后立刻快速失败：否则模型会把剩下的 turn 全花在
+        一个必然以同样方式失败的调用上。
 
         @param tool_name 工具名
         @param arguments 参数
         @return 文本结果
         """
-        if self._loop is None or self._session is None:
-            return f"MCP {self.config.name} 未连接"
-        future = asyncio.run_coroutine_threadsafe(
-            self._call_tool_async(tool_name, arguments),
-            self._loop,
-        )
-        try:
-            return future.result(timeout=self.timeout_sec)
-        except Exception as exc:
-            return f"MCP 调用失败 ({self.config.name}/{tool_name}): {exc}"
+        blocked = self._fast_fail_text(tool_name)
+        if blocked:
+            return blocked
 
-    async def _call_tool_async(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        result = await self._session.call_tool(tool_name, arguments)
-        body, is_error = render_call_result(result)
+        text, reason, generation = self._call_once(tool_name, arguments)
+        if reason is None:
+            return text
+
+        crashes = self._note_crash(tool_name, generation)
+        logger.warning(
+            "MCP %s/%s 传输层故障（%s），尝试重连", self.config.name, tool_name, reason
+        )
+        if not self._reconnect(seen_generation=generation):
+            self._mark_unavailable(reason)
+            return format_unavailable(
+                server=self.config.name,
+                tool=tool_name,
+                reason=reason,
+                reconnect_tried=self._reconnects > 0,
+                timeout_sec=self.timeout_sec,
+            )
+
+        self._notice(f"MCP {self.config.name} 连接已重建（{reason}）")
+        is_write = is_write_mcp_tool(tool_name, self._tool_desc.get(tool_name, ""))
+        if crashes > 1 or not replay_allowed(reason, is_write_tool=is_write):
+            if crashes >= _TOOL_CRASH_LIMIT:
+                return format_tool_crashes_server(
+                    server=self.config.name, tool=tool_name
+                )
+            return format_reconnected_no_replay(
+                server=self.config.name,
+                tool=tool_name,
+                reason=reason,
+                timeout_sec=self.timeout_sec,
+            )
+
+        replay_text, replay_reason, replay_generation = self._call_once(
+            tool_name, arguments
+        )
+        if replay_reason is None:
+            return replay_text
+        if self._note_crash(tool_name, replay_generation) >= _TOOL_CRASH_LIMIT:
+            return format_tool_crashes_server(server=self.config.name, tool=tool_name)
+        self._mark_unavailable(replay_reason)
+        return format_unavailable(
+            server=self.config.name,
+            tool=tool_name,
+            reason=replay_reason,
+            reconnect_tried=True,
+            timeout_sec=self.timeout_sec,
+        )
+
+    def _fast_fail_text(self, tool_name: str) -> str:
+        with self._state_lock:
+            reason = self._unavailable_reason
+            crashes = self._tool_crashes.get(tool_name, 0)
+            tried = self._reconnects > 0
+        if reason:
+            return format_unavailable(
+                server=self.config.name,
+                tool=tool_name,
+                reason=reason,
+                reconnect_tried=tried,
+                timeout_sec=self.timeout_sec,
+            )
+        if crashes >= _TOOL_CRASH_LIMIT:
+            return format_tool_crashes_server(server=self.config.name, tool=tool_name)
+        return ""
+
+    def _notice(self, message: str) -> None:
+        try:
+            from llgraph.terminal.ops_notice import ops_notice
+
+            ops_notice(message)
+        except Exception:
+            pass
+
+    def _note_crash(self, tool_name: str, generation: int) -> int:
+        """
+        记一次「这个工具打挂了第 N 代连接」。
+
+        必须按代号去重：并发调度下同一次断开会被四五个线程同时撞到，
+        按失败次数计数会把一个无辜的工具直接算到封停线上。
+
+        @param tool_name 工具名
+        @param generation 这次调用跑在哪一代连接上
+        @return 该工具累计打挂过几代连接
+        """
+        with self._state_lock:
+            if self._tool_crash_gen.get(tool_name) == generation:
+                return self._tool_crashes.get(tool_name, 0)
+            self._tool_crash_gen[tool_name] = generation
+            count = self._tool_crashes.get(tool_name, 0) + 1
+            self._tool_crashes[tool_name] = count
+            return count
+
+    def _mark_unavailable(self, reason: str) -> None:
+        with self._state_lock:
+            if not self._unavailable_reason:
+                self._unavailable_reason = reason
+        logger.warning("MCP %s 已判定不可用（%s）", self.config.name, reason)
+        self._notice(f"MCP {self.config.name} 不可用（{reason}），本会话不再调用")
+
+    def _reconnect(self, *, seen_generation: int) -> bool:
+        """
+        重启子进程并重建会话。
+
+        并发调度下多个线程会同时撞到同一次断开：靠 generation 判断
+        「别人是不是已经重连好了」，避免一次断开烧掉整个重连预算。
+
+        @param seen_generation 调用方发起本次调用时看到的连接代号
+        @return 是否有可用连接
+        """
+        with self._state_lock:
+            if self._generation != seen_generation:
+                return True
+            if self._unavailable_reason:
+                return False
+            if self._reconnects >= self.max_reconnects:
+                return False
+            self._reconnects += 1
+            try:
+                self.stop()
+            except Exception:
+                pass
+            return self.start()
+
+    def _call_once(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> tuple[str, str | None, int]:
+        """
+        发起一次调用。
+
+        @param tool_name 工具名
+        @param arguments 参数
+        @return (正文, 传输层原因, 本次跑在哪一代连接上)；
+            原因为 None 表示这次结果可以直接回灌给模型
+        """
+        with self._state_lock:
+            loop = self._loop
+            session = self._session
+            generation = self._generation
+        if loop is None or session is None or loop.is_closed():
+            return "", REASON_DISCONNECTED, generation
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._call_tool_async(tool_name, arguments), loop
+            )
+        except RuntimeError:
+            return "", REASON_DISCONNECTED, generation
+
+        try:
+            body, is_error = self._wait_future(future)
+        except _McpCallCancelled:
+            return "[llgraph] 用户已停止当前生成。", None, generation
+        except _McpCallTimeout:
+            return "", REASON_TIMEOUT, generation
+        except Exception as exc:  # noqa: BLE001 — 分类后决定重连还是原样回灌
+            reason = classify_mcp_failure(exc)
+            if reason is not None:
+                return "", reason, generation
+            return (
+                f"MCP 调用失败 ({self.config.name}/{tool_name}): {exc}",
+                None,
+                generation,
+            )
+
         if is_error:
-            return f"MCP 错误: {body}"
-        return body or "(空结果)"
+            return f"MCP 错误: {body}", None, generation
+        return body or "(空结果)", None, generation
+
+    def _wait_future(self, future: Future) -> tuple[str, bool]:
+        """
+        分片等待 future，期间保持 Stop 可响应。
+
+        刻意用 `futures.wait` 而不是 `future.result(timeout=)`：后者的超时异常
+        在 3.11+ 就是内建 `TimeoutError`，和工具自己抛的超时撞在一起分不开。
+
+        @param future 已投递到 loop 的调用 future
+        @return (正文, 服务端是否报错)
+        @raises _McpCallTimeout 超过 timeout_sec
+        @raises _McpCallCancelled 用户已请求停止
+        """
+        deadline = time.monotonic() + max(1.0, self.timeout_sec)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                future.cancel()
+                raise _McpCallTimeout(f"MCP 调用超过 {self.timeout_sec:g}s")
+            done, _pending = futures_wait([future], timeout=min(_CANCEL_POLL_SEC, remaining))
+            if done:
+                return future.result()
+            if _cancel_requested():
+                future.cancel()
+                raise _McpCallCancelled
+
+    async def _call_tool_async(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> tuple[str, bool]:
+        result = await self._session.call_tool(tool_name, arguments)
+        return render_call_result(result)
 
     def stop(self) -> None:
         """关闭会话与子进程。"""
@@ -291,7 +538,11 @@ class McpToolRegistry:
         for cfg in self.settings.servers:
             runtime: _McpServerRuntime | None = None
             try:
-                runtime = _McpServerRuntime(cfg, timeout_sec=self.settings.timeout_sec)
+                runtime = _McpServerRuntime(
+                    cfg,
+                    timeout_sec=self.settings.timeout_sec,
+                    max_reconnects=self.settings.max_reconnects,
+                )
                 if not runtime.start():
                     msg = runtime._error or "未知错误"
                     self._load_errors.append(f"{cfg.name}: {msg}")
@@ -371,7 +622,11 @@ class McpToolRegistry:
             if schema_text:
                 full_desc += f"\n参数 JSON Schema: {schema_text}"
 
-            args_model = _mcp_input_schema_to_model(lc_name, input_schema)
+            args_model = (
+                _mcp_input_schema_to_model(lc_name, input_schema)
+                if isinstance(input_schema, dict)
+                else None
+            )
 
             def make_structured(tname: str, rt: _McpServerRuntime):
                 def _invoke(**kwargs: Any) -> str:

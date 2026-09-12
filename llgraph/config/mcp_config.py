@@ -30,6 +30,9 @@ class McpSettings:
     timeout_sec: float
     allow_write_tools: bool
     config_source: str
+    # 单个 Server 每个会话最多重启几次；0=不重连。上限存在的意义是
+    # 拦住「进程一起来就挂」的无限重启循环。
+    max_reconnects: int = 3
 
 
 def _parse_bool(value: object, default: bool) -> bool:
@@ -130,6 +133,7 @@ def resolve_mcp_settings(workspace: Path, *, allow_write: bool = False) -> McpSe
     llgraph_path = workspace / ".llgraph" / LLGRAPH_MCP_FILENAME
 
     defaults_timeout = 60.0
+    max_reconnects = 3
     allow_write_tools = False
     servers: tuple[McpServerConfig, ...] = ()
     source = "(无)"
@@ -139,6 +143,10 @@ def resolve_mcp_settings(workspace: Path, *, allow_write: bool = False) -> McpSe
         defaults = raw.get("defaults") if isinstance(raw.get("defaults"), dict) else {}
         try:
             defaults_timeout = float(defaults.get("timeout_sec", defaults_timeout))
+        except (TypeError, ValueError):
+            pass
+        try:
+            max_reconnects = int(defaults.get("max_reconnects", max_reconnects))
         except (TypeError, ValueError):
             pass
         allow_write_tools = _parse_bool(defaults.get("allow_write_tools"), False)
@@ -154,6 +162,7 @@ def resolve_mcp_settings(workspace: Path, *, allow_write: bool = False) -> McpSe
         timeout_sec=max(5.0, defaults_timeout),
         allow_write_tools=allow_write_tools,
         config_source=source,
+        max_reconnects=max(0, min(10, max_reconnects)),
     )
 
 
