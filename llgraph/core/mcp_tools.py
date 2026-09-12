@@ -13,6 +13,11 @@ from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field, create_model
 
 from llgraph.config.mcp_config import McpServerConfig, McpSettings, format_mcp_summary
+from llgraph.core.mcp_compat import (
+    render_call_result,
+    tool_description,
+    tool_input_schema,
+)
 from llgraph.permissions.mcp import is_write_mcp_tool
 
 logger = logging.getLogger(__name__)
@@ -236,15 +241,10 @@ class _McpServerRuntime:
 
     async def _call_tool_async(self, tool_name: str, arguments: dict[str, Any]) -> str:
         result = await self._session.call_tool(tool_name, arguments)
-        parts: list[str] = []
-        for block in result.content:
-            if hasattr(block, "text"):
-                parts.append(str(block.text))
-            else:
-                parts.append(str(block))
-        if result.isError:
-            return f"MCP 错误: {''.join(parts)}"
-        return "".join(parts) or "(空结果)"
+        body, is_error = render_call_result(result)
+        if is_error:
+            return f"MCP 错误: {body}"
+        return body or "(空结果)"
 
     def stop(self) -> None:
         """关闭会话与子进程。"""
@@ -352,14 +352,14 @@ class McpToolRegistry:
         tools: list[StructuredTool] = []
         for mcp_tool in runtime.list_tools():
             name = mcp_tool.name
-            desc = mcp_tool.description or name
+            desc = tool_description(mcp_tool)
             if not permit_write and is_write_mcp_tool(name, desc):
                 continue
             lc_name = f"mcp__{server_name}__{name}"
-            input_schema = mcp_tool.inputSchema if hasattr(mcp_tool, "inputSchema") else {}
+            input_schema = tool_input_schema(mcp_tool)
 
             schema_text = ""
-            if isinstance(input_schema, dict) and input_schema:
+            if input_schema:
                 try:
                     schema_text = json.dumps(input_schema, ensure_ascii=False)[:1500]
                 except TypeError:
@@ -371,11 +371,7 @@ class McpToolRegistry:
             if schema_text:
                 full_desc += f"\n参数 JSON Schema: {schema_text}"
 
-            args_model = (
-                _mcp_input_schema_to_model(lc_name, input_schema)
-                if isinstance(input_schema, dict)
-                else None
-            )
+            args_model = _mcp_input_schema_to_model(lc_name, input_schema)
 
             def make_structured(tname: str, rt: _McpServerRuntime):
                 def _invoke(**kwargs: Any) -> str:
