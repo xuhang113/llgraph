@@ -84,6 +84,17 @@ _CONSUMED_ALIASES = frozenset(
     }
 )
 
+# 正文字段：原样交给工具，不做 strip、不做 JSON 解析。
+# strip 会吃掉文件末尾换行与正文首尾空行；JSON 解析会把 `{"name": "x"}` 这种
+# 正文当成对象，pydantic 直接拒（写不了任何 .json），白烧一轮 LLM。
+_RAW_TEXT_KEYS: dict[str, frozenset[str]] = {
+    "write_file": frozenset({"content", *CONTENT_ALIASES}),
+    "append_file": frozenset({"content", *CONTENT_ALIASES}),
+    "search_replace": frozenset(
+        {"old_string", "new_string", *OLD_STRING_ALIASES, *NEW_STRING_ALIASES}
+    ),
+}
+
 _TOOL_KEEP_FIELDS: dict[str, frozenset[str]] = {
     "read_file": frozenset({"path", "start_line", "end_line"}),
     "read_files": frozenset({"paths", "start_line", "end_line"}),
@@ -220,9 +231,13 @@ def _unwrap_nested(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _parse_json_values(data: dict[str, Any]) -> dict[str, Any]:
+def _parse_json_values(
+    data: dict[str, Any], *, raw_text_keys: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     out = dict(data)
     for key, value in list(out.items()):
+        if key in raw_text_keys:
+            continue
         parsed = maybe_parse_json(value)
         if parsed is not value:
             out[key] = parsed
@@ -415,8 +430,8 @@ def coerce_tool_args(name: str, args: object) -> dict[str, Any]:
     if not data:
         return {}
     data = _unwrap_nested(data)
-    data = _parse_json_values(data)
     tool = (name or "").strip()
+    data = _parse_json_values(data, raw_text_keys=_RAW_TEXT_KEYS.get(tool, frozenset()))
 
     if tool in PATH_TOOLS or tool in READ_RANGE_TOOLS:
         if tool != "read_files":

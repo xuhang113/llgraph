@@ -127,6 +127,49 @@ def test_coerce_write_file_tool_invoke(tmp_path: Path) -> None:
     assert (tmp_path / "n.md").read_text(encoding="utf-8") == "hello"
 
 
+def test_coerce_keeps_json_file_body_as_text(tmp_path: Path) -> None:
+    """正文长得像 JSON 就被解析成 dict，pydantic 当场拒 —— 等于写不了任何 .json。"""
+    body = '{\n  "name": "demo"\n}\n'
+    out = coerce_tool_args("write_file", {"path": "package.json", "content": body})
+    assert out["content"] == body
+
+    tools = _tools(tmp_path, allow_write=True)
+    reply = str(tools["write_file"].invoke({"path": "package.json", "content": body}))
+    assert "已写入" in reply
+    assert (tmp_path / "package.json").read_text(encoding="utf-8") == body
+
+
+def test_coerce_keeps_write_payload_whitespace(tmp_path: Path) -> None:
+    """正文不许被 strip：末尾换行、首尾空行都是文件语义的一部分。"""
+    out = coerce_tool_args("write_file", {"path": "a.py", "content": "x = 1\n\n"})
+    assert out["content"] == "x = 1\n\n"
+
+    tools = _tools(tmp_path, allow_write=True)
+    tools["write_file"].invoke({"path": "a.py", "content": "x = 1\n"})
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+
+    appended = coerce_tool_args("append_file", {"path": "a.py", "contents": "\ny = 2\n"})
+    assert appended["content"] == "\ny = 2\n"
+
+
+def test_coerce_keeps_search_replace_hunk_whitespace() -> None:
+    out = coerce_tool_args(
+        "search_replace",
+        {"path": "a.py", "old_str": "    return 1\n\n", "new_str": "    return 2\n\n"},
+    )
+    assert out["old_string"] == "    return 1\n\n"
+    assert out["new_string"] == "    return 2\n\n"
+
+
+def test_coerce_search_replace_still_parses_replacements_json() -> None:
+    out = coerce_tool_args(
+        "search_replace",
+        {"path": "a.py", "replacements": '[{"old_str":"a\\n","new_str":"b\\n"}]'},
+    )
+    hunk = out["replacements"][0]
+    assert (hunk["old_string"], hunk["new_string"]) == ("a\n", "b\n")
+
+
 def test_coerce_shell_command_list_and_timeout() -> None:
     parsed = RunShellCommandInput.model_validate(
         {"command": ["ls", "-la"], "timeout": 30, "cwd": "src"}
