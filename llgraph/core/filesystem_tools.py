@@ -17,6 +17,7 @@ from llgraph.core.filesystem_tool_schemas import (
     SearchReplaceInput,
     WriteFileInput,
 )
+from llgraph.core.atomic_write import write_workspace_text
 from llgraph.core.edit_apply import (
     EditHunk,
     apply_edit_hunks,
@@ -1220,8 +1221,7 @@ def create_filesystem_tools(
                 old_text = ""
         if edit_tracker is not None and target.is_file():
             edit_tracker.ensure_snapshot(rel)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        write_workspace_text(target, content)
         _after_write(rel, "write", old_part="", new_part=content)
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
@@ -1276,8 +1276,7 @@ def create_filesystem_tools(
             new_text = old_text + content
         else:
             new_text = content
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(new_text, encoding="utf-8")
+        write_workspace_text(target, new_text)
         _after_write(rel, "append", old_part="", new_part=content)
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
@@ -1360,7 +1359,7 @@ def create_filesystem_tools(
             return _prepend_note(remap_note, format_apply_failure(rel, applied))
         if edit_tracker is not None:
             edit_tracker.ensure_snapshot(rel)
-        target.write_text(applied.new_text, encoding="utf-8")
+        write_workspace_text(target, applied.new_text)
         old_part = "\n".join(h.old_string for h in hunks)
         new_part = "\n".join(h.new_string for h in hunks)
         _after_write(

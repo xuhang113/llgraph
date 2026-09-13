@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from llgraph.config.edit_settings import EditSettings, resolve_edit_settings
+from llgraph.core.atomic_write import write_workspace_text
 from llgraph.session.atomic_store import atomic_write_json, atomic_write_text
 from llgraph.session.user_storage import (
     migrate_legacy_workspace_session_dir,
@@ -422,8 +423,8 @@ class SessionEditTracker:
         if snap_path.is_file():
             try:
                 content = snap_path.read_text(encoding="utf-8")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content, encoding="utf-8")
+                # 回滚要么完整还原，要么什么都不动；半截还原比不还原更难救
+                write_workspace_text(target, content)
                 return self._finalize_undo(
                     rel,
                     UndoItemResult(rel, "restored", "已从会话首次编辑前快照还原"),
