@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,16 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from llgraph.context.chat_history_repair import ai_message_tool_calls
 from llgraph.context.investigate_harness import is_ephemeral_harness_human
+from llgraph.core.search_diffusion_guard import (
+    GrepScope,
+    PendingGrep,
+    WidenDecision,
+    WidenPlan,
+    apply_widened_note,
+    format_merged_note,
+    plan_grep_widenings,
+    widened_root_from_result,
+)
 from llgraph.core.write_failure_tracker import WRITE_TOOL_NAMES
 from llgraph.core.write_serialize import normalize_write_path, write_path_from_call
 
@@ -456,6 +466,24 @@ def format_fail_block(shape: ToolShape, prior: ToolRecord) -> str:
     return "\n".join(lines)
 
 
+def _shape_with_actual_grep_root(shape: ToolShape, content: str) -> ToolShape:
+    """
+    grep 结果被扩根执行过时，按**真正搜过的根**参与后续覆盖判定。
+
+    fp 保持原样：它标识「模型请求了什么」，同参数重复调用仍应精确命中。
+
+    @param shape 按 tool_call 参数推导的形态
+    @param content 工具返回正文
+    @return 可能改写 path 后的形态
+    """
+    if shape.kind != "grep":
+        return shape
+    root = widened_root_from_result(content)
+    if not root or root == shape.path:
+        return shape
+    return replace(shape, path=root)
+
+
 def _index_record(index: _HistoryIndex, record: ToolRecord) -> None:
     index.exact[record.shape.fp] = record
     shape = record.shape
@@ -578,6 +606,7 @@ def build_history_index(messages: list[BaseMessage]) -> _HistoryIndex:
         failed = tool_result_failed(shape.name, content)
         if _write_succeeded(shape.name, content):
             _invalidate_path(index, shape.path)
+        shape = _shape_with_actual_grep_root(shape, content)
         record = ToolRecord(shape=shape, call_id=cid, content=content, failed=failed)
         _index_record(index, record)
     return index
@@ -665,23 +694,77 @@ class _CarryReadContext:
         return format_cross_turn_read_block(coverages, tool_name=shape.name)
 
 
-def compute_blocked_tool_messages(
+@dataclass(frozen=True)
+class ToolLoopPlan:
+    """本批的拦截表 + 扩根改写表。"""
+
+    blocked: dict[str, ToolMessage]
+    widenings: dict[str, WidenDecision]
+
+
+def _grep_widen_plan(
+    index: _HistoryIndex,
+    shapes: list[tuple[str, ToolShape]],
+    *,
+    widen_after: int,
+    workspace: Path | None,
+) -> WidenPlan:
+    """
+    计算「同 pattern 只换目录」的扩根 / 合并决策。
+
+    @param index 本问历史索引
+    @param shapes 本批 (call_id, 形态)
+    @param widen_after 触发阈值；≤0 关闭
+    @param workspace 工作区根（校验扩根目标是目录）
+    @return 决策
+    """
+    pending = [
+        PendingGrep(
+            call_id=cid,
+            pattern=shape.pattern,
+            file_glob=shape.file_glob,
+            path=shape.path,
+        )
+        for cid, shape in shapes
+        if shape.kind == "grep"
+    ]
+    if not pending:
+        return WidenPlan(widen={}, merged={})
+    prior = [
+        GrepScope(
+            pattern=rec.shape.pattern,
+            file_glob=rec.shape.file_glob,
+            path=rec.shape.path,
+        )
+        for rec in index.greps
+    ]
+    return plan_grep_widenings(
+        prior,
+        pending,
+        widen_after=widen_after,
+        workspace=workspace,
+    )
+
+
+def compute_tool_loop_plan(
     messages: list[BaseMessage],
     calls: list[Any],
     *,
     workspace: Path | None = None,
     thread_id: str | None = None,
     cross_turn_reads: bool = False,
-) -> dict[str, ToolMessage]:
+    grep_widen_after: int = 0,
+) -> ToolLoopPlan:
     """
-    计算本批应拦截的 tool_call_id → 占位 ToolMessage。
+    计算本批的拦截表与扩根改写表。
 
     @param messages 工具执行前的图消息
     @param calls 本批待执行 tool_calls
     @param workspace 工作区根（跨轮 read 去重要拿磁盘核对；None 时关闭该层）
     @param thread_id 会话线程（查出站压缩水位，判断历史正文是否还看得见）
     @param cross_turn_reads 是否启用跨轮重复读拦截
-    @return 拦截表
+    @param grep_widen_after 同 pattern 攒够几个互不覆盖的目录后扩根；0=关闭
+    @return 计划
     """
     index = build_history_index(messages)
     write_paths = _batch_write_paths(calls)
@@ -694,12 +777,38 @@ def compute_blocked_tool_messages(
         enabled=cross_turn_reads,
     )
 
+    shapes: list[tuple[str, ToolShape, Any]] = []
     for call in calls:
         shape = shape_from_call(call)
         cid = call_id(call)
         if shape is None or not cid:
             continue
+        shapes.append((cid, shape, call))
+
+    widen_plan = _grep_widen_plan(
+        index,
+        [(cid, shape) for cid, shape, _ in shapes],
+        widen_after=grep_widen_after,
+        workspace=workspace,
+    )
+
+    for cid, shape, _call in shapes:
         name = shape.name
+
+        # 合并到本批的扩根调用；扩根调用本身被拦下时不合并（否则指向一条没跑的结果）
+        merged_owner = widen_plan.merged.get(cid)
+        if merged_owner is not None and merged_owner not in blocked:
+            blocked[cid] = ToolMessage(
+                content=format_merged_note(
+                    requested=shape.path,
+                    root=widen_plan.widen[merged_owner].root,
+                    pattern=shape.pattern,
+                    owner_call_id=merged_owner,
+                ),
+                tool_call_id=cid,
+                name=name,
+            )
+            continue
 
         batch_hit = seen_batch.get(shape.fp)
         if batch_hit is not None:
@@ -733,7 +842,44 @@ def compute_blocked_tool_messages(
         seen_batch[shape.fp] = ToolRecord(
             shape=shape, call_id=cid, content="", failed=False
         )
-    return blocked
+    return ToolLoopPlan(
+        blocked=blocked,
+        widenings={
+            cid: decision
+            for cid, decision in widen_plan.widen.items()
+            if cid not in blocked
+        },
+    )
+
+
+def compute_blocked_tool_messages(
+    messages: list[BaseMessage],
+    calls: list[Any],
+    *,
+    workspace: Path | None = None,
+    thread_id: str | None = None,
+    cross_turn_reads: bool = False,
+    grep_widen_after: int = 0,
+) -> dict[str, ToolMessage]:
+    """
+    计算本批应拦截的 tool_call_id → 占位 ToolMessage。
+
+    @param messages 工具执行前的图消息
+    @param calls 本批待执行 tool_calls
+    @param workspace 工作区根
+    @param thread_id 会话线程
+    @param cross_turn_reads 是否启用跨轮重复读拦截
+    @param grep_widen_after 同 pattern 攒够几个互不覆盖的目录后扩根；0=关闭
+    @return 拦截表
+    """
+    return compute_tool_loop_plan(
+        messages,
+        calls,
+        workspace=workspace,
+        thread_id=thread_id,
+        cross_turn_reads=cross_turn_reads,
+        grep_widen_after=grep_widen_after,
+    ).blocked
 
 
 def install_tool_loop_guard(
@@ -745,28 +891,66 @@ def install_tool_loop_guard(
     workspace: Path | None = None,
     thread_id: str | None = None,
     cross_turn_reads: bool = False,
+    grep_widen_after: int = 0,
 ) -> None:
-    """把本批拦截表挂到 ToolNode（跨线程可见）。"""
+    """把本批拦截表与扩根改写表挂到 ToolNode（跨线程可见）。"""
     if not enabled:
         inner._llgraph_loop_blocks = {}
+        inner._llgraph_grep_widenings = {}
         return
-    inner._llgraph_loop_blocks = compute_blocked_tool_messages(
+    plan = compute_tool_loop_plan(
         messages,
         calls,
         workspace=workspace,
         thread_id=thread_id,
         cross_turn_reads=cross_turn_reads,
+        grep_widen_after=grep_widen_after,
     )
+    inner._llgraph_loop_blocks = plan.blocked
+    inner._llgraph_grep_widenings = plan.widenings
 
 
 def clear_tool_loop_guard(inner: Any) -> None:
-    """清除 ToolNode 上的重复工具拦截表。"""
+    """清除 ToolNode 上的重复工具拦截表与扩根改写表。"""
     inner._llgraph_loop_blocks = {}
+    inner._llgraph_grep_widenings = {}
+
+
+def _widened_call(call: dict[str, Any], decision: WidenDecision) -> dict[str, Any]:
+    """
+    生成扩根后的调用副本（不改原 AIMessage 里的 tool_call）。
+
+    @param call 原调用
+    @param decision 扩根决策
+    @return 副本；参数不可解析时原样返回
+    """
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return call
+    return {**call, "args": {**args, "path": decision.root}}
+
+
+def _annotate_widened(result: Any, decision: WidenDecision) -> Any:
+    """
+    在扩根搜索结果尾部追加「扩到了哪」。
+
+    @param result ToolNode 单次执行结果
+    @param decision 扩根决策
+    @return 追加说明后的结果
+    """
+    if not isinstance(result, ToolMessage) or not isinstance(result.content, str):
+        return result
+    return ToolMessage(
+        content=apply_widened_note(result.content, decision),
+        tool_call_id=result.tool_call_id,
+        name=result.name,
+    )
 
 
 def wrap_tool_node_with_loop_guard(inner: Any) -> None:
     """
-    包装 ToolNode._run_one / _arun_one：命中拦截表则不执行真实工具。
+    包装 ToolNode._run_one / _arun_one：命中拦截表则不执行真实工具；
+    命中扩根表则用扩根后的 path 执行一次，并在结果尾部说明扩到了哪。
 
     必须在 timing / write_serialize 之前调用，使拦截仍走写串行门闩的 mark_done，
     避免同 path 后续写等待已拦截的前驱导致超时。
@@ -777,6 +961,7 @@ def wrap_tool_node_with_loop_guard(inner: Any) -> None:
         return
 
     inner._llgraph_loop_blocks = {}
+    inner._llgraph_grep_widenings = {}
     original_run = inner._run_one
     original_arun = inner._arun_one
 
@@ -786,17 +971,35 @@ def wrap_tool_node_with_loop_guard(inner: Any) -> None:
         msg = blocks.get(cid)
         return msg if isinstance(msg, ToolMessage) else None
 
+    def _widening(call: dict[str, Any]) -> WidenDecision | None:
+        plan = getattr(inner, "_llgraph_grep_widenings", None) or {}
+        cid = str(call.get("id") or "").strip()
+        decision = plan.get(cid)
+        return decision if isinstance(decision, WidenDecision) else None
+
     def guarded_run_one(call: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
         blocked = _blocked_message(call)
         if blocked is not None:
             return blocked
-        return original_run(call, *args, **kwargs)
+        decision = _widening(call)
+        if decision is None:
+            return original_run(call, *args, **kwargs)
+        return _annotate_widened(
+            original_run(_widened_call(call, decision), *args, **kwargs),
+            decision,
+        )
 
     async def guarded_arun_one(call: dict[str, Any], *args: Any, **kwargs: Any) -> Any:
         blocked = _blocked_message(call)
         if blocked is not None:
             return blocked
-        return await original_arun(call, *args, **kwargs)
+        decision = _widening(call)
+        if decision is None:
+            return await original_arun(call, *args, **kwargs)
+        return _annotate_widened(
+            await original_arun(_widened_call(call, decision), *args, **kwargs),
+            decision,
+        )
 
     inner._run_one = guarded_run_one  # type: ignore[method-assign]
     inner._arun_one = guarded_arun_one  # type: ignore[method-assign]

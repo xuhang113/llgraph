@@ -17,6 +17,9 @@ BATCH_TOOLS_NUDGE_AFTER_CAP = 20
 DEFAULT_IDENTICAL_TOOL_GUARD = True
 # 跨轮重复读同一文件（磁盘逐行未变）是否短路径拦截；默认开。
 DEFAULT_CROSS_TURN_READ_DEDUPE = True
+# 同 pattern 已按 N 个互不覆盖的目录搜过后，把下一次同 pattern 检索扩到公共祖先；0=关闭。
+DEFAULT_GREP_WIDEN_AFTER = 2
+GREP_WIDEN_AFTER_CAP = 10
 # 同一路径连续写失败 N 次后回灌升级提示；0=关闭。
 DEFAULT_EDIT_FAILURE_HINT_AFTER = 2
 EDIT_FAILURE_HINT_AFTER_CAP = 20
@@ -168,6 +171,44 @@ def resolve_cross_turn_read_dedupe(workspace: Path | None) -> bool:
         agent.get("cross_turn_read_dedupe"),
         default=DEFAULT_CROSS_TURN_READ_DEDUPE,
     )
+
+
+def parse_grep_widen_after(
+    raw: object,
+    *,
+    default: int = DEFAULT_GREP_WIDEN_AFTER,
+) -> int:
+    """
+    解析 grep_widen_after。
+
+    @param raw agent.json 原始值（False / 0 表示关闭）
+    @param default 缺省
+    @return 0～CAP；0=关闭
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return default if raw else 0
+    try:
+        return max(0, min(GREP_WIDEN_AFTER_CAP, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
+def resolve_grep_widen_after(workspace: Path | None) -> int:
+    """
+    同 pattern 攒够几个互不覆盖的搜索根后扩根到公共祖先。
+
+    受 identical_tool_guard 总开关约束：总开关关掉时本层也不生效。
+
+    @param workspace 工作区根；None 时用默认
+    @return 阈值；0=关闭
+    """
+    if workspace is None:
+        return DEFAULT_GREP_WIDEN_AFTER
+    cfg = load_agent_config(workspace)
+    agent = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
+    return parse_grep_widen_after(agent.get("grep_widen_after"))
 
 
 def parse_edit_failure_hint_after(

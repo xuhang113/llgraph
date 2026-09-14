@@ -289,6 +289,7 @@ def ripgrep_content(
         "-n",
         "--no-heading",
         "--color=never",
+        "-H",
         "-m",
         str(max(1, limit)),
         *_rg_skip_glob_args(merged_skip),
@@ -422,6 +423,9 @@ def ripgrep_count(
         "--count",
         "--no-heading",
         "--color=never",
+        # 必须显式 -H：rg 只给一个文件参数时默认不打印文件名，
+        # 输出里就没有 "path:count"，单文件 grep 会被解析成「零命中」。
+        "-H",
         *_rg_skip_glob_args(merged_skip),
     ]
     if file_glob.strip():
@@ -510,6 +514,7 @@ def ripgrep_content_in_files(
         "-n",
         "--no-heading",
         "--color=never",
+        "-H",
         "-m",
         str(max(1, max_per_file)),
     ]

@@ -18,6 +18,7 @@ from llgraph.core.react_limits import (
     resolve_batch_tools_nudge_after,
     resolve_cross_turn_read_dedupe,
     resolve_edit_failure_hint_after,
+    resolve_grep_widen_after,
     resolve_identical_tool_guard,
 )
 from llgraph.core.tool_execution_context import set_tool_execution_messages
@@ -333,6 +334,7 @@ def build_tool_node(
                 workspace=workspace,
                 thread_id=_config_thread_id(config),
                 cross_turn_reads=resolve_cross_turn_read_dedupe(workspace),
+                grep_widen_after=resolve_grep_widen_after(workspace),
             )
             install_edit_failure_blocks(
                 inner,
@@ -404,6 +406,7 @@ def build_tool_node(
                 workspace=workspace,
                 thread_id=_config_thread_id(config),
                 cross_turn_reads=resolve_cross_turn_read_dedupe(workspace),
+                grep_widen_after=resolve_grep_widen_after(workspace),
             )
             install_edit_failure_blocks(
                 inner,
