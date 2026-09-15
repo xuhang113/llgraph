@@ -3,7 +3,7 @@
 基于 [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) 的终端 Agent，通过 **OpenAI 兼容 API 网关** 调用大模型。对标 Cursor Agent / Claude Code 一类的本地改代码助手：CLI + Web Console，过程可展开（Trace / Skills / 工具）。
 
 <p align="center">
-  <img src="docs/assets/react-intro.gif" alt="llgraph 多轮 ReAct：模型决策 → 工具 → 再决策 → 回复" width="420" />
+  <video src="docs/assets/react-intro.mp4" width="420" controls muted playsinline></video>
 </p>
 
 <p align="center">
