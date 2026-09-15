@@ -1,6 +1,6 @@
 # llgraph
 
-基于 [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) 的终端 Agent，通过 **OpenAI 兼容 API 网关** 调用大模型。对标 Cursor Agent / Claude Code 一类的本地改代码助手：CLI + Web Console，过程可展开（Trace / Skills / 工具）。
+基于 [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) 的终端 Agent，通过 **OpenAI 兼容 API 网关** 调用大模型。CLI + Web Console，过程可展开（Trace / Skills / 工具）。
 
 https://github.com/user-attachments/assets/4ea12924-c1c3-466e-8e76-d61c39c90946
 
