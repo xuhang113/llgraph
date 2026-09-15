@@ -2,7 +2,7 @@
 
 基于 [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) 的终端 Agent，通过 **OpenAI 兼容 API 网关** 调用大模型。对标 Cursor Agent / Claude Code 一类的本地改代码助手：CLI + Web Console，过程可展开（Trace / Skills / 工具）。
 
-https://github.com/user-attachments/assets/d5b59962-2e02-4e88-b37f-255c995a9509
+https://github.com/user-attachments/assets/4ea12924-c1c3-466e-8e76-d61c39c90946
 
 <p align="center">
   <a href="docs/assets/console-tour.mp4">界面速览</a>
@@ -27,7 +27,7 @@ https://github.com/user-attachments/assets/d5b59962-2e02-4e88-b37f-255c995a9509
 
 在 monorepo 工作区中提供：**语义搜代码**、Rules/Skills、局部改代码、MCP、上下文压缩与动态落盘、会话记忆；可选 **Web Console**（浏览器 UI）与 **Python 库 API**（`llgraph.console`）。
 
-截图与介绍视频拍的是本仓库 Web Console 的真实界面（`llgraph web`），不含其它项目数据。视频里是右侧 Trace 的多轮 ReAct（模型决策 → 检索/grep/read → 回复）。
+截图与介绍视频拍的是本仓库 Web Console 的真实整屏界面（`llgraph web`：侧栏、会话、Trace），不含其它项目数据。视频里是多轮 ReAct（模型决策 → 检索/grep/read → 回复）。
 
 | 文档 | 说明 |
 |------|------|
