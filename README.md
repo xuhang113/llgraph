@@ -1,8 +1,24 @@
 # llgraph
 
-基于 [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) 的终端 Agent，通过 **OpenAI 兼容 API 网关** 调用大模型。
+基于 [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) 的终端 Agent，通过 **OpenAI 兼容 API 网关** 调用大模型。对标 Cursor Agent / Claude Code 一类的本地改代码助手：CLI + Web Console，过程可展开（Trace / Skills / 工具）。
+
+<p align="center">
+  <img src="docs/assets/console-tour.gif" alt="llgraph Web Console：会话、内置工具、Skills" width="720" />
+</p>
+
+<p align="center">
+  <a href="docs/assets/console-tour.mp4">视频版（mp4）</a>
+  ·
+  <a href="docs/assets/console.png">会话</a>
+  ·
+  <a href="docs/assets/tools.png">工具</a>
+  ·
+  <a href="docs/assets/skills.png">Skills</a>
+</p>
 
 在 monorepo 工作区中提供：**语义搜代码**、Rules/Skills、局部改代码、MCP、上下文压缩与动态落盘、会话记忆；可选 **Web Console**（浏览器 UI）与 **Python 库 API**（`llgraph.console`）。
+
+截图拍的是本仓库作为工作区时的 Web Console（`llgraph web`），不含其它项目数据。
 
 | 文档 | 说明 |
 |------|------|
@@ -122,8 +138,8 @@ from llgraph.console import Console
 c = Console()
 c.list_workspaces()
 c.register_workspace("/path/to/workspace")
-c.session_tree("my-workspace-xxxxxxxx")
-c.delete_session("my-workspace-xxxxxxxx", "plan-xxxxxxxx")  # Plan 含 Worker 级联
+c.session_tree("llgraph-xxxxxxxx")
+c.delete_session("llgraph-xxxxxxxx", "plan-xxxxxxxx")  # Plan 含 Worker 级联
 ```
 
 控制面边界见 `llgraph.gateway`（`ControlGateway`）；远程部署预留 `LLGRAPH_CONTROL_GATEWAY=remote`。
