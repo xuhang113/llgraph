@@ -2,13 +2,9 @@
 
 基于 [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) 的终端 Agent，通过 **OpenAI 兼容 API 网关** 调用大模型。对标 Cursor Agent / Claude Code 一类的本地改代码助手：CLI + Web Console，过程可展开（Trace / Skills / 工具）。
 
-<p align="center">
-  <video src="docs/assets/react-intro.mp4" width="420" controls muted playsinline></video>
-</p>
+https://github.com/user-attachments/assets/d5b59962-2e02-4e88-b37f-255c995a9509
 
 <p align="center">
-  <a href="docs/assets/react-intro.mp4">多轮 ReAct 介绍</a>
-  ·
   <a href="docs/assets/console-tour.mp4">界面速览</a>
 </p>
 
