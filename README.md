@@ -3,34 +3,31 @@
 基于 [LangGraph](https://docs.langchain.com/oss/python/langgraph/overview) 的终端 Agent，通过 **OpenAI 兼容 API 网关** 调用大模型。对标 Cursor Agent / Claude Code 一类的本地改代码助手：CLI + Web Console，过程可展开（Trace / Skills / 工具）。
 
 <p align="center">
-  <img src="docs/assets/react-intro.gif" alt="llgraph：项目介绍与多轮 ReAct（模型决策 → 工具 → 再决策 → 回复）" width="720" />
+  <img src="docs/assets/react-intro.gif" alt="llgraph：项目介绍与多轮 ReAct" width="420" />
 </p>
 
 <p align="center">
-  <a href="docs/assets/react-intro.mp4">介绍片 · 多轮 ReAct（mp4）</a>
+  <a href="docs/assets/react-intro.mp4">介绍片</a>
   ·
-  <a href="docs/assets/trace.png">Trace</a>
-  ·
-  <a href="docs/assets/trace-rounds.png">多轮步骤</a>
-  ·
-  <a href="docs/assets/trace-react.png">ReAct 对照</a>
-  ·
-  <a href="docs/assets/console-features.png">会话</a>
+  <a href="docs/assets/console-tour.mp4">界面速览</a>
 </p>
 
-<p align="center">
-  <img src="docs/assets/console-tour.gif" alt="llgraph Web Console 界面速览：会话、内置工具、Skills" width="720" />
-</p>
-
-<p align="center">
-  <a href="docs/assets/console-tour.mp4">界面速览（mp4）</a>
-  ·
-  <a href="docs/assets/console.png">会话窗</a>
-  ·
-  <a href="docs/assets/tools.png">工具</a>
-  ·
-  <a href="docs/assets/skills.png">Skills</a>
-</p>
+<table align="center">
+  <tr>
+    <td align="center" width="160">
+      <a href="docs/assets/console.png"><img src="docs/assets/console.png" alt="会话" width="150" /></a><br/>会话
+    </td>
+    <td align="center" width="160">
+      <a href="docs/assets/trace.png"><img src="docs/assets/trace.png" alt="Trace" width="110" /></a><br/>Trace
+    </td>
+    <td align="center" width="160">
+      <a href="docs/assets/tools.png"><img src="docs/assets/tools.png" alt="工具" width="150" /></a><br/>工具
+    </td>
+    <td align="center" width="160">
+      <a href="docs/assets/skills.png"><img src="docs/assets/skills.png" alt="Skills" width="150" /></a><br/>Skills
+    </td>
+  </tr>
+</table>
 
 在 monorepo 工作区中提供：**语义搜代码**、Rules/Skills、局部改代码、MCP、上下文压缩与动态落盘、会话记忆；可选 **Web Console**（浏览器 UI）与 **Python 库 API**（`llgraph.console`）。
 
@@ -124,7 +121,7 @@ llgraph -w -C /path/to/workspace            # 允许改代码
 
 ## Web Console（可选）
 
-浏览器版工作区 / Agent / Plan 控制台。前端在 `web-ui/`，后端与 Agent 执行同属 **llgraph 进程**（经 `llgraph.console` 调库，非独立 REST 服务）。
+浏览器版工作区 / Agent 控制台。前端在 `web-ui/`，后端与 Agent 执行同属 **llgraph 进程**（经 `llgraph.console` 调库，非独立 REST 服务）。
 
 ### 启动
 
@@ -155,7 +152,7 @@ c = Console()
 c.list_workspaces()
 c.register_workspace("/path/to/workspace")
 c.session_tree("llgraph-xxxxxxxx")
-c.delete_session("llgraph-xxxxxxxx", "plan-xxxxxxxx")  # Plan 含 Worker 级联
+c.delete_session("llgraph-xxxxxxxx", "cli-xxxxxxxx")
 ```
 
 控制面边界见 `llgraph.gateway`（`ControlGateway`）；远程部署预留 `LLGRAPH_CONTROL_GATEWAY=remote`。
@@ -207,8 +204,7 @@ llgraph 把 **仓库内配置** 与 **用户目录下的会话/记忆** 分开�
 ```bash
 llgraph --list-sessions -C <工作区>              # 列出会话（标题 + thread_id）
 llgraph -C <工作区> --thread-id cli-xxxxxxxx     # 恢复指定会话
-llgraph -C <工作区> --delete-session cli-xxx     # 删除 Agent 会话
-llgraph -C <工作区> --delete-session plan-xxx    # 删除 Plan（含 Worker/Planner 子节点）
+llgraph -C <工作区> --delete-session cli-xxx     # 删除会话
 llgraph -C <工作区> --purge-sessions --including-current   # 全量删除
 ```
 
@@ -220,7 +216,7 @@ llgraph -C <工作区> --purge-sessions --including-current   # 全量删除
 | `/session use <id>` | 切换会话 |
 | `/session new` | 新建会话 |
 | `/session title <标题>` | 重命名（≤30 字；首条用户消息也会自动生成标题） |
-| `/session delete <id>` | 删除指定会话（`cli-*` 或 `plan-*`，Plan 级联 Worker） |
+| `/session delete <id>` | 删除指定会话 |
 | `/session delete empty` | 删除空壳会话（仅 manifest/meta、无对话） |
 | `/session delete all` | 删除除当前外全部 |
 | `/session delete all --including-current` | 全量删除并切到新会话 |
@@ -304,14 +300,13 @@ llgraph index -C . --path some-service
 ```
 llgraph/
   llgraph/
-    main.py                 CLI 入口（含 llgraph web / index / search / plan）
+    main.py                 CLI 入口（含 llgraph web / index / search）
     cli/                    子命令（web_cli 等）
-    console/                Web Console 库 API + runtime（Agent/Plan SSE）
+    console/                Web Console 库 API + runtime（Agent SSE）
     gateway/                控制面网关（local / remote 预留）
     web/server/             bundled UI 本地 HTTP 适配（非公开 API）
     core/                   ReAct Agent、工具
     session/                会话持久化、删除、注册
-    plan/                   Plan 多 Agent 工作流
     context/                压缩、落盘
     code_index/             向量索引
   web-ui/                   React 前端（Vite；build → dist/）
