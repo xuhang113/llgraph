@@ -20,6 +20,10 @@ class McpServerConfig:
     env: dict[str, str]
     cwd: str | None
     enabled: bool
+    # 读写判定的人工覆盖（工具名 glob）。判定是启发式的，总有猜不中的工具；
+    # 没有这两个口子时，用户要么忍着工具被隐藏，要么把整台 Server 的写工具全打开。
+    read_tools: tuple[str, ...] = ()
+    write_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,22 @@ def _parse_bool(value: object, default: bool) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def _parse_tool_patterns(value: object) -> tuple[str, ...]:
+    """
+    解析工具名 glob 列表（单个字符串也接受）。
+
+    @param value 配置原值
+    @return 去空白后的模式元组
+    """
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        item.strip() for item in value if isinstance(item, str) and item.strip()
+    )
 
 
 def _expand_placeholders(value: str, workspace: Path) -> str:
@@ -116,6 +136,8 @@ def _servers_from_llgraph_format(
                 env=env,
                 cwd=cwd_str,
                 enabled=enabled,
+                read_tools=_parse_tool_patterns(cfg.get("read_tools")),
+                write_tools=_parse_tool_patterns(cfg.get("write_tools")),
             )
         )
     return tuple(servers)

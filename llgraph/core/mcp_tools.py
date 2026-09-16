@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field, create_model
 from llgraph.config.mcp_config import McpServerConfig, McpSettings, format_mcp_summary
 from llgraph.core.mcp_compat import (
     render_call_result,
+    tool_annotations,
     tool_description,
     tool_input_schema,
 )
@@ -30,7 +31,7 @@ from llgraph.core.mcp_health import (
     format_unavailable,
     replay_allowed,
 )
-from llgraph.permissions.mcp import is_write_mcp_tool
+from llgraph.permissions.mcp import McpToolAccess, classify_mcp_tool
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +169,7 @@ class _McpServerRuntime:
         self._error: str | None = None
         self._tools: list[Any] = []
         self._tool_desc: dict[str, str] = {}
+        self._tool_annotations: dict[str, object] = {}
         self._session = None
         self._stdio_ctx = None
         # 重连状态：并发工具调度下会有多个线程同时撞到同一次断开
@@ -258,9 +260,13 @@ class _McpServerRuntime:
         await self._session.initialize()
         listed = await self._session.list_tools()
         self._tools = list(listed.tools)
-        # 重连后仍要能判断「这是不是写类工具」，描述先存一份
+        # 重连后仍要能判断「这是不是写类工具」，描述与标注先存一份
         for item in self._tools:
-            self._tool_desc[str(getattr(item, "name", ""))] = tool_description(item)
+            tool_name = str(getattr(item, "name", ""))
+            self._tool_desc[tool_name] = tool_description(item)
+            annotations = tool_annotations(item)
+            if annotations is not None:
+                self._tool_annotations[tool_name] = annotations
 
     async def _shutdown_async(self) -> None:
         if self._session is not None:
@@ -279,6 +285,24 @@ class _McpServerRuntime:
     def list_tools(self) -> list[Any]:
         """返回 MCP 工具定义列表。"""
         return list(self._tools)
+
+    def tool_access(self, tool_name: str) -> McpToolAccess:
+        """
+        这个工具是读还是写（连接期缓存的描述 / 标注 + 本 Server 的人工覆盖）。
+
+        过滤工具表和「重连后能不能自动重放」用的是同一个判定：
+        两处不一致的话，只读模式下被隐藏的工具反而会被当成读工具重放。
+
+        @param tool_name MCP 原始工具名
+        @return 判定结果
+        """
+        return classify_mcp_tool(
+            tool_name,
+            self._tool_desc.get(tool_name, ""),
+            annotations=self._tool_annotations.get(tool_name),
+            read_tools=self.config.read_tools,
+            write_tools=self.config.write_tools,
+        )
 
     def call_tool_sync(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """
@@ -314,7 +338,7 @@ class _McpServerRuntime:
             )
 
         self._notice(f"MCP {self.config.name} 连接已重建（{reason}）")
-        is_write = is_write_mcp_tool(tool_name, self._tool_desc.get(tool_name, ""))
+        is_write = self.tool_access(tool_name).is_write
         if crashes > 1 or not replay_allowed(reason, is_write_tool=is_write):
             if crashes >= _TOOL_CRASH_LIMIT:
                 return format_tool_crashes_server(
@@ -523,6 +547,7 @@ class McpToolRegistry:
         self._runtimes: dict[str, _McpServerRuntime] = {}
         self._langchain_tools: list[StructuredTool] = []
         self._load_errors: list[str] = []
+        self._hidden_write_tools: dict[str, list[str]] = {}
 
     @property
     def load_errors(self) -> list[str]:
@@ -575,6 +600,11 @@ class McpToolRegistry:
         """已注册的 LangChain 工具（仅加载成功的 Server）。"""
         return list(self._langchain_tools)
 
+    @property
+    def hidden_write_tools(self) -> dict[str, list[str]]:
+        """只读模式下被隐藏的写类工具（按 Server 分组）。"""
+        return {k: list(v) for k, v in self._hidden_write_tools.items() if v}
+
     def summary(self) -> str:
         """加载摘要。"""
         ok = len(self._runtimes)
@@ -584,6 +614,17 @@ class McpToolRegistry:
             base += f"\n  已加载: {ok}/{total} Server，工具数 {len(self._langchain_tools)}"
         elif total:
             base += f"\n  已加载: 0/{total} Server（失败已跳过，不影响其它功能）"
+        # 隐藏必须可见：判错时用户至少能看出「少了哪个工具」，
+        # 而不是只能猜为什么模型说这个能力不存在。
+        for server_name, names in sorted(self._hidden_write_tools.items()):
+            if not names:
+                continue
+            shown = "、".join(names[:6])
+            more = f" 等 {len(names)} 个" if len(names) > 6 else ""
+            base += (
+                f"\n  [只读] {server_name} 已隐藏写类工具: {shown}{more}"
+                "（需要就用 -w，或在 mcp.json 该 Server 下写 read_tools）"
+            )
         for err in self._load_errors:
             base += f"\n  [跳过] {err}"
         return base
@@ -600,12 +641,22 @@ class McpToolRegistry:
             if allow_write_tools is None
             else allow_write_tools
         )
+        hidden: list[str] = []
         tools: list[StructuredTool] = []
         for mcp_tool in runtime.list_tools():
             name = mcp_tool.name
             desc = tool_description(mcp_tool)
-            if not permit_write and is_write_mcp_tool(name, desc):
-                continue
+            if not permit_write:
+                access = runtime.tool_access(name)
+                if access.is_write:
+                    hidden.append(name)
+                    logger.info(
+                        "MCP %s/%s 只读模式下已隐藏（判据 %s）",
+                        server_name,
+                        name,
+                        access.reason(),
+                    )
+                    continue
             lc_name = f"mcp__{server_name}__{name}"
             input_schema = tool_input_schema(mcp_tool)
 
@@ -686,6 +737,7 @@ class McpToolRegistry:
                     args_schema=_McpArgumentsJson,
                 )
             tools.append(tool)
+        self._hidden_write_tools[server_name] = hidden
         return tools
 
     def rebuild_for_allow_write(self, workspace: Path, allow_write: bool) -> list[StructuredTool]:

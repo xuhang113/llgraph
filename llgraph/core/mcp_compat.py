@@ -53,6 +53,19 @@ def tool_input_schema(mcp_tool: object) -> dict[str, Any]:
     return schema if isinstance(schema, dict) else {}
 
 
+def tool_annotations(mcp_tool: object) -> object | None:
+    """
+    读取 MCP 工具标注（`readOnlyHint` / `destructiveHint` 所在的对象）。
+
+    标注是服务端自己声明的读写语义，比按工具名猜准得多；
+    1.x 早期版本没有这个字段，取不到就返回 None 让调用方退回启发式判定。
+
+    @param mcp_tool MCP `Tool` 对象
+    @return `ToolAnnotations` 对象或 dict；缺失时 None
+    """
+    return _first_attr(mcp_tool, ("annotations",), None)
+
+
 def tool_description(mcp_tool: object) -> str:
     """
     读取 MCP 工具描述。
