@@ -13,13 +13,20 @@
 **定时自动迭代**（`cursor/auto_upgrade`，每天北京时间 10:00）：
 
 - 直接在当前分支提交，不要开新分支，不要 PR。
-- 按影响力选一件做深：速度 / 性能 / 稳定性 / 商用体验。两件都很小才可顺带第二件。
-- 先看 changelog 已有方向，接着做，不要推倒重来。
-- 没有高价值切口：只写 changelog 说明下轮攻哪，不要硬改。
+- 按下面「排队」做，不要自己另开主题，不要两件一起开。
+- 先看 changelog 已有方向再接着做，不要推倒重来。
+- 没有可下手切口：只写 changelog 说明下轮攻哪，不要硬改。
 
 ## 产品
 
-终端侧 Cursor 式 Agent：LangGraph ReAct + OpenAI 兼容网关 + CLI / Web Console。对标 Cursor Agent、Claude Code、Codex CLI。提交后仍可 `pip install -e` 并启动现有 CLI。
+终端 Agent：LangGraph ReAct + CLI / Web Console。模型目前走 OpenAI 兼容网关（`LLGRAPH_*`）。提交后仍可 `pip install -e` 并启动现有 CLI。陌生人安装走 `scripts/install.sh`。
+
+## Cloud Agent 排队（做完一件再换）
+
+1. **模型入口（当前优先）**：开箱接 Anthropic / OpenAI / Gemini / Ollama，**保留**现有 OpenAI 兼容网关。做到用官方 Key 或本地 Ollama 能跑一轮对话+工具。下手：`llgraph/core/llm.py`、`llgraph/config/config.py`、`examples/llgraph.env.example`。
+2. **编辑器里干活**：VS Code 扩展或 ACP 插件；终端 TUI 后置。**1 未完成前不要开 2。**
+
+速度 / 性能 / 稳定性：仅当上面两件本轮都没有可下手切口时才选。不要做 PyPI / brew（安装脚本已经有了）。
 
 ## 改哪里
 

@@ -81,6 +81,16 @@ cp examples/llgraph.env.example ~/.config/llgraph/llgraph.env
 
 ## 安装
 
+一条命令（macOS / Linux；装到 `~/.local/share/llgraph`，命令进 `~/.local/bin`）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xuhang113/llgraph/cursor/auto_upgrade/scripts/install.sh | bash
+```
+
+装完编辑 `~/.config/llgraph/llgraph.env`。已有克隆也可以在仓库里跑 `./scripts/install.sh`。
+
+从源码手动装：
+
 ```bash
 cd /path/to/llgraph
 python3.12 -m venv .venv && source .venv/bin/activate
