@@ -94,6 +94,41 @@ def _ollama_response(state: _StubState) -> dict[str, Any]:
     }
 
 
+def _anthropic_response(state: _StubState) -> dict[str, Any]:
+    """Anthropic /v1/messages 形态（网关与官方入口共用这套协议）。"""
+    body = state.requests[-1]
+    has_tool_result = any(
+        isinstance(m.get("content"), list)
+        and any(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in m["content"]
+        )
+        for m in body.get("messages", [])
+    )
+    if has_tool_result:
+        content: list[dict[str, Any]] = [{"type": "text", "text": "北京现在 12:00。"}]
+        stop_reason = "end_turn"
+    else:
+        content = [
+            {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "city_time",
+                "input": {"city": "北京"},
+            }
+        ]
+        stop_reason = "tool_use"
+    return {
+        "id": "msg_stub",
+        "type": "message",
+        "role": "assistant",
+        "model": body.get("model", "stub"),
+        "content": content,
+        "stop_reason": stop_reason,
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }
+
+
 def _make_handler(state: _StubState):
     """
     构造 stub HTTP handler（同时支持 OpenAI /v1 与 ollama /api）。
@@ -120,6 +155,8 @@ def _make_handler(state: _StubState):
                     data = (json.dumps(payload) + "\n").encode("utf-8")
                 else:
                     data = json.dumps(payload).encode("utf-8")
+            elif self.path.endswith("/v1/messages"):
+                data = json.dumps(_anthropic_response(state)).encode("utf-8")
             else:
                 data = json.dumps(_openai_response(state)).encode("utf-8")
 
@@ -178,6 +215,27 @@ def _run_one_tool_round(bound: Any) -> tuple[AIMessage, AIMessage]:
     )
     final = bound.invoke(messages)
     return first, final
+
+
+def test_gateway_one_tool_round(
+    monkeypatch: pytest.MonkeyPatch,
+    stub_server: tuple[str, _StubState],
+) -> None:
+    """默认网关路径：多 provider 改造后仍按 Anthropic 协议发到 LLGRAPH_API_BASE_URL。"""
+    base_url, state = stub_server
+    monkeypatch.setenv(ENV_API_BASE_URL, base_url)
+    monkeypatch.setenv(ENV_API_KEY, _FAKE_KEY)
+    monkeypatch.setenv(ENV_MODEL, "claude-opus-4-6")
+
+    llm = create_chat_llm(None)
+    assert getattr(llm, "llgraph_provider") == "gateway"
+    bound = _bind_tools_if_needed(llm, [city_time])
+    _first, final = _run_one_tool_round(bound)
+
+    assert "12:00" in str(final.content)
+    first_req = state.requests[0]
+    assert [t["name"] for t in (first_req.get("tools") or [])] == ["city_time"]
+    assert first_req.get("model") == "claude-opus-4-6"
 
 
 def test_openai_provider_one_tool_round(
