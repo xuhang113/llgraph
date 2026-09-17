@@ -37,6 +37,20 @@ mcp = [
 search = [
     "tavily-python>=0.5.0",
 ]
+openai = [
+    "langchain-openai>=0.3.0",
+]
+gemini = [
+    "langchain-google-genai>=2.0.0",
+]
+ollama = [
+    "langchain-ollama>=0.2.0",
+]
+models = [
+    "langchain-openai>=0.3.0",
+    "langchain-google-genai>=2.0.0",
+    "langchain-ollama>=0.2.0",
+]
 web = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
@@ -53,6 +67,9 @@ all = [
     "watchdog>=4.0.0",
     "mcp>=1.0.0",
     "tavily-python>=0.5.0",
+    "langchain-openai>=0.3.0",
+    "langchain-google-genai>=2.0.0",
+    "langchain-ollama>=0.2.0",
 ]
 dev = [
     "ruff>=0.9.0",

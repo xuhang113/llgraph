@@ -11,7 +11,7 @@ REPO_URL="${LLGRAPH_REPO:-https://github.com/xuhang113/llgraph.git}"
 REPO_REF="${LLGRAPH_REF:-cursor/auto_upgrade}"
 DEFAULT_HOME="${HOME}/.local/share/llgraph"
 BIN_DIR="${LLGRAPH_BIN_DIR:-${HOME}/.local/bin}"
-EXTRAS="${LLGRAPH_EXTRAS:-index,watch,mcp}"
+EXTRAS="${LLGRAPH_EXTRAS:-index,watch,mcp,models}"
 WITH_WEB="${LLGRAPH_WITH_WEB:-0}"
 
 usage() {

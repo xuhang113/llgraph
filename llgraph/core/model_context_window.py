@@ -11,6 +11,10 @@ from llgraph.core.llm_settings import resolve_effective_model
 # 未在目录/启发式命中时的默认值（现代模型多为 200K）
 DEFAULT_CONTEXT_WINDOW = 200_000
 
+# ollama 标签形态（qwen3:8b）：本地模型实际窗口远小于云端同名模型，
+# 按 200K 算会让自动压缩永不触发、第一轮长上下文就被服务端截断。
+LOCAL_TAG_CONTEXT_WINDOW = 32_768
+
 # 模型名启发式（顺序优先）
 _CONTEXT_WINDOW_PATTERNS: list[tuple[re.Pattern[str], int]] = [
     (re.compile(r"deepseek-v4", re.I), 1_000_000),
@@ -96,6 +100,10 @@ def resolve_model_context_window(
         for entry in catalog:
             if entry.model_id == mid and entry.context_window is not None:
                 return entry.context_window, f"catalog({mid})"
+
+        if ":" in mid and "/" not in mid:
+            # 本地模型的窗口按标签保守取；要更大就在 agent.json llm.models 里写 context_window
+            return LOCAL_TAG_CONTEXT_WINDOW, f"local-tag({mid})"
 
         guessed = _heuristic_context_window(mid)
         if guessed is not None:

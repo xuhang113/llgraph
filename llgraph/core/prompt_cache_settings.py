@@ -85,7 +85,7 @@ def prompt_cache_enabled_for_model(
     model_id: str | None,
 ) -> bool:
     """
-    当前模型是否启用 prompt cache。
+    当前模型是否启用 prompt cache（非 Anthropic 协议的 provider 一律不打断点）。
 
     @param workspace 工作区根
     @param model_id 模型 id
@@ -93,6 +93,12 @@ def prompt_cache_enabled_for_model(
     """
     settings = resolve_prompt_cache_settings(workspace)
     if not settings.enabled:
+        return False
+    from llgraph.config.providers import provider_supports_prompt_cache
+    from llgraph.core.llm_settings import resolve_effective_provider
+
+    provider, _source = resolve_effective_provider(workspace)
+    if not provider_supports_prompt_cache(provider):
         return False
     if not model_id or not str(model_id).strip():
         return True

@@ -59,6 +59,29 @@ def resolve_configured_model() -> str:
     return os.getenv(ENV_MODEL, DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
 
+def configured_model_or_none() -> str | None:
+    """
+    读取 LLGRAPH_MODEL；未配置时返回 None（区别于 resolve_configured_model 的默认值）。
+
+    provider 选中后要用「这家自己的默认模型」，前提是用户没点名模型。
+
+    @return 模型 id 或 None
+    """
+    load_llgraph_env()
+    raw = os.getenv(ENV_MODEL, "").strip()
+    return raw or None
+
+
+def gateway_credentials_present() -> bool:
+    """
+    OpenAI 兼容网关凭据是否齐（base_url + key）。
+
+    @return 是否可走网关
+    """
+    load_llgraph_env()
+    return bool(os.getenv(ENV_API_BASE_URL, "").strip() and os.getenv(ENV_API_KEY, "").strip())
+
+
 def get_llgraph_settings() -> dict[str, str]:
     """
     读取 llgraph API 必填项；缺失时抛出清晰错误。

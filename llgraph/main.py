@@ -590,9 +590,9 @@ def main() -> None:
                 sess.watch_service.notify_changed(rel)
 
         # 凭据缺失要在 banner 之前就报错（延迟构建会把 RuntimeError 推到首轮）
-        from llgraph.config.config import get_llgraph_settings
+        from llgraph.core.llm import verify_model_credentials
 
-        get_llgraph_settings()
+        verify_model_credentials(workspace)
 
         def _build_interactive_agent() -> Any:
             from llgraph.core.agent import build_agent

@@ -61,6 +61,10 @@ def _bind_tools_if_needed(model: Any, tools: Sequence[BaseTool | Callable | dict
     """
     为 Chat 模型绑定工具（未绑定时）。
 
+    ``parallel_tool_calls`` / ``tool_choice`` 只有 Anthropic / OpenAI 协议认；
+    Gemini、Ollama 的 bind_tools 会把未知参数原样塞进请求体，服务端才报错，
+    所以按 provider 决定传哪些（provider 由 create_chat_llm 挂在模型上）。
+
     @param model LLM
     @param tools 工具列表
     @return 可能 bind_tools 后的模型
@@ -68,12 +72,12 @@ def _bind_tools_if_needed(model: Any, tools: Sequence[BaseTool | Callable | dict
     if not tools:
         return model
     if isinstance(model, BaseChatModel):
+        from llgraph.config.providers import tool_bind_kwargs
+
+        provider = getattr(model, "llgraph_provider", None)
+        kwargs = tool_bind_kwargs(provider)
         try:
-            return model.bind_tools(
-                list(tools),
-                parallel_tool_calls=True,
-                tool_choice="auto",
-            )
+            return model.bind_tools(list(tools), **kwargs)
         except TypeError:
             try:
                 return model.bind_tools(list(tools), parallel_tool_calls=True)

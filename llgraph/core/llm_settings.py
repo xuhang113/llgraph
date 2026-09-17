@@ -5,8 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from llgraph.config.config import ENV_MODEL, resolve_configured_model
+from llgraph.config.config import (
+    ENV_MODEL,
+    configured_model_or_none,
+    resolve_configured_model,
+)
 from llgraph.config.edit_settings import load_agent_config
+from llgraph.config.providers import (
+    ENV_PROVIDER,
+    PROVIDER_GATEWAY,
+    default_model_for_provider,
+    detect_provider,
+    normalize_provider_name,
+)
 
 DEFAULT_MAX_TOKENS = 16_384
 DEFAULT_REQUEST_TIMEOUT_SEC = 600.0
@@ -17,12 +28,13 @@ _runtime_model: str | None = None
 
 @dataclass(frozen=True)
 class LlmSettings:
-    """Gateway 模型生成参数。"""
+    """模型生成参数。"""
 
     model: str
     max_tokens: int
     request_timeout_sec: float
     thinking_stream_timeout_sec: float
+    provider: str = PROVIDER_GATEWAY
 
 
 def set_runtime_model(model_id: str | None) -> str | None:
@@ -45,14 +57,14 @@ def get_runtime_model() -> str | None:
     return _runtime_model
 
 
-def resolve_effective_model(workspace: Path | None = None) -> str:
+def resolve_explicit_model(workspace: Path | None = None) -> str | None:
     """
-    解析实际使用的模型 id。
+    用户点名的模型：会话 /model > agent.json llm.model > LLGRAPH_MODEL。
 
-    优先级：会话 /model > agent.json llm.model > LLGRAPH_MODEL。
+    一个都没配时返回 None——此时模型名由 provider 的默认值决定。
 
     @param workspace 工作区根
-    @return 模型 id
+    @return 模型 id 或 None
     """
     if _runtime_model:
         return _runtime_model
@@ -64,7 +76,49 @@ def resolve_effective_model(workspace: Path | None = None) -> str:
         if isinstance(raw, str) and raw.strip():
             return raw.strip()
 
-    return resolve_configured_model()
+    return configured_model_or_none()
+
+
+def resolve_effective_provider(workspace: Path | None = None) -> tuple[str, str]:
+    """
+    解析这轮走哪家模型入口。
+
+    优先级：agent.json llm.provider > LLGRAPH_PROVIDER > 网关凭据 >
+    模型 id 指向且有凭据的那家 > 配了官方 Key 的那家 > 本地 Ollama。
+    一家都探不到时返回网关（真正建客户端时才报错，只读路径不该崩）。
+
+    @param workspace 工作区根
+    @return (provider, 来源说明)
+    """
+    if workspace is not None:
+        cfg = load_agent_config(workspace)
+        llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
+        name = normalize_provider_name(llm_cfg.get("provider"))
+        if name is not None:
+            return name, "工作区 agent.json llm.provider"
+
+    provider, source = detect_provider(resolve_explicit_model(workspace))
+    if provider is None:
+        return PROVIDER_GATEWAY, "默认（未探测到任何凭据）"
+    return provider, source
+
+
+def resolve_effective_model(workspace: Path | None = None) -> str:
+    """
+    解析实际使用的模型 id。
+
+    优先级：会话 /model > agent.json llm.model > LLGRAPH_MODEL >
+    当前 provider 的默认模型。
+
+    @param workspace 工作区根
+    @return 模型 id
+    """
+    explicit = resolve_explicit_model(workspace)
+    if explicit:
+        return explicit
+
+    provider, _source = resolve_effective_provider(workspace)
+    return default_model_for_provider(provider) or resolve_configured_model()
 
 
 def resolve_llm_settings(workspace: Path | None = None) -> LlmSettings:
@@ -99,11 +153,13 @@ def resolve_llm_settings(workspace: Path | None = None) -> LlmSettings:
         except (TypeError, ValueError):
             thinking_stream_timeout_sec = DEFAULT_THINKING_STREAM_TIMEOUT_SEC
 
+    provider, _source = resolve_effective_provider(workspace)
     return LlmSettings(
         model=resolve_effective_model(workspace),
         max_tokens=max_tokens,
         request_timeout_sec=request_timeout_sec,
         thinking_stream_timeout_sec=thinking_stream_timeout_sec,
+        provider=provider,
     )
 
 
@@ -126,8 +182,12 @@ def format_model_status(workspace: Path) -> str:
         llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
         if isinstance(llm_cfg.get("model"), str) and llm_cfg.get("model", "").strip():
             lines.append(f"来源: agent.json llm.model（env 默认 {env_model}）")
-        else:
+        elif configured_model_or_none():
             lines.append(f"来源: 环境变量 {ENV_MODEL}")
+        else:
+            lines.append("来源: provider 默认模型（未配 agent.json llm.model / 环境变量）")
+    provider, provider_source = resolve_effective_provider(workspace)
+    lines.append(f"模型入口: {provider}（{provider_source}；切换用 {ENV_PROVIDER} 或 llm.provider）")
     lines.append("切换: /model <名>  |  /model reset 恢复默认  |  列表: /model list")
     lines.append("配置: /config（agent.json 合并规则）")
     try:
@@ -152,13 +212,17 @@ def format_model_banner_suffix(workspace: Path) -> str:
     @return 如「claude-sonnet-4-6（工作区 agent.json）」
     """
     effective = resolve_effective_model(workspace)
+    provider, _source = resolve_effective_provider(workspace)
+    suffix = "" if provider == PROVIDER_GATEWAY else f"，{provider}"
     if _runtime_model:
-        return f"{effective}（本会话 /model 覆盖）"
+        return f"{effective}（本会话 /model 覆盖{suffix}）"
     cfg = load_agent_config(workspace)
     llm_cfg = cfg.get("llm") if isinstance(cfg.get("llm"), dict) else {}
     if isinstance(llm_cfg.get("model"), str) and llm_cfg.get("model", "").strip():
         env_model = resolve_configured_model()
         if effective != env_model:
-            return f"{effective}（工作区 agent.json llm.model；env 为 {env_model}）"
-        return f"{effective}（工作区 agent.json llm.model）"
-    return f"{effective}（环境变量 {ENV_MODEL}）"
+            return f"{effective}（工作区 agent.json llm.model；env 为 {env_model}{suffix}）"
+        return f"{effective}（工作区 agent.json llm.model{suffix}）"
+    if not configured_model_or_none():
+        return f"{effective}（{provider} 默认模型）"
+    return f"{effective}（环境变量 {ENV_MODEL}{suffix}）"

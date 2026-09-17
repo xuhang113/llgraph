@@ -178,6 +178,11 @@ def fetch_gateway_models(*, force_refresh: bool = False) -> list[str]:
     """
     global _cache_models, _cache_at, _cache_key
 
+    from llgraph.config.config import gateway_credentials_present
+
+    # 走官方 Key / 本地 Ollama 时没有网关凭据，/model list 不该因此抛错
+    if not gateway_credentials_present():
+        return []
     settings = get_llgraph_settings()
     base = settings["base_url"].rstrip("/")
     api_key = settings["api_key"]

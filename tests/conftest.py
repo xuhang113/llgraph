@@ -13,6 +13,23 @@ from llgraph.config.config import (
     ENV_IGNORE_ENV_FILES,
     ENV_MODEL,
 )
+from llgraph.config.providers import ENV_OLLAMA_AUTODETECT, ENV_PROVIDER
+
+# 开发机上可能 export 了官方厂商 Key / ollama 地址：清掉，否则「选哪家」随机器变
+_VENDOR_ENV_NAMES = (
+    ENV_PROVIDER,
+    "LLGRAPH_ANTHROPIC_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "LLGRAPH_ANTHROPIC_BASE_URL",
+    "LLGRAPH_OPENAI_API_KEY",
+    "OPENAI_API_KEY",
+    "LLGRAPH_OPENAI_BASE_URL",
+    "LLGRAPH_GEMINI_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "LLGRAPH_OLLAMA_BASE_URL",
+    "OLLAMA_HOST",
+)
 
 # 不可路由的本地端口：任何漏网的出站请求都会立刻 connection refused，不会真打网关
 _FAKE_BASE_URL = "http://127.0.0.1:9"
@@ -44,6 +61,10 @@ def _isolate_gateway_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ENV_API_BASE_URL, _FAKE_BASE_URL)
     monkeypatch.setenv(ENV_API_KEY, _FAKE_API_KEY)
     monkeypatch.setenv(ENV_MODEL, _FAKE_MODEL)
+    for name in _VENDOR_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    # 不去连本机 11434：单测不该因为开发机开着 ollama 就换一条模型入口
+    monkeypatch.setenv(ENV_OLLAMA_AUTODETECT, "0")
 
 
 @pytest.fixture(autouse=True)
