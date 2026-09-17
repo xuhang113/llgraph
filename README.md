@@ -75,9 +75,22 @@ cp examples/llgraph.env.example ~/.config/llgraph/llgraph.env
 |------|------|
 | `LLGRAPH_API_BASE_URL` | OpenAI 兼容网关根地址 |
 | `LLGRAPH_API_KEY` | API 令牌 |
-| `LLGRAPH_MODEL` | 默认模型名 |
+| `LLGRAPH_MODEL` | 默认模型名；不配则用当前入口的默认模型 |
 
-凭据使用 **`LLGRAPH_*`**，不复用 Claude CLI 的 `ANTHROPIC_*`。
+网关凭据使用 **`LLGRAPH_*`**，不复用 Claude CLI 的 `ANTHROPIC_*`。
+
+也可以不用网关，直接接官方 API 或本地模型（四选一，`llgraph` 自己判断走哪条，
+`/model` 会显示选中的入口）：
+
+| 入口 | 配什么 |
+|------|------|
+| Anthropic 官方 | `LLGRAPH_ANTHROPIC_API_KEY`，或已 export 的 `ANTHROPIC_API_KEY` |
+| OpenAI 官方 | `LLGRAPH_OPENAI_API_KEY` / `OPENAI_API_KEY`（`pip install 'llgraph[openai]'`） |
+| Gemini 官方 | `LLGRAPH_GEMINI_API_KEY` / `GEMINI_API_KEY`（`pip install 'llgraph[gemini]'`） |
+| 本地 Ollama | 不用 Key，`ollama serve` 在听就行（`pip install 'llgraph[ollama]'`） |
+
+想强制某一家：`LLGRAPH_PROVIDER=gateway|anthropic|openai|gemini|ollama`。
+本地模型请挑支持 tools 的（如 `qwen3:8b`），否则 Agent 只能聊天、不能调工具。
 
 ## 安装
 

@@ -19,12 +19,12 @@
 
 ## 产品
 
-终端 Agent：LangGraph ReAct + CLI / Web Console。模型目前走 OpenAI 兼容网关（`LLGRAPH_*`）。提交后仍可 `pip install -e` 并启动现有 CLI。陌生人安装走 `scripts/install.sh`。
+终端 Agent：LangGraph ReAct + CLI / Web Console。模型入口：OpenAI 兼容网关（`LLGRAPH_*`，默认）或 Anthropic / OpenAI / Gemini / Ollama 官方入口（见 `llgraph/config/providers.py`）。提交后仍可 `pip install -e` 并启动现有 CLI。陌生人安装走 `scripts/install.sh`。
 
 ## Cloud Agent 排队（做完一件再换）
 
-1. **模型入口（当前优先）**：开箱接 Anthropic / OpenAI / Gemini / Ollama，**保留**现有 OpenAI 兼容网关。做到用官方 Key 或本地 Ollama 能跑一轮对话+工具。下手：`llgraph/core/llm.py`、`llgraph/config/config.py`、`examples/llgraph.env.example`。
-2. **编辑器里干活**：VS Code 扩展或 ACP 插件；终端 TUI 后置。**1 未完成前不要开 2。**
+1. ~~**模型入口**：开箱接 Anthropic / OpenAI / Gemini / Ollama，保留现有网关。~~ 2026-09-17 完成（`changelog/2026-09-17-multi-provider-model-entry.md`）。别再重做一遍；剩下的小口子（Gemini 协议层测试、`/model list` 接官方列表、一个会话混用多家）都写在那篇的「不要做」里。
+2. **编辑器里干活（当前优先）**：VS Code 扩展或 ACP 插件；终端 TUI 后置。
 
 速度 / 性能 / 稳定性：仅当上面两件本轮都没有可下手切口时才选。不要做 PyPI / brew（安装脚本已经有了）。
 
