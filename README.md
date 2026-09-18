@@ -178,6 +178,30 @@ c.delete_session("llgraph-xxxxxxxx", "cli-xxxxxxxx")
 
 ---
 
+## 在编辑器里用（ACP）
+
+`llgraph acp` 在 stdio 上说 [Agent Client Protocol](https://agentclientprotocol.com)，支持 ACP 的编辑器（Zed、Neovim 等）可以把 llgraph 当内置 Agent 拉起来。命令由编辑器以子进程方式启动，不用手敲。
+
+Zed 的 `settings.json`：
+
+```json
+{
+  "agent_servers": {
+    "llgraph": {
+      "command": "llgraph",
+      "args": ["acp"]
+    }
+  }
+}
+```
+
+- 工作区取编辑器在 `session/new` 里给的 `cwd`；没给时用 `llgraph acp -C <目录>`
+- 默认**只读**，要让它改文件加 `"args": ["acp", "--write"]`
+- 模型入口与 CLI 完全一致（网关或 Anthropic / OpenAI / Gemini / Ollama），凭据没配会在编辑器的 Agent 日志（stderr）里直接报出来
+- 会话与 CLI / Web Console 同一套落盘：编辑器里聊到一半可以 `llgraph --thread-id <sessionId>` 接着聊（同一时刻只能一边操作）
+
+---
+
 ## 数据放在哪（重要）
 
 llgraph 把 **仓库内配置** 与 **用户目录下的会话/记忆** 分开，避免污染 git 工作区。
@@ -287,6 +311,7 @@ llgraph -C <工作区> --purge-sessions --including-current   # 全量删除
 
 ```bash
 llgraph web --help                          # Web Console（需 [web]）
+llgraph acp --help                          # 编辑器接入（ACP，stdio）
 llgraph index --status -C .
 llgraph index -C . --incremental
 llgraph search "NotFoundException" -C .
@@ -319,8 +344,9 @@ llgraph index -C . --path some-service
 ```
 llgraph/
   llgraph/
-    main.py                 CLI 入口（含 llgraph web / index / search）
-    cli/                    子命令（web_cli 等）
+    main.py                 CLI 入口（含 llgraph web / acp / index / search）
+    cli/                    子命令（web_cli、acp_cli 等）
+    editor/acp/             ACP 服务端（编辑器接入）
     console/                Web Console 库 API + runtime（Agent SSE）
     gateway/                控制面网关（local / remote 预留）
     web/server/             bundled UI 本地 HTTP 适配（非公开 API）

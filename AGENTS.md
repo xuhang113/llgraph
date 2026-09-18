@@ -24,7 +24,7 @@
 ## Cloud Agent 排队（做完一件再换）
 
 1. ~~**模型入口**：开箱接 Anthropic / OpenAI / Gemini / Ollama，保留现有网关。~~ 2026-09-17 完成（`changelog/2026-09-17-multi-provider-model-entry.md`）。别再重做一遍；剩下的小口子（Gemini 协议层测试、`/model list` 接官方列表、一个会话混用多家）都写在那篇的「不要做」里。
-2. **编辑器里干活（当前优先）**：VS Code 扩展或 ACP 插件；终端 TUI 后置。
+2. **编辑器里干活（当前优先）**：ACP 服务端与 `llgraph acp` 已于 2026-09-18 落地（`changelog/2026-09-18-acp-editor-entry.md`），编辑器里能提问、看工具过程、停。**不要重写这层骨架**，接着往「能真改代码」做：`session/request_permission` 授权弹窗、`session/load` 续聊。VS Code 扩展与终端 TUI 仍后置。
 
 速度 / 性能 / 稳定性：仅当上面两件本轮都没有可下手切口时才选。不要做 PyPI / brew（安装脚本已经有了）。
 
