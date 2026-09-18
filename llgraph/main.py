@@ -2,7 +2,7 @@
 
 本模块顶层只 import 标准库与 `trace_mode`（纯 Enum）。
 `llgraph.core.agent` / `trace_display` / 会话落盘等重链路一律函数内延迟 import：
-`--help`、`--list-sessions`、`llgraph index|search|web` 不该为了打印一行
+`--help`、`--list-sessions`、`llgraph index|search|web|acp` 不该为了打印一行
 而先付 1s 的 langchain + anthropic SDK import。
 """
 
@@ -114,6 +114,11 @@ def main() -> None:
         from llgraph.cli.web_cli import main as web_main
 
         web_main(sys.argv[2:])
+        return
+    if len(sys.argv) >= 2 and sys.argv[1] == "acp":
+        from llgraph.cli.acp_cli import main as acp_main
+
+        acp_main(sys.argv[2:])
         return
     if len(sys.argv) >= 2 and sys.argv[1] == "index":
         from llgraph.cli.index_cli import main as index_main
