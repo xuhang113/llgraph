@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from llgraph.permissions.approval import ApprovalAsk
+
 def request_turn_cancel(thread_id: str) -> bool:
     """
     请求停止进行中的一轮。
@@ -29,6 +31,8 @@ class AcpTurnRequest:
     thread_id: str
     message: str
     allow_write: bool = False
+    permission_ask: ApprovalAsk | None = None
+    """写 / 执行前的授权闸门；None 表示不问（写工具直接落地）。"""
 
 
 @dataclass
@@ -56,6 +60,7 @@ def run_acp_turn(
     @param cancel_check 返回 True 时中断本轮
     @return 结果（stop_reason 为 end_turn 或 cancelled）
     """
+    from llgraph.permissions.approval import use_approval_gate
     from llgraph.config.edit_settings import resolve_edit_settings
     from llgraph.console.runtime.agent_service import (
         force_release_agent_chat,
@@ -131,20 +136,23 @@ def run_acp_turn(
             session_id=req.thread_id,
             disabled=False,
         )
-        text = invoke_agent(
-            agent_ctx.agent,
-            req.message,
-            workspace_root=req.workspace,
-            thread_id=req.thread_id,
-            with_memory=True,
-            trace_session=trace,
-            context_session=rt.context_session,
-            write_failure_tracker=write_failure_tracker,
-            context_spill=context_spill,
-            allow_write=req.allow_write,
-            cancel_check=cancel_check,
-            run_source="acp",
-        )
+        # 闸门登记在 invoke 外面：工具可能在 LangGraph 线程池里跑，
+        # ContextVar 由 langchain 在提交任务时随 context 一起复制过去
+        with use_approval_gate(req.permission_ask):
+            text = invoke_agent(
+                agent_ctx.agent,
+                req.message,
+                workspace_root=req.workspace,
+                thread_id=req.thread_id,
+                with_memory=True,
+                trace_session=trace,
+                context_session=rt.context_session,
+                write_failure_tracker=write_failure_tracker,
+                context_spill=context_spill,
+                allow_write=req.allow_write,
+                cancel_check=cancel_check,
+                run_source="acp",
+            )
         cancelled = cancel_check() or is_agent_cancel_requested(req.thread_id)
     finally:
         # 注册表与 session 锁一起释放：漏一个，这个 thread 之后就再也开不了新一轮

@@ -24,6 +24,11 @@ from llgraph.core.shell_output import clip_shell_output, combine_stdio
 from llgraph.core.shell_schemas import AwaitShellInput, RunShellCommandInput
 from llgraph.core.tool_arg_coerce import format_tool_validation_error
 from llgraph.core.workspace import WorkspaceContext
+from llgraph.permissions.approval import (
+    APPROVAL_KIND_EXECUTE,
+    ApprovalRequest,
+    check_approval,
+)
 from llgraph.permissions.shell import check_shell_command
 from llgraph.sandbox.exec import LiveShellProcess, spawn_sandboxed_shell
 from llgraph.sandbox.policy import SandboxPolicy
@@ -308,6 +313,19 @@ def create_shell_tools(
                 )
                 + f"(已切换工作目录 → {start_rel}；后续省略 working_directory 的 shell 将落在此处)"
             )
+
+        if allow_write:
+            # 只读模式下能过闸门的命令本身就不改工作区，再弹一次框只是噪音
+            unapproved = check_approval(
+                ApprovalRequest(
+                    tool="run_shell_command",
+                    kind=APPROVAL_KIND_EXECUTE,
+                    command=rest,
+                    cwd=start_rel,
+                )
+            )
+            if unapproved:
+                return unapproved
 
         fp = command_fingerprint(rest, start_rel)
         existing = registry.find_running(thread_id, fp)

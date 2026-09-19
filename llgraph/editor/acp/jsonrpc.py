@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 import threading
+import time
 from typing import Any, Callable, TextIO
 
 PARSE_ERROR = -32700
@@ -40,18 +41,44 @@ def invalid_params(message: str) -> JsonRpcError:
     return JsonRpcError(INVALID_PARAMS, message)
 
 
+class RequestFailed(Exception):
+    """我们发出的请求没拿到结果（对端回了 error、超时、或连接已断）。"""
+
+
+class RequestCancelled(Exception):
+    """等对端回复期间本轮被取消。"""
+
+
+class _Pending:
+    """一条等着对端回复的出向请求。"""
+
+    __slots__ = ("done", "result", "error")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.result: Any = None
+        self.error: str | None = None
+
+
 class JsonRpcConnection:
     """
     一条 ndjson JSON-RPC 连接。
 
     写入端加锁：``session/prompt`` 在工作线程里跑，边跑边推 ``session/update``，
     与读循环的回包并发。
+
+    也能反向发请求（``session/request_permission``）：请求由工作线程发出并阻塞等待，
+    回包由读循环收下后唤醒它——所以等待期间读循环必须仍在跑，不能在这里读流。
     """
 
     def __init__(self, reader: TextIO, writer: TextIO) -> None:
         self._reader = reader
         self._writer = writer
         self._write_lock = threading.Lock()
+        self._pending: dict[str, _Pending] = {}
+        self._pending_lock = threading.Lock()
+        self._next_request_id = 0
+        self._closed = False
 
     def _send(self, payload: dict[str, Any]) -> None:
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -89,6 +116,84 @@ class JsonRpcConnection:
         """
         self._send({"jsonrpc": "2.0", "id": request_id, "error": error.to_payload()})
 
+    def request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+        cancel_check: Callable[[], bool] | None = None,
+        poll_interval: float = 0.05,
+    ) -> Any:
+        """
+        向对端（编辑器）发一条请求并等回复。
+
+        @param method 方法名
+        @param params 参数
+        @param timeout 等待上限秒；None 表示一直等（人可能去泡咖啡了）
+        @param cancel_check 返回 True 时放弃等待
+        @param poll_interval 轮询 cancel_check 的间隔秒
+        @return 对端的 result
+        @raise RequestFailed 对端回 error / 超时 / 连接已断
+        @raise RequestCancelled 等待期间被取消
+        """
+        with self._pending_lock:
+            if self._closed:
+                raise RequestFailed("连接已关闭")
+            self._next_request_id += 1
+            request_id = f"agent-{self._next_request_id}"
+            pending = _Pending()
+            self._pending[request_id] = pending
+        try:
+            self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params if params is not None else {},
+                }
+            )
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while not pending.done.wait(poll_interval):
+                if cancel_check is not None and cancel_check():
+                    raise RequestCancelled(f"{method} 等待期间被取消")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise RequestFailed(f"{method} 等待对端回复超时")
+            if pending.error is not None:
+                raise RequestFailed(pending.error)
+            return pending.result
+        finally:
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+
+    def _resolve_pending(self, message: dict[str, Any]) -> None:
+        """对端回包 → 唤醒对应的 ``request``。"""
+        raw_id = message.get("id")
+        if raw_id is None:
+            return
+        with self._pending_lock:
+            pending = self._pending.get(str(raw_id))
+        if pending is None:
+            return
+        error = message.get("error")
+        if isinstance(error, dict):
+            pending.error = str(error.get("message") or "对端返回错误") or "对端返回错误"
+        elif error is not None:
+            pending.error = str(error)
+        else:
+            pending.result = message.get("result")
+        pending.done.set()
+
+    def _fail_all_pending(self, reason: str) -> None:
+        """连接断开时把等待中的请求一起放掉，否则工作线程会永远挂着。"""
+        with self._pending_lock:
+            self._closed = True
+            pendings = list(self._pending.values())
+        for pending in pendings:
+            if not pending.done.is_set():
+                pending.error = reason
+                pending.done.set()
+
     def serve(
         self,
         dispatch: Callable[[str, dict[str, Any], Any], Any],
@@ -98,6 +203,15 @@ class JsonRpcConnection:
 
         @param dispatch ``(method, params, request_id) -> result | DEFERRED``
         """
+        try:
+            self._serve_loop(dispatch)
+        finally:
+            self._fail_all_pending("连接已关闭")
+
+    def _serve_loop(
+        self,
+        dispatch: Callable[[str, dict[str, Any], Any], Any],
+    ) -> None:
         for raw in self._reader:
             line = raw.strip()
             if not line:
@@ -112,7 +226,7 @@ class JsonRpcConnection:
                 continue
             method = message.get("method")
             if not isinstance(method, str) or not method:
-                # 回包（对端响应我们发出的请求）：本轮不主动发请求，忽略即可
+                self._resolve_pending(message)
                 continue
             request_id = message.get("id")
             params = message.get("params")

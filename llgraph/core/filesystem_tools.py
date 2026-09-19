@@ -61,6 +61,11 @@ from llgraph.core.read_focus import (
     should_focus_read,
 )
 from llgraph.core.text_file_types import is_probably_text_path, read_path_rejection_reason
+from llgraph.permissions.approval import (
+    APPROVAL_KIND_EDIT,
+    ApprovalRequest,
+    check_approval,
+)
 from llgraph.session.session_edits import SessionEditTracker
 from llgraph.core.write_failure_tracker import WriteFailureTracker
 from llgraph.core.workspace import (
@@ -547,6 +552,35 @@ def create_filesystem_tools(
         if write_failure_tracker is not None:
             write_failure_tracker.note_failure(tool_name, msg)
         return msg
+
+    def _write_unapproved(
+        tool_name: str,
+        rel: str,
+        *,
+        old_text: str = "",
+        new_text: str = "",
+    ) -> str | None:
+        """
+        落盘前问一次授权闸门（ACP 下即编辑器里的弹窗；CLI / Web 无闸门直接放行）。
+
+        被拒不计入 write_failure_tracker：那是「写法不对」的计数器，
+        用户按了拒绝不该让模型下一轮收到分块重试的提示。
+
+        @param tool_name 工具名
+        @param rel 工作区相对路径
+        @param old_text 改前全文（供编辑器渲染 diff）
+        @param new_text 改后全文
+        @return 被拒时返回给模型的说明；放行为 None
+        """
+        return check_approval(
+            ApprovalRequest(
+                tool=tool_name,
+                kind=APPROVAL_KIND_EDIT,
+                path=rel,
+                old_text=old_text,
+                new_text=new_text,
+            )
+        )
 
     def _after_write(rel: str, op: str, *, replacements: int = 1, old_part: str = "", new_part: str = "") -> str:
         """写成功后记账并通知 watch。"""
@@ -1219,6 +1253,11 @@ def create_filesystem_tools(
                 old_text = target.read_text(encoding="utf-8")
             except OSError:
                 old_text = ""
+        unapproved = _write_unapproved(
+            "write_file", rel, old_text=old_text, new_text=content
+        )
+        if unapproved:
+            return unapproved
         if edit_tracker is not None and target.is_file():
             edit_tracker.ensure_snapshot(rel)
         write_workspace_text(target, content)
@@ -1270,12 +1309,17 @@ def create_filesystem_tools(
                     return str(exc)
         old_text = ""
         if target.is_file():
-            if edit_tracker is not None:
-                edit_tracker.ensure_snapshot(rel)
             old_text = target.read_text(encoding="utf-8")
             new_text = old_text + content
         else:
             new_text = content
+        unapproved = _write_unapproved(
+            "append_file", rel, old_text=old_text, new_text=new_text
+        )
+        if unapproved:
+            return unapproved
+        if target.is_file() and edit_tracker is not None:
+            edit_tracker.ensure_snapshot(rel)
         write_workspace_text(target, new_text)
         _after_write(rel, "append", old_part="", new_part=content)
         if write_failure_tracker is not None:
@@ -1357,6 +1401,11 @@ def create_filesystem_tools(
         )
         if not applied.ok:
             return _prepend_note(remap_note, format_apply_failure(rel, applied))
+        unapproved = _write_unapproved(
+            "search_replace", rel, old_text=text, new_text=applied.new_text
+        )
+        if unapproved:
+            return unapproved
         if edit_tracker is not None:
             edit_tracker.ensure_snapshot(rel)
         write_workspace_text(target, applied.new_text)

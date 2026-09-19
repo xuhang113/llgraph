@@ -18,6 +18,7 @@ import pytest
 from llgraph.config.config import ENV_API_BASE_URL, ENV_API_KEY, ENV_MODEL
 from llgraph.core.llm_settings import set_runtime_model
 from llgraph.editor.acp.turn import AcpTurnRequest, run_acp_turn
+from llgraph.permissions.approval import ApprovalDecision, ApprovalRequest
 
 _FAKE_KEY = "test-key-not-a-secret"
 _FILE_BODY = "hello from llgraph\n"
@@ -28,9 +29,9 @@ def _sse(event: str, data: dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
 
-def _tool_use_stream() -> bytes:
-    """第一轮：模型要求读文件。"""
-    args = json.dumps({"path": "hello.txt"})
+def _tool_use_stream(tool_name: str = "read_file", tool_input: Any = None) -> bytes:
+    """第一轮：模型要求调一个工具。"""
+    args = json.dumps(tool_input if tool_input is not None else {"path": "hello.txt"})
     return b"".join(
         [
             _sse(
@@ -56,7 +57,7 @@ def _tool_use_stream() -> bytes:
                     "content_block": {
                         "type": "tool_use",
                         "id": "toolu_1",
-                        "name": "read_file",
+                        "name": tool_name,
                         "input": {},
                     },
                 },
@@ -153,6 +154,30 @@ class _StubState:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
         self.lock = threading.Lock()
+        # 第一轮让模型要求调哪个工具（写入那条用例换成 search_replace）
+        self.tool_name = "read_file"
+        self.tool_input: dict[str, Any] = {"path": "hello.txt"}
+
+    def tool_results(self) -> list[str]:
+        """@return 回灌给模型的工具结果文本（验收「模型看到了拒绝」用）"""
+        out: list[str] = []
+        for body in self.requests:
+            for message in body.get("messages", []):
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        raw = block.get("content")
+                        if isinstance(raw, str):
+                            out.append(raw)
+                        elif isinstance(raw, list):
+                            out.extend(
+                                str(part.get("text") or "")
+                                for part in raw
+                                if isinstance(part, dict)
+                            )
+        return out
 
 
 def _make_handler(state: _StubState):
@@ -182,7 +207,11 @@ def _make_handler(state: _StubState):
 
             wants_reply = _has_tool_result(body)
             if body.get("stream"):
-                payload = _text_stream() if wants_reply else _tool_use_stream()
+                payload = (
+                    _text_stream()
+                    if wants_reply
+                    else _tool_use_stream(state.tool_name, state.tool_input)
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Content-Length", str(len(payload)))
@@ -197,8 +226,8 @@ def _make_handler(state: _StubState):
                     {
                         "type": "tool_use",
                         "id": "toolu_1",
-                        "name": "read_file",
-                        "input": {"path": "hello.txt"},
+                        "name": state.tool_name,
+                        "input": state.tool_input,
                     }
                 ]
             )
@@ -324,3 +353,84 @@ def test_acp_turn_is_read_only_by_default(
     assert "read_file" in tool_names
     assert "write_file" not in tool_names
     assert "search_replace" not in tool_names
+
+
+def _edit_turn(
+    workspace: Path,
+    thread_id: str,
+    decision: ApprovalDecision,
+) -> tuple[list[ApprovalRequest], Any]:
+    """跑一轮「模型要改代码」，闸门按给定决定应答。"""
+    asked: list[ApprovalRequest] = []
+
+    def ask(req: ApprovalRequest) -> ApprovalDecision:
+        asked.append(req)
+        return decision
+
+    result = run_acp_turn(
+        AcpTurnRequest(
+            workspace=workspace,
+            thread_id=thread_id,
+            message="把 return 1 改成 return 2",
+            allow_write=True,
+            permission_ask=ask,
+        ),
+        send_update=lambda _u: None,
+        cancel_check=lambda: False,
+    )
+    return asked, result
+
+
+@pytest.fixture
+def edit_workspace(tmp_path: Path, stub_gateway: _StubState) -> Path:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    stub_gateway.tool_name = "search_replace"
+    stub_gateway.tool_input = {
+        "path": "app.py",
+        "old_string": "return 1",
+        "new_string": "return 2",
+    }
+    return workspace
+
+
+def test_acp_turn_writes_after_permission_granted(
+    edit_workspace: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """允许之后这一刀真落地——「编辑器里能改代码」就是这一条。"""
+    asked, result = _edit_turn(
+        edit_workspace, "cli-acpw1", ApprovalDecision(allowed=True)
+    )
+
+    assert result.stop_reason == "end_turn"
+    assert len(asked) == 1
+    assert asked[0].tool == "search_replace"
+    assert asked[0].path == "app.py"
+    assert "return 1" in (asked[0].old_text or "")
+    assert "return 2" in (asked[0].new_text or "")
+    assert (edit_workspace / "app.py").read_text(encoding="utf-8") == (
+        "def run():\n    return 2\n"
+    )
+
+
+def test_acp_turn_rejection_keeps_file_and_tells_the_model(
+    edit_workspace: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    asked, result = _edit_turn(
+        edit_workspace,
+        "cli-acpw2",
+        ApprovalDecision(allowed=False, reason="用户在编辑器里选择了拒绝"),
+    )
+
+    assert len(asked) == 1
+    assert result.stop_reason == "end_turn"
+    assert (edit_workspace / "app.py").read_text(encoding="utf-8") == (
+        "def run():\n    return 1\n"
+    )
+    # 模型必须知道这次没改成：否则下一轮会以为改过了
+    assert any("拒绝" in text for text in stub_gateway.tool_results())

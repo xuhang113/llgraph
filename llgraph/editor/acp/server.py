@@ -32,6 +32,8 @@ class AcpSession:
     allow_write: bool = False
     busy: bool = False
     cancelled: threading.Event = field(default_factory=threading.Event)
+    permission: Any = None
+    """授权闸门（``AcpPermissionGate``）；None 表示写入不逐次确认。"""
 
 
 class AcpServer:
@@ -48,11 +50,13 @@ class AcpServer:
         connection: JsonRpcConnection,
         *,
         allow_write: bool = False,
+        ask_permission: bool = False,
         default_workspace: Path | None = None,
         turn_runner: TurnRunner | None = None,
     ) -> None:
         self._conn = connection
         self._allow_write = allow_write
+        self._ask_permission = ask_permission and allow_write
         self._default_workspace = default_workspace
         self._turn_runner = turn_runner
         self._sessions: dict[str, AcpSession] = {}
@@ -124,12 +128,23 @@ class AcpServer:
         from llgraph.console.runtime.agent_service import create_agent_session
 
         session_id = create_agent_session(workspace)
-        with self._sessions_lock:
-            self._sessions[session_id] = AcpSession(
-                session_id=session_id,
+        session = AcpSession(
+            session_id=session_id,
+            workspace=workspace,
+            allow_write=self._allow_write,
+        )
+        if self._ask_permission:
+            from llgraph.editor.acp.permission import AcpPermissionGate
+
+            # 闸门按会话建：「本会话都允许」要能跨轮记住
+            session.permission = AcpPermissionGate(
+                self._conn,
+                session_id,
                 workspace=workspace,
-                allow_write=self._allow_write,
+                cancel_check=session.cancelled.is_set,
             )
+        with self._sessions_lock:
+            self._sessions[session_id] = session
         return {"sessionId": session_id}
 
     def _require_session(self, params: dict[str, Any]) -> AcpSession:
@@ -198,6 +213,11 @@ class AcpServer:
                     thread_id=session.session_id,
                     message=text,
                     allow_write=session.allow_write,
+                    permission_ask=(
+                        session.permission.ask
+                        if session.permission is not None
+                        else None
+                    ),
                 ),
                 send_update=lambda update: self._send_update(session, update),
                 cancel_check=session.cancelled.is_set,
@@ -215,6 +235,7 @@ class AcpServer:
 def serve_stdio(
     *,
     allow_write: bool = False,
+    ask_permission: bool = False,
     default_workspace: Path | None = None,
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
@@ -226,6 +247,7 @@ def serve_stdio(
     否则 Agent 链路里任何一行 print 都会插进 ndjson 流，把编辑器的解析打断。
 
     @param allow_write 是否允许写工作区文件
+    @param ask_permission 每次写 / 执行前走 ``session/request_permission``
     @param default_workspace ``session/new`` 未给 cwd 时的兜底工作区
     @param stdin 读端（默认 sys.stdin）
     @param stdout 写端（默认真实 sys.stdout）
@@ -238,6 +260,7 @@ def serve_stdio(
         server = AcpServer(
             JsonRpcConnection(reader, writer),
             allow_write=allow_write,
+            ask_permission=ask_permission,
             default_workspace=default_workspace,
         )
         server.serve()

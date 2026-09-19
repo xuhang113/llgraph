@@ -29,7 +29,12 @@ def main(argv: list[str] | None = None) -> None:
         "-w",
         "--write",
         action="store_true",
-        help="允许写入工作区文件（默认只读）",
+        help="写入与 shell 不再逐次确认（默认每次都在编辑器里弹授权框）",
+    )
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        help="完全只读：不注册写工具，也不会弹授权框",
     )
     args = parser.parse_args(argv)
 
@@ -59,8 +64,20 @@ def main(argv: list[str] | None = None) -> None:
 
     from llgraph.editor.acp.server import serve_stdio
 
-    print("[llgraph] ACP 服务已就绪（stdio）", file=sys.stderr, flush=True)
+    allow_write = not args.read_only
+    ask_permission = allow_write and not args.write
+    if not allow_write:
+        mode = "只读"
+    elif ask_permission:
+        mode = "可写，每次写入/执行需在编辑器里确认"
+    else:
+        mode = "可写，不逐次确认"
+    print(f"[llgraph] ACP 服务已就绪（stdio；{mode}）", file=sys.stderr, flush=True)
     try:
-        serve_stdio(allow_write=args.write, default_workspace=workspace)
+        serve_stdio(
+            allow_write=allow_write,
+            ask_permission=ask_permission,
+            default_workspace=workspace,
+        )
     except KeyboardInterrupt:
         pass
