@@ -196,7 +196,9 @@ Zed 的 `settings.json`：
 ```
 
 - 工作区取编辑器在 `session/new` 里给的 `cwd`；没给时用 `llgraph acp -C <目录>`
-- 默认**只读**，要让它改文件加 `"args": ["acp", "--write"]`
+- 默认**可写，但每次写入 / 执行命令都会在编辑器里弹授权框**（ACP `session/request_permission`）：
+  弹窗带改动 diff，可选「允许这一次 / 本会话都允许 / 拒绝 / 本会话都拒绝」；拒绝只是这一刀不落地，对话继续
+- 不想逐次点：`"args": ["acp", "--write"]`；完全不让它碰文件：`"args": ["acp", "--read-only"]`
 - 模型入口与 CLI 完全一致（网关或 Anthropic / OpenAI / Gemini / Ollama），凭据没配会在编辑器的 Agent 日志（stderr）里直接报出来
 - 会话与 CLI / Web Console 同一套落盘：编辑器里聊到一半可以 `llgraph --thread-id <sessionId>` 接着聊（同一时刻只能一边操作）
 
