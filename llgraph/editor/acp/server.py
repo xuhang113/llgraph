@@ -21,6 +21,7 @@ from llgraph.editor.acp.turn import AcpTurnRequest, AcpTurnResult
 from llgraph.editor.acp.updates import ACP_PROTOCOL_VERSION, prompt_text
 
 TurnRunner = Callable[..., AcpTurnResult]
+HistoryLoader = Callable[[Path, str], list[dict[str, Any]]]
 
 
 @dataclass
@@ -53,12 +54,14 @@ class AcpServer:
         ask_permission: bool = False,
         default_workspace: Path | None = None,
         turn_runner: TurnRunner | None = None,
+        history_loader: HistoryLoader | None = None,
     ) -> None:
         self._conn = connection
         self._allow_write = allow_write
         self._ask_permission = ask_permission and allow_write
         self._default_workspace = default_workspace
         self._turn_runner = turn_runner
+        self._history_loader = history_loader
         self._sessions: dict[str, AcpSession] = {}
         self._sessions_lock = threading.Lock()
         self.initialized = False
@@ -80,6 +83,8 @@ class AcpServer:
             return {}
         if method == "session/new":
             return self._session_new(params)
+        if method == "session/load":
+            return self._session_load(params, request_id)
         if method == "session/prompt":
             return self._session_prompt(params, request_id)
         if method == "session/cancel":
@@ -101,7 +106,7 @@ class AcpServer:
             # 协商取双方较小值：客户端更新时不至于被我们顶到不认识的版本
             "protocolVersion": min(version, ACP_PROTOCOL_VERSION),
             "agentCapabilities": {
-                "loadSession": False,
+                "loadSession": True,
                 "promptCapabilities": {
                     "image": False,
                     "audio": False,
@@ -111,23 +116,29 @@ class AcpServer:
             "authMethods": [],
         }
 
-    def _session_new(self, params: dict[str, Any]) -> dict[str, Any]:
-        cwd = params.get("cwd")
+    def _resolve_workspace(self, cwd: Any, *, method: str) -> Path:
+        """
+        取本次会话的工作区。
+
+        @param cwd 请求里的 cwd
+        @param method 方法名（用于报错文案）
+        @return 工作区绝对路径
+        """
         if cwd is None and self._default_workspace is not None:
             workspace = self._default_workspace
         else:
             if not isinstance(cwd, str) or not cwd.strip():
-                raise invalid_params("session/new 需要 cwd")
+                raise invalid_params(f"{method} 需要 cwd")
             candidate = Path(cwd).expanduser()
             if not candidate.is_absolute():
                 raise invalid_params("cwd 必须是绝对路径")
             workspace = candidate.resolve()
         if not workspace.is_dir():
             raise invalid_params(f"工作区不是有效目录: {workspace}")
+        return workspace
 
-        from llgraph.console.runtime.agent_service import create_agent_session
-
-        session_id = create_agent_session(workspace)
+    def _make_session(self, session_id: str, workspace: Path) -> AcpSession:
+        """@param session_id 会话 ID @param workspace 工作区 @return 登记好授权闸门的会话"""
         session = AcpSession(
             session_id=session_id,
             workspace=workspace,
@@ -143,9 +154,61 @@ class AcpServer:
                 workspace=workspace,
                 cancel_check=session.cancelled.is_set,
             )
+        return session
+
+    def _session_new(self, params: dict[str, Any]) -> dict[str, Any]:
+        workspace = self._resolve_workspace(params.get("cwd"), method="session/new")
+
+        from llgraph.console.runtime.agent_service import create_agent_session
+
+        session_id = create_agent_session(workspace)
+        session = self._make_session(session_id, workspace)
         with self._sessions_lock:
             self._sessions[session_id] = session
         return {"sessionId": session_id}
+
+    def _session_load(self, params: dict[str, Any], request_id: Any) -> Any:
+        """
+        接回一个已有会话：登记它，再把历史回放成 ``session/update``。
+
+        Agent 那边的内存状态不用在这里恢复——会话保活池在下一轮 prompt 时
+        自己从 ``messages.jsonl`` 读回去；这里只负责把编辑器的聊天区填满。
+
+        @param params sessionId / cwd
+        @param request_id 请求 id
+        @return DEFERRED（回放交给工作线程）
+        """
+        if request_id is None:
+            raise JsonRpcError(INVALID_REQUEST, "session/load 必须是请求，不能是通知")
+        raw_id = params.get("sessionId")
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            raise invalid_params("缺少 sessionId")
+        session_id = raw_id.strip()
+        workspace = self._resolve_workspace(params.get("cwd"), method="session/load")
+
+        from llgraph.editor.acp.replay import session_is_resumable
+
+        if not session_is_resumable(workspace, session_id):
+            raise invalid_params(f"该工作区下没有会话 {session_id}: {workspace}")
+
+        with self._sessions_lock:
+            session = self._sessions.get(session_id)
+            if session is not None and session.busy:
+                raise JsonRpcError(INVALID_REQUEST, "该会话已有对话在进行，请先 session/cancel")
+            if session is None or session.workspace != workspace:
+                session = self._make_session(session_id, workspace)
+                self._sessions[session_id] = session
+            # 回放期间占住会话：编辑器紧接着发 prompt 会被挡回去，不至于两边同时写历史
+            session.busy = True
+        session.cancelled.clear()
+        worker = threading.Thread(
+            target=self._run_load,
+            args=(session, request_id),
+            daemon=True,
+            name=f"acp-load-{session_id[:12]}",
+        )
+        worker.start()
+        return DEFERRED
 
     def _require_session(self, params: dict[str, Any]) -> AcpSession:
         session_id = params.get("sessionId")
@@ -199,6 +262,24 @@ class AcpServer:
             "session/update",
             {"sessionId": session.session_id, "update": update},
         )
+
+    def _run_load(self, session: AcpSession, request_id: Any) -> None:
+        loader = self._history_loader
+        if loader is None:
+            from llgraph.editor.acp.replay import load_session_updates
+
+            loader = load_session_updates
+        try:
+            updates = loader(session.workspace, session.session_id)
+            for update in updates:
+                self._send_update(session, update)
+        except Exception as exc:
+            self._conn.respond_error(request_id, JsonRpcError(INTERNAL_ERROR, str(exc)))
+            return
+        finally:
+            session.busy = False
+        # 空对象而不是 null：ACP 后续版本在这里放可选字段，对端按对象解析更稳
+        self._conn.respond(request_id, {})
 
     def _run_turn(self, session: AcpSession, text: str, request_id: Any) -> None:
         runner = self._turn_runner
