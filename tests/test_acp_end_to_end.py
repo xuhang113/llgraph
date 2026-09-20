@@ -276,6 +276,15 @@ def clean_runtime() -> None:
 
     yield
     RUNTIME_MANAGER.shutdown_all()
+    # 会话保活池是进程级的：留着不清，别的用例一调 get_or_build 就会触发淘汰，
+    # 把 release_checkpointer 的调用记到人家的 mock 上
+    from llgraph.core.agent_session_pool import (
+        agent_session_pool_stats,
+        invalidate_agent_session_thread,
+    )
+
+    for entry in agent_session_pool_stats()["threads"]:
+        invalidate_agent_session_thread(Path(entry["workspace"]), entry["thread_id"])
 
 
 def test_acp_turn_streams_tool_call_and_reply(
@@ -353,6 +362,51 @@ def test_acp_turn_is_read_only_by_default(
     assert "read_file" in tool_names
     assert "write_file" not in tool_names
     assert "search_replace" not in tool_names
+
+
+def test_loaded_session_sends_old_history_to_the_model(
+    tmp_path: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """续聊的实质：编辑器重启后接回来的那一轮，模型必须还看得见之前说过的话。"""
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from llgraph.editor.acp.replay import load_session_updates
+    from llgraph.session.session_file_store import save_session_messages
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "hello.txt").write_text(_FILE_BODY, encoding="utf-8")
+    thread_id = "cli-acpload1"
+    save_session_messages(
+        workspace,
+        thread_id,
+        [
+            HumanMessage(content="记住暗号是 菠萝蜜"),
+            AIMessage(content="好的，记住了。"),
+        ],
+    )
+
+    # 编辑器侧先拿回历史
+    updates = load_session_updates(workspace, thread_id)
+    assert any(
+        u["sessionUpdate"] == "user_message_chunk" and "菠萝蜜" in u["content"]["text"]
+        for u in updates
+    ), updates
+
+    run_acp_turn(
+        AcpTurnRequest(
+            workspace=workspace,
+            thread_id=thread_id,
+            message="暗号是什么？",
+        ),
+        send_update=lambda _u: None,
+        cancel_check=lambda: False,
+    )
+
+    sent = json.dumps(stub_gateway.requests, ensure_ascii=False)
+    assert "菠萝蜜" in sent
 
 
 def _edit_turn(

@@ -201,6 +201,7 @@ Zed 的 `settings.json`：
 - 不想逐次点：`"args": ["acp", "--write"]`；完全不让它碰文件：`"args": ["acp", "--read-only"]`
 - 模型入口与 CLI 完全一致（网关或 Anthropic / OpenAI / Gemini / Ollama），凭据没配会在编辑器的 Agent 日志（stderr）里直接报出来
 - 会话与 CLI / Web Console 同一套落盘：编辑器里聊到一半可以 `llgraph --thread-id <sessionId>` 接着聊（同一时刻只能一边操作）
+- 编辑器重启后拿旧 sessionId 接得回来（ACP `session/load`）：历史会重新推回聊天区，模型侧也接着上次的上下文；太长的历史只回放最近一段，模型仍然记得全部
 
 ---
 
