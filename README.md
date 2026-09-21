@@ -202,6 +202,8 @@ Zed 的 `settings.json`：
 - 模型入口与 CLI 完全一致（网关或 Anthropic / OpenAI / Gemini / Ollama），凭据没配会在编辑器的 Agent 日志（stderr）里直接报出来
 - 会话与 CLI / Web Console 同一套落盘：编辑器里聊到一半可以 `llgraph --thread-id <sessionId>` 接着聊（同一时刻只能一边操作）
 - 编辑器重启后拿旧 sessionId 接得回来（ACP `session/load`）：历史会重新推回聊天区，模型侧也接着上次的上下文；太长的历史只回放最近一段，模型仍然记得全部
+- 编辑器声明了 `fs` 能力（Zed 会）时，读文件以**编辑器里那份**为准（ACP `fs/read_text_file`）：你改了还没保存，它读到的也是你眼前这版，返回里会注明「取自未保存的缓冲区」。
+  改**有未保存改动**的文件会交回编辑器写（`fs/write_text_file`），免得你随手一次保存把它的修改盖掉；其它文件照旧由 llgraph 原子落盘。编辑器答不上来时自动回落磁盘，不会让这一轮失败
 
 ---
 
