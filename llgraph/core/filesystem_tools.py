@@ -18,6 +18,7 @@ from llgraph.core.filesystem_tool_schemas import (
     WriteFileInput,
 )
 from llgraph.core.atomic_write import write_workspace_text
+from llgraph.core.editor_fs import editor_buffer_text, editor_write_text
 from llgraph.core.edit_apply import (
     EditHunk,
     apply_edit_hunks,
@@ -298,6 +299,61 @@ def _prepend_note(note: str, body: str) -> str:
     return prefix + body
 
 
+def _join_notes(*notes: str) -> str:
+    """@param notes 若干提示（空的跳过） @return 合成一段"""
+    return "\n".join(item.strip() for item in notes if (item or "").strip())
+
+
+EDITOR_BUFFER_READ_NOTE = (
+    "注意: 以下内容取自编辑器中**未保存**的缓冲区，与磁盘上的版本不一致。"
+)
+
+EDITOR_BUFFER_WRITE_NOTE = (
+    "注意: 该文件在编辑器里有未保存改动；本次修改基于缓冲区内容，并已交回编辑器写入。"
+)
+
+EDITOR_BUFFER_FALLBACK_NOTE = (
+    "注意: 该文件在编辑器里有未保存改动；编辑器没能接下这次写入，已直接落盘。"
+    "若编辑器里仍显示旧内容，请让用户勿用缓冲区覆盖保存。"
+)
+
+
+def _editor_text(target: Path, disk_text: str) -> tuple[str, bool]:
+    """
+    编辑器里有未保存改动时以缓冲区为准。
+
+    与磁盘一致（以及没有编辑器这条来源）时按「没有缓冲区」算，
+    免得每次读都挂一句提示，也免得把普通写入绕道编辑器。
+
+    @param target 绝对路径
+    @param disk_text 磁盘上的正文
+    @return (采用的正文, 是否取自编辑器缓冲区)
+    """
+    buffered = editor_buffer_text(target)
+    if buffered is None or buffered == disk_text:
+        return disk_text, False
+    return buffered, True
+
+
+def _persist_text(target: Path, text: str, *, via_editor: bool) -> str:
+    """
+    落盘（或交给编辑器写）。
+
+    @param target 绝对路径
+    @param text 全量正文
+    @param via_editor 编辑器里那份是未保存缓冲区，优先交给编辑器
+    @return 要附给模型的提示；普通落盘时为空
+    @raises OSError 磁盘写入失败
+    """
+    if via_editor:
+        if editor_write_text(target, text):
+            return EDITOR_BUFFER_WRITE_NOTE
+        write_workspace_text(target, text)
+        return EDITOR_BUFFER_FALLBACK_NOTE
+    write_workspace_text(target, text)
+    return ""
+
+
 def _glob_literal_workspace_hits(
     ctx: WorkspaceContext,
     glob_pattern: str,
@@ -402,6 +458,16 @@ def _read_file_content(
         text = target.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return None, f"读取失败: {exc}"
+
+    text, from_editor = _editor_text(target, text)
+    if from_editor:
+        # 上面的 size 检查是磁盘 stat，拦不住缓冲区：未保存那份可能大得多
+        if len(text.encode("utf-8", errors="replace")) > max_read_bytes:
+            return None, (
+                f"编辑器中未保存的 {display_path} 过大，上限 {max_read_bytes} 字节。"
+                "请先在编辑器里保存后再读。"
+            )
+        remap_note = _join_notes(remap_note, EDITOR_BUFFER_READ_NOTE)
 
     lines = text.splitlines()
     if len(lines) == 0:
@@ -1248,11 +1314,13 @@ def create_filesystem_tools(
         except PermissionError as exc:
             return str(exc)
         old_text = ""
+        from_editor = False
         if target.is_file():
             try:
                 old_text = target.read_text(encoding="utf-8")
             except OSError:
                 old_text = ""
+            old_text, from_editor = _editor_text(target, old_text)
         unapproved = _write_unapproved(
             "write_file", rel, old_text=old_text, new_text=content
         )
@@ -1260,7 +1328,7 @@ def create_filesystem_tools(
             return unapproved
         if edit_tracker is not None and target.is_file():
             edit_tracker.ensure_snapshot(rel)
-        write_workspace_text(target, content)
+        editor_note = _persist_text(target, content, via_editor=from_editor)
         _after_write(rel, "write", old_part="", new_part=content)
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
@@ -1274,7 +1342,10 @@ def create_filesystem_tools(
         )
         return _with_diagnostics(
             rel,
-            f"已写入 {rel}（{len(content)} 字符）{hint}\n{snapshot}",
+            _prepend_note(
+                editor_note,
+                f"已写入 {rel}（{len(content)} 字符）{hint}\n{snapshot}",
+            ),
             content,
             old_text=old_text,
         )
@@ -1308,8 +1379,10 @@ def create_filesystem_tools(
                 except PermissionError as exc:
                     return str(exc)
         old_text = ""
+        from_editor = False
         if target.is_file():
             old_text = target.read_text(encoding="utf-8")
+            old_text, from_editor = _editor_text(target, old_text)
             new_text = old_text + content
         else:
             new_text = content
@@ -1320,7 +1393,7 @@ def create_filesystem_tools(
             return unapproved
         if target.is_file() and edit_tracker is not None:
             edit_tracker.ensure_snapshot(rel)
-        write_workspace_text(target, new_text)
+        editor_note = _persist_text(target, new_text, via_editor=from_editor)
         _after_write(rel, "append", old_part="", new_part=content)
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
@@ -1333,7 +1406,7 @@ def create_filesystem_tools(
         return _with_diagnostics(
             rel,
             _prepend_note(
-                remap_note,
+                _join_notes(remap_note, editor_note),
                 f"已追加 {rel}（+{len(content)} 字符，共 {len(new_text)} 字符）{hint}\n{snapshot}",
             ),
             new_text,
@@ -1381,6 +1454,7 @@ def create_filesystem_tools(
             text = target.read_text(encoding="utf-8")
         except OSError as exc:
             return f"读取失败: {exc}"
+        text, from_editor = _editor_text(target, text)
         hunks: list[EditHunk] = []
         if old_string:
             hunks.append(
@@ -1408,7 +1482,7 @@ def create_filesystem_tools(
             return unapproved
         if edit_tracker is not None:
             edit_tracker.ensure_snapshot(rel)
-        write_workspace_text(target, applied.new_text)
+        editor_note = _persist_text(target, applied.new_text, via_editor=from_editor)
         old_part = "\n".join(h.old_string for h in hunks)
         new_part = "\n".join(h.new_string for h in hunks)
         _after_write(
@@ -1422,7 +1496,10 @@ def create_filesystem_tools(
             write_failure_tracker.note_success()
         return _with_diagnostics(
             rel,
-            _prepend_note(remap_note, format_apply_success(rel, applied, old_text=text)),
+            _prepend_note(
+                _join_notes(remap_note, editor_note),
+                format_apply_success(rel, applied, old_text=text),
+            ),
             applied.new_text,
             old_text=text,
         )

@@ -470,6 +470,84 @@ def test_acp_turn_writes_after_permission_granted(
     )
 
 
+class _FakeEditorFiles:
+    """假编辑器的未保存缓冲区（真桥的协议细节在 test_acp_fs_bridge.py 里测）。"""
+
+    def __init__(self, buffers: dict[Path, str]) -> None:
+        self.buffers = dict(buffers)
+        self.writes: list[tuple[Path, str]] = []
+
+    def read_text(self, path: Path) -> str | None:
+        return self.buffers.get(Path(path))
+
+    def write_text(self, path: Path, text: str) -> bool:
+        self.writes.append((Path(path), text))
+        self.buffers[Path(path)] = text
+        return True
+
+
+def test_acp_turn_reads_the_unsaved_buffer(
+    tmp_path: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """编辑器里改了还没保存：模型该看到缓冲区那份，不是磁盘那份。"""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    target = workspace / "hello.txt"
+    target.write_text(_FILE_BODY, encoding="utf-8")
+    editor = _FakeEditorFiles({target: "用户刚打的这行还没保存\n"})
+
+    updates: list[dict[str, Any]] = []
+    run_acp_turn(
+        AcpTurnRequest(
+            workspace=workspace,
+            thread_id="cli-acpfs1",
+            message="读一下 hello.txt",
+            editor_files=editor,
+        ),
+        send_update=updates.append,
+        cancel_check=lambda: False,
+    )
+
+    tool_call = next(u for u in updates if u["sessionUpdate"] == "tool_call")
+    shown = tool_call["content"][0]["content"]["text"]
+    assert "还没保存" in shown
+    assert "hello from llgraph" not in shown
+    # 模型拿到的工具结果同样是缓冲区那份
+    sent = json.dumps(stub_gateway.requests, ensure_ascii=False)
+    assert "还没保存" in sent
+
+
+def test_acp_turn_edit_of_a_dirty_file_goes_back_to_the_editor(
+    edit_workspace: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """有未保存改动的文件：这一刀交给编辑器写，别让用户一按保存就盖掉。"""
+    target = edit_workspace / "app.py"
+    buffered = "def run():\n    return 1  # 还没保存\n"
+    editor = _FakeEditorFiles({target: buffered})
+
+    result = run_acp_turn(
+        AcpTurnRequest(
+            workspace=edit_workspace,
+            thread_id="cli-acpfs2",
+            message="把 return 1 改成 return 2",
+            allow_write=True,
+            editor_files=editor,
+        ),
+        send_update=lambda _u: None,
+        cancel_check=lambda: False,
+    )
+
+    assert result.stop_reason == "end_turn"
+    assert len(editor.writes) == 1
+    written = editor.writes[0][1]
+    assert written == "def run():\n    return 2  # 还没保存\n"
+    assert target.read_text(encoding="utf-8") == "def run():\n    return 1\n"
+
+
 def test_acp_turn_rejection_keeps_file_and_tells_the_model(
     edit_workspace: Path,
     stub_gateway: _StubState,

@@ -33,6 +33,8 @@ class AcpTurnRequest:
     allow_write: bool = False
     permission_ask: ApprovalAsk | None = None
     """写 / 执行前的授权闸门；None 表示不问（写工具直接落地）。"""
+    editor_files: Any = None
+    """编辑器文件来源（``EditorFileSource``）；None 表示文件工具只读写磁盘。"""
 
 
 @dataclass
@@ -71,6 +73,7 @@ def run_acp_turn(
     from llgraph.console.runtime.workspace_runtime import RUNTIME_MANAGER
     from llgraph.context.context_spill import ContextSpill
     from llgraph.core.agent import invoke_agent
+    from llgraph.core.editor_fs import use_editor_file_source
     from llgraph.core.session_bootstrap import (
         AgentRuntimeBundle,
         get_or_build_agent_session_for_thread,
@@ -136,9 +139,11 @@ def run_acp_turn(
             session_id=req.thread_id,
             disabled=False,
         )
-        # 闸门登记在 invoke 外面：工具可能在 LangGraph 线程池里跑，
+        # 闸门与编辑器文件来源都登记在 invoke 外面：工具可能在 LangGraph 线程池里跑，
         # ContextVar 由 langchain 在提交任务时随 context 一起复制过去
-        with use_approval_gate(req.permission_ask):
+        with use_approval_gate(req.permission_ask), use_editor_file_source(
+            req.editor_files
+        ):
             text = invoke_agent(
                 agent_ctx.agent,
                 req.message,

@@ -35,6 +35,8 @@ class AcpSession:
     cancelled: threading.Event = field(default_factory=threading.Event)
     permission: Any = None
     """授权闸门（``AcpPermissionGate``）；None 表示写入不逐次确认。"""
+    file_bridge: Any = None
+    """编辑器文件来源（``AcpFileBridge``）；None 表示只读写磁盘。"""
 
 
 class AcpServer:
@@ -65,6 +67,7 @@ class AcpServer:
         self._sessions: dict[str, AcpSession] = {}
         self._sessions_lock = threading.Lock()
         self.initialized = False
+        self._client_fs: tuple[bool, bool] = (False, False)
 
     # ---- 分发 ----
 
@@ -101,6 +104,10 @@ class AcpServer:
         version = params.get("protocolVersion", ACP_PROTOCOL_VERSION)
         if not isinstance(version, int):
             raise invalid_params("protocolVersion 必须是整数")
+        from llgraph.editor.acp.fs_bridge import client_fs_capabilities
+
+        # 客户端的文件能力只在握手里说一次，会话是之后才建的，先记下来
+        self._client_fs = client_fs_capabilities(params.get("clientCapabilities"))
         self.initialized = True
         return {
             # 协商取双方较小值：客户端更新时不至于被我们顶到不认识的版本
@@ -152,6 +159,19 @@ class AcpServer:
                 self._conn,
                 session_id,
                 workspace=workspace,
+                cancel_check=session.cancelled.is_set,
+            )
+        can_read, can_write = self._client_fs
+        if can_read or can_write:
+            from llgraph.editor.acp.fs_bridge import AcpFileBridge
+
+            # 桥也按会话建：请求里要带 sessionId，编辑器据此知道是哪个会话在读写
+            session.file_bridge = AcpFileBridge(
+                self._conn,
+                session_id,
+                workspace=workspace,
+                can_read=can_read,
+                can_write=can_write,
                 cancel_check=session.cancelled.is_set,
             )
         return session
@@ -299,6 +319,7 @@ class AcpServer:
                         if session.permission is not None
                         else None
                     ),
+                    editor_files=session.file_bridge,
                 ),
                 send_update=lambda update: self._send_update(session, update),
                 cancel_check=session.cancelled.is_set,
