@@ -166,37 +166,87 @@ def prompt_text(blocks: Any) -> str:
     return "\n\n".join(p.strip() for p in parts if p.strip()).strip()
 
 
+def tool_call_pending(
+    tool_call_id: str,
+    *,
+    title: str,
+    tool_name: str,
+) -> dict[str, Any]:
+    """
+    模型刚决定要调的工具 → ACP ``tool_call``（pending）。
+
+    @param tool_call_id 本会话内唯一的工具调用 id
+    @param title 步骤标题（与跑完那条一致，编辑器里不会换名字）
+    @param tool_name 工具名（定 kind）
+    @return session/update 载荷
+    """
+    return {
+        "sessionUpdate": "tool_call",
+        "toolCallId": tool_call_id,
+        "title": title or "执行工具",
+        "kind": acp_tool_kind(tool_name),
+        "status": "pending",
+    }
+
+
+def tool_call_status(tool_call_id: str, status: str) -> dict[str, Any]:
+    """
+    只改状态的 ``tool_call_update``（pending → in_progress / failed）。
+
+    @param tool_call_id 已发过 ``tool_call`` 的那个 id
+    @param status ACP ToolCallStatus
+    @return session/update 载荷
+    """
+    return {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_call_id,
+        "status": status,
+    }
+
+
+def is_tool_call_step(step: dict[str, Any]) -> bool:
+    """@param step trace 步骤 dict @return 是否对应编辑器里的一次工具调用"""
+    return str(step.get("kind") or "") in ("tool", "explore")
+
+
 def tool_call_from_step(
     step: dict[str, Any],
     *,
     tool_call_id: str,
     max_content_lines: int = 40,
+    as_update: bool = False,
 ) -> dict[str, Any] | None:
     """
-    trace 工具步骤 → ACP ``tool_call`` 更新。
+    trace 工具步骤 → ACP 工具调用更新（completed）。
 
-    llgraph 的步骤在工具跑完后才登记（带耗时与输出），所以直接以 completed 发出，
-    不存在 pending → in_progress 的中间态。
+    trace 的步骤在工具跑完后才登记（那时才有耗时与输出）。这条调用此前若已经以
+    pending 报过（``tool_call_pending``），收尾必须走 ``tool_call_update``——
+    再发一条 ``tool_call`` 会让编辑器多画一行。
+
+    ``as_update`` 时只报状态与输出，不重发标题 / kind：工具节点的输出里没有调用参数，
+    照它算出来的标题会从 ``执行 read_file(a.txt)`` 退化成 ``执行 read_file``。
 
     @param step trace 步骤 dict
-    @param tool_call_id 本轮内唯一的工具调用 id
+    @param tool_call_id 本会话内唯一的工具调用 id
     @param max_content_lines 回填给编辑器的输出行数上限
+    @param as_update True 时发 ``tool_call_update``（这条调用已经报过 pending）
     @return session/update 载荷；非工具步骤返回 None
     """
-    kind = str(step.get("kind") or "")
-    if kind not in ("tool", "explore"):
+    if not is_tool_call_step(step):
         return None
+    kind = str(step.get("kind") or "")
     title = str(step.get("title") or "").strip() or "执行工具"
     tool_name = tool_name_from_title(title)
     body_lines = step.get("body_lines")
     lines = [str(x) for x in body_lines] if isinstance(body_lines, list) else []
     payload: dict[str, Any] = {
-        "sessionUpdate": "tool_call",
+        "sessionUpdate": "tool_call_update" if as_update else "tool_call",
         "toolCallId": tool_call_id,
-        "title": title,
-        "kind": "think" if kind == "explore" else acp_tool_kind(tool_name),
         "status": "completed",
     }
+    if not as_update:
+        payload["title"] = title
+        payload["kind"] = "think" if kind == "explore" else acp_tool_kind(tool_name)
     if lines:
         shown = lines[:max_content_lines]
         hidden = len(lines) - len(shown)

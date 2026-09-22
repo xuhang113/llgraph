@@ -25,6 +25,16 @@ _FILE_BODY = "hello from llgraph\n"
 _REPLY = "hello.txt 里只有一行问候。"
 
 
+def _completed_tool_call(updates: list[dict[str, Any]]) -> dict[str, Any]:
+    """@param updates 收到的 session/update @return 带输出的那条完成态工具更新"""
+    return next(
+        u
+        for u in updates
+        if u["sessionUpdate"] in ("tool_call", "tool_call_update")
+        and u.get("status") == "completed"
+    )
+
+
 def _sse(event: str, data: dict[str, Any]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
 
@@ -314,9 +324,10 @@ def test_acp_turn_streams_tool_call_and_reply(
     assert "tool_call" in kinds, kinds
     assert "agent_message_chunk" in kinds, kinds
 
-    tool_call = next(u for u in updates if u["sessionUpdate"] == "tool_call")
-    assert tool_call["kind"] == "read"
-    assert "read_file" in tool_call["title"]
+    announced = next(u for u in updates if u["sessionUpdate"] == "tool_call")
+    assert announced["kind"] == "read"
+    assert "read_file" in announced["title"]
+    tool_call = _completed_tool_call(updates)
     assert "hello from llgraph" in tool_call["content"][0]["content"]["text"]
 
     streamed = "".join(
@@ -326,6 +337,51 @@ def test_acp_turn_streams_tool_call_and_reply(
 
     # 正文 chunk 必须排在工具调用之后：编辑器按到达顺序渲染
     assert kinds.index("tool_call") < len(kinds) - 1
+
+
+def test_acp_turn_reports_tool_call_pending_then_in_progress_then_completed(
+    tmp_path: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """长工具跑起来之前编辑器里也得有东西可看：三段状态按序到达，且是同一个 toolCallId。"""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "hello.txt").write_text(_FILE_BODY, encoding="utf-8")
+
+    updates: list[dict[str, Any]] = []
+    run_acp_turn(
+        AcpTurnRequest(
+            workspace=workspace,
+            thread_id="cli-acptc1",
+            message="读一下 hello.txt",
+            tool_call_prefix="t1_",
+        ),
+        send_update=updates.append,
+        cancel_check=lambda: False,
+    )
+
+    tool_updates = [
+        u for u in updates if u["sessionUpdate"] in ("tool_call", "tool_call_update")
+    ]
+    assert [u["status"] for u in tool_updates] == ["pending", "in_progress", "completed"]
+    # 三段必须落在同一行上，否则编辑器里会画出三条各自独立的工具调用
+    assert len({u["toolCallId"] for u in tool_updates}) == 1
+    assert tool_updates[0]["toolCallId"].startswith("t1_")
+    # 新建那条是 tool_call，后两段是对它的更新
+    assert [u["sessionUpdate"] for u in tool_updates] == [
+        "tool_call",
+        "tool_call_update",
+        "tool_call_update",
+    ]
+    # pending 那条就带好标题与 kind：编辑器不用等跑完才知道这是在读哪个文件
+    assert tool_updates[0]["title"] == "执行 read_file(hello.txt)"
+    assert tool_updates[0]["kind"] == "read"
+    # 状态推进排在正文之前
+    first_text = next(
+        i for i, u in enumerate(updates) if u["sessionUpdate"] == "agent_message_chunk"
+    )
+    assert updates.index(tool_updates[-1]) < first_text
 
 
 def test_acp_turn_is_read_only_by_default(
@@ -510,7 +566,7 @@ def test_acp_turn_reads_the_unsaved_buffer(
         cancel_check=lambda: False,
     )
 
-    tool_call = next(u for u in updates if u["sessionUpdate"] == "tool_call")
+    tool_call = _completed_tool_call(updates)
     shown = tool_call["content"][0]["content"]["text"]
     assert "还没保存" in shown
     assert "hello from llgraph" not in shown

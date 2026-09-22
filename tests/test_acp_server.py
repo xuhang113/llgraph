@@ -245,6 +245,29 @@ def test_prompt_passes_write_mode_through(workspace: Path) -> None:
         h.close()
 
 
+def test_tool_call_id_prefix_advances_every_turn(workspace: Path) -> None:
+    """第二轮的 call_1 不能撞上第一轮那条已收尾的调用：编辑器按 toolCallId 认行。"""
+    prefixes: list[str] = []
+
+    def runner(req: AcpTurnRequest, *, send_update: Any, cancel_check: Any) -> AcpTurnResult:
+        prefixes.append(req.tool_call_prefix)
+        return AcpTurnResult(text="ok")
+
+    h = _Harness(turn_runner=runner)
+    try:
+        session_id = _new_session(h, workspace)
+        for request_id in (3, 4):
+            h.send(
+                "session/prompt",
+                {"sessionId": session_id, "prompt": [{"type": "text", "text": "看看"}]},
+                request_id=request_id,
+            )
+            h.response(request_id)
+        assert prefixes == ["t1_", "t2_"]
+    finally:
+        h.close()
+
+
 def test_cancel_during_prompt_stops_turn(workspace: Path) -> None:
     """跑一轮的同时还要能收 session/cancel：读循环不能被 prompt 占住。"""
     started = threading.Event()

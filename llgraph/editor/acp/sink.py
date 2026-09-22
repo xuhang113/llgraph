@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Callable
 
 from llgraph.console.runtime.sse_sink import _step_to_dict
@@ -9,15 +10,22 @@ from llgraph.display.trace_sink import strip_ansi
 from llgraph.editor.acp.updates import (
     agent_message_chunk,
     agent_thought_chunk,
+    is_tool_call_step,
     tool_call_from_step,
+    tool_call_pending,
+    tool_call_status,
 )
 
 
 class AcpTraceSink:
     """
     TraceSink 实现：正文走 ``agent_message_chunk``，思考走 ``agent_thought_chunk``，
-    工具步骤走 ``tool_call``。
+    工具走 ``tool_call`` 三段（pending → in_progress → completed）。
 
+    三段各自的来源不同：pending 来自模型决策（``tool_calls_planned``），
+    in_progress 来自 ToolNode 真正开跑（``tool_started``，在工具线程里被调用），
+    completed 来自跑完登记的 trace 步骤（``step_added``）。
+    三者靠模型给的 tool_call id 串成一条，编辑器里始终只有一行在动。
 
     trace 行（``line()``）不外发：ACP 没有对应的更新类型，编辑器里刷成思考会很吵。
     """
@@ -26,12 +34,27 @@ class AcpTraceSink:
     suppress_reply_body: bool = True
     suppress_web_hints: bool = True
 
-    def __init__(self, send_update: Callable[[dict[str, Any]], None]) -> None:
+    def __init__(
+        self,
+        send_update: Callable[[dict[str, Any]], None],
+        *,
+        id_prefix: str = "",
+    ) -> None:
+        """
+        @param send_update ``session/update`` 的 update 字段回调
+        @param id_prefix toolCallId 前缀；同一会话里每轮换一个，免得第二轮的
+            ``call_1`` 撞上第一轮那条已经收尾的调用
+        """
         self._send = send_update
+        self._id_prefix = id_prefix
         self.log_lines: list[str] = []
         self.streamed_chars: int = 0
         self._thinking_sent: int = 0
         self._tool_seq: int = 0
+        # 工具在 LangGraph 线程池里跑，起步通知与主线程的登记并发
+        self._tool_lock = threading.Lock()
+        self._tool_ids: dict[str, str] = {}
+        self._open_ids: set[str] = set()
 
     def line(self, text: str) -> None:
         """@param text trace 行（仅留档，不外发）"""
@@ -64,16 +87,89 @@ class AcpTraceSink:
         if delta.strip():
             self._send(agent_thought_chunk(delta))
 
+    def _next_tool_call_id(self) -> str:
+        self._tool_seq += 1
+        return f"{self._id_prefix}call_{self._tool_seq}"
+
+    def tool_calls_planned(self, calls: list[dict[str, Any]]) -> None:
+        """
+        模型决定要调的工具：先各画一条 pending。
+
+        @param calls ``[{"id": ..., "name": ..., "title": ...}]``
+        """
+        payloads: list[dict[str, Any]] = []
+        with self._tool_lock:
+            for call in calls:
+                raw_id = str(call.get("id") or "").strip()
+                if not raw_id or raw_id in self._tool_ids:
+                    continue
+                acp_id = self._next_tool_call_id()
+                self._tool_ids[raw_id] = acp_id
+                self._open_ids.add(acp_id)
+                payloads.append(
+                    tool_call_pending(
+                        acp_id,
+                        title=str(call.get("title") or "").strip(),
+                        tool_name=str(call.get("name") or "").strip(),
+                    )
+                )
+        for payload in payloads:
+            self._send(payload)
+
+    def tool_started(self, tool_call_id: str, tool_name: str) -> None:
+        """
+        某次工具调用真正开跑（在工具线程里被调用）。
+
+        没报过 pending 的 id 不发 in_progress：那说明这条调用不会有人收尾
+        （trace 静默、或 explore 那类另走 explore 步骤），留一条转圈的记录更糟。
+
+        @param tool_call_id 模型给的 id
+        @param tool_name 工具名（此处不用，仅对齐观察者签名）
+        """
+        _ = tool_name
+        with self._tool_lock:
+            acp_id = self._tool_ids.get(str(tool_call_id or "").strip())
+            if acp_id is None or acp_id not in self._open_ids:
+                return
+        self._send(tool_call_status(acp_id, "in_progress"))
+
     def step_added(self, step: Any) -> None:
         """@param step TraceStepRecord"""
         payload = _step_to_dict(step)
-        self._tool_seq += 1
+        if not is_tool_call_step(payload):
+            return
+        raw_id = str(payload.get("tool_call_id") or "").strip()
+        with self._tool_lock:
+            acp_id = self._tool_ids.get(raw_id) if raw_id else None
+            as_update = acp_id is not None
+            if acp_id is None:
+                acp_id = self._next_tool_call_id()
+                if raw_id:
+                    self._tool_ids[raw_id] = acp_id
+            self._open_ids.discard(acp_id)
         update = tool_call_from_step(
             payload,
-            tool_call_id=f"call_{self._tool_seq}",
+            tool_call_id=acp_id,
+            as_update=as_update,
         )
         if update is not None:
             self._send(update)
+
+    def abandon_open_tool_calls(self) -> None:
+        """
+        一轮收场时把还没收尾的调用标成 failed。
+
+        被取消、或模型那轮中途出错时，编辑器里那几条 pending / in_progress
+        会一直转圈——本轮之后再也不会有人来改它们的状态。
+        """
+        with self._tool_lock:
+            open_ids = sorted(self._open_ids)
+            self._open_ids.clear()
+        for acp_id in open_ids:
+            try:
+                self._send(tool_call_status(acp_id, "failed"))
+            except Exception:  # noqa: BLE001 - 连接可能已经断了，收场不能再抛
+                return
 
     def step_selected(self, step_id: int) -> None:
         """@param step_id 步骤编号（ACP 不使用）"""

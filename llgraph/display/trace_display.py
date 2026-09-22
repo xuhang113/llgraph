@@ -297,6 +297,8 @@ class TraceStepRecord:
     elapsed_kind: str = "wall"
     """explore 等子会话：点开可拉子 Trace。"""
     sub_thread: str | None = None
+    """kind=tool：模型给这次调用的 id（入口据此把「开始」与「完成」串成一条）。"""
+    tool_call_id: str | None = None
 
 
 def _resolve_elapsed_kind(kind: str) -> str:
@@ -697,6 +699,7 @@ class TurnTracePrinter:
         invoke_timing: dict[str, Any] | None = None,
         elapsed_kind: str | None = None,
         sub_thread: str | None = None,
+        tool_call_id: str | None = None,
     ) -> int:
         self._step_index += 1
         lines = body_lines if body_lines is not None else (body.splitlines() if body else [])
@@ -713,6 +716,7 @@ class TurnTracePrinter:
                 invoke_timing=invoke_timing,
                 elapsed_kind=resolved_kind,
                 sub_thread=(sub_thread or "").strip() or None,
+                tool_call_id=(tool_call_id or "").strip() or None,
             )
         )
         return self._step_index
@@ -1091,6 +1095,42 @@ class TurnTracePrinter:
         )
         self._step_start = time.perf_counter()
 
+    def _notify_tool_calls_planned(self, tool_calls: list) -> None:
+        """
+        模型决定要调哪些工具 → 通知 Sink（编辑器据此先画一条 pending）。
+
+        工具步骤要等跑完才登记，这中间可能隔着上下文维护、写串行化、排在别人后面，
+        长命令期间界面上什么都没有。这里给的是「已排队」，不是「已开始」。
+
+        spawn_subagent 不通知：它的完成态由 emit_explore_trace_step 以 explore 步骤登记，
+        与 on_tools_update 那边的跳过规则保持一致，免得留一条永远不收尾的 pending。
+
+        @param tool_calls AIMessage.tool_calls
+        """
+        sink = self._session.trace_sink
+        if sink is None or not hasattr(sink, "tool_calls_planned"):
+            return
+        # verbose（trace all）下 on_tools_update 不按工具登记步骤，没人给 pending 收尾
+        if self._session.is_verbose():
+            return
+        planned: list[dict[str, Any]] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name") or "").strip()
+            call_id = str(call.get("id") or "").strip()
+            if not name or not call_id or name == "spawn_subagent":
+                continue
+            planned.append(
+                {
+                    "id": call_id,
+                    "name": name,
+                    "title": _format_tool_step_title(name, call.get("args") or {}),
+                }
+            )
+        if planned:
+            sink.tool_calls_planned(planned)
+
     def on_agent_update(self, messages: list) -> None:
         if not self._session.shows_process():
             self._step_start = time.perf_counter()
@@ -1184,6 +1224,7 @@ class TurnTracePrinter:
                         if len(tool_names) > 3:
                             label += f" 等{len(tool_names)}个"
                         emit_trace_milestone(self._session, f"执行 {label}…")
+            self._notify_tool_calls_planned(tool_calls)
             self._streamed_reply = False
         elif text:
             visible = _user_visible_reply_text(text)
@@ -1251,6 +1292,7 @@ class TurnTracePrinter:
                     output_summary,
                     body_lines=lines,
                     elapsed_kind="tool",
+                    tool_call_id=str(getattr(msg, "tool_call_id", "") or ""),
                 )
                 self._print_step_summary(
                     step_id,

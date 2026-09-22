@@ -37,6 +37,8 @@ class AcpSession:
     """授权闸门（``AcpPermissionGate``）；None 表示写入不逐次确认。"""
     file_bridge: Any = None
     """编辑器文件来源（``AcpFileBridge``）；None 表示只读写磁盘。"""
+    turn_seq: int = 0
+    """本会话已开始的轮数；toolCallId 用它做前缀，跨轮不撞号。"""
 
 
 class AcpServer:
@@ -250,6 +252,7 @@ class AcpServer:
         if not text:
             raise invalid_params("prompt 为空")
         session.busy = True
+        session.turn_seq += 1
         session.cancelled.clear()
         worker = threading.Thread(
             target=self._run_turn,
@@ -320,6 +323,7 @@ class AcpServer:
                         else None
                     ),
                     editor_files=session.file_bridge,
+                    tool_call_prefix=f"t{session.turn_seq}_",
                 ),
                 send_update=lambda update: self._send_update(session, update),
                 cancel_check=session.cancelled.is_set,

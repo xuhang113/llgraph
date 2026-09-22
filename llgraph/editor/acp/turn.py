@@ -35,6 +35,8 @@ class AcpTurnRequest:
     """写 / 执行前的授权闸门；None 表示不问（写工具直接落地）。"""
     editor_files: Any = None
     """编辑器文件来源（``EditorFileSource``）；None 表示文件工具只读写磁盘。"""
+    tool_call_prefix: str = ""
+    """toolCallId 前缀；同一会话每轮换一个，免得第二轮的 id 撞上上一轮那条。"""
 
 
 @dataclass
@@ -78,6 +80,7 @@ def run_acp_turn(
         AgentRuntimeBundle,
         get_or_build_agent_session_for_thread,
     )
+    from llgraph.core.tool_progress import use_tool_start_observer
     from llgraph.core.write_failure_tracker import WriteFailureTracker
     from llgraph.display.trace_display import TraceSession
     from llgraph.editor.acp.sink import AcpTraceSink
@@ -98,7 +101,7 @@ def run_acp_turn(
     RUNTIME_MANAGER.wait_mcp_ready(req.workspace, timeout=2.0)
 
     trace = TraceSession(mode=rt.trace_session.mode)
-    sink = AcpTraceSink(send_update)
+    sink = AcpTraceSink(send_update, id_prefix=req.tool_call_prefix)
     trace.trace_sink = sink
 
     edit_settings = resolve_edit_settings(req.workspace)
@@ -139,11 +142,11 @@ def run_acp_turn(
             session_id=req.thread_id,
             disabled=False,
         )
-        # 闸门与编辑器文件来源都登记在 invoke 外面：工具可能在 LangGraph 线程池里跑，
-        # ContextVar 由 langchain 在提交任务时随 context 一起复制过去
+        # 闸门、编辑器文件来源、工具起步观察者都登记在 invoke 外面：工具可能在
+        # LangGraph 线程池里跑，ContextVar 由 langchain 在提交任务时随 context 复制过去
         with use_approval_gate(req.permission_ask), use_editor_file_source(
             req.editor_files
-        ):
+        ), use_tool_start_observer(sink.tool_started):
             text = invoke_agent(
                 agent_ctx.agent,
                 req.message,
@@ -160,6 +163,8 @@ def run_acp_turn(
             )
         cancelled = cancel_check() or is_agent_cancel_requested(req.thread_id)
     finally:
+        # 被取消 / 中途抛错时，编辑器里那几条还在转圈的工具调用本轮之后没人再收尾
+        sink.abandon_open_tool_calls()
         # 注册表与 session 锁一起释放：漏一个，这个 thread 之后就再也开不了新一轮
         if not force_release_agent_chat(req.thread_id, owner="acp"):
             LOCKS.release(req.thread_id, owner="acp")

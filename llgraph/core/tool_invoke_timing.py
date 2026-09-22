@@ -101,15 +101,21 @@ def wrap_tool_node_with_timing(inner: Any) -> None:
     """
     为 LangGraph ToolNode 注入按 tool_call 计时的 _run_one / _arun_one 包装。
 
+    这层是链路里唯一「一次工具调用从头包到尾」的位置，所以起步通知
+    （``tool_progress``）也搭在这里：计时起点即工具真正开跑的那一刻。
+
     @param inner ToolNode 实例（原地修改）
     """
     if getattr(inner, "_llgraph_timing_wrapped", False):
         return
 
+    from llgraph.core.tool_progress import notify_tool_started
+
     original_run = inner._run_one
     original_arun = inner._arun_one
 
     def timed_run_one(call: dict[str, Any], input_type: Any, tool_runtime: Any) -> Any:
+        notify_tool_started(str(call.get("id") or ""), str(call.get("name") or ""))
         started = time.perf_counter()
         try:
             return original_run(call, input_type, tool_runtime)
@@ -117,6 +123,7 @@ def wrap_tool_node_with_timing(inner: Any) -> None:
             record_tool_timing(str(call.get("id") or ""), time.perf_counter() - started)
 
     async def timed_arun_one(call: dict[str, Any], input_type: Any, tool_runtime: Any) -> Any:
+        notify_tool_started(str(call.get("id") or ""), str(call.get("name") or ""))
         started = time.perf_counter()
         try:
             return await original_arun(call, input_type, tool_runtime)
