@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import Any, Callable
 
 from llgraph.console.runtime.sse_sink import _step_to_dict
@@ -12,6 +13,7 @@ from llgraph.editor.acp.updates import (
     agent_thought_chunk,
     is_tool_call_step,
     tool_call_from_step,
+    tool_call_locations,
     tool_call_pending,
     tool_call_status,
 )
@@ -20,7 +22,7 @@ from llgraph.editor.acp.updates import (
 class AcpTraceSink:
     """
     TraceSink 实现：正文走 ``agent_message_chunk``，思考走 ``agent_thought_chunk``，
-    工具走 ``tool_call`` 三段（pending → in_progress → completed）。
+    工具走 ``tool_call`` 三段（pending → in_progress → completed / failed）。
 
     三段各自的来源不同：pending 来自模型决策（``tool_calls_planned``），
     in_progress 来自 ToolNode 真正开跑（``tool_started``，在工具线程里被调用），
@@ -39,14 +41,17 @@ class AcpTraceSink:
         send_update: Callable[[dict[str, Any]], None],
         *,
         id_prefix: str = "",
+        workspace: Path | None = None,
     ) -> None:
         """
         @param send_update ``session/update`` 的 update 字段回调
         @param id_prefix toolCallId 前缀；同一会话里每轮换一个，免得第二轮的
             ``call_1`` 撞上第一轮那条已经收尾的调用
+        @param workspace 工作区根；把工具参数里的相对路径补成 ACP 要的绝对路径
         """
         self._send = send_update
         self._id_prefix = id_prefix
+        self._workspace = Path(workspace) if workspace is not None else None
         self.log_lines: list[str] = []
         self.streamed_chars: int = 0
         self._thinking_sent: int = 0
@@ -95,7 +100,7 @@ class AcpTraceSink:
         """
         模型决定要调的工具：先各画一条 pending。
 
-        @param calls ``[{"id": ..., "name": ..., "title": ...}]``
+        @param calls ``[{"id": ..., "name": ..., "title": ..., "paths": [...]}]``
         """
         payloads: list[dict[str, Any]] = []
         with self._tool_lock:
@@ -111,6 +116,9 @@ class AcpTraceSink:
                         acp_id,
                         title=str(call.get("title") or "").strip(),
                         tool_name=str(call.get("name") or "").strip(),
+                        locations=tool_call_locations(
+                            call.get("paths"), self._workspace
+                        ),
                     )
                 )
         for payload in payloads:

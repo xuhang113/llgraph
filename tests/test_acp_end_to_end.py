@@ -377,11 +377,47 @@ def test_acp_turn_reports_tool_call_pending_then_in_progress_then_completed(
     # pending 那条就带好标题与 kind：编辑器不用等跑完才知道这是在读哪个文件
     assert tool_updates[0]["title"] == "执行 read_file(hello.txt)"
     assert tool_updates[0]["kind"] == "read"
+    # 受影响文件按绝对路径给出，编辑器里那一行才点得开
+    assert tool_updates[0]["locations"] == [{"path": str(workspace / "hello.txt")}]
     # 状态推进排在正文之前
     first_text = next(
         i for i, u in enumerate(updates) if u["sessionUpdate"] == "agent_message_chunk"
     )
     assert updates.index(tool_updates[-1]) < first_text
+
+
+def test_acp_turn_reports_a_broken_tool_call_as_failed(
+    tmp_path: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """工具没抛异常也可能是失败的（这里是参数校验错），编辑器里不能画成一次成功。"""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    # 少了必填的 path：工具返回一段「错误: 工具参数无效」，而不是抛异常
+    stub_gateway.tool_input = {}
+
+    updates: list[dict[str, Any]] = []
+    run_acp_turn(
+        AcpTurnRequest(
+            workspace=workspace,
+            thread_id="cli-acpfail1",
+            message="读一个文件",
+            tool_call_prefix="t1_",
+        ),
+        send_update=updates.append,
+        cancel_check=lambda: False,
+    )
+
+    tool_updates = [
+        u for u in updates if u["sessionUpdate"] in ("tool_call", "tool_call_update")
+    ]
+    assert [u["status"] for u in tool_updates] == ["pending", "in_progress", "failed"]
+    assert len({u["toolCallId"] for u in tool_updates}) == 1
+    # 失败原因要能在那一行里点开看到
+    assert "path" in tool_updates[-1]["content"][0]["content"]["text"]
+    # 参数里没有 path，自然也没有可跳转的文件
+    assert "locations" not in tool_updates[0]
 
 
 def test_acp_turn_is_read_only_by_default(

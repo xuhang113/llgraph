@@ -249,6 +249,48 @@ def _tool_call_args_by_id(messages: list) -> dict[str, dict[str, Any]]:
     return {}
 
 
+# 参数里的 path 指向「这次动的那份文件」的工具。搜索类（grep_files / glob_files /
+# list_directory）的 path 是扫描范围、多半就是工作区根，指过去点不出有用的东西
+_SINGLE_PATH_TOOLS = frozenset(
+    {"read_file", "write_file", "append_file", "search_replace"}
+)
+_MULTI_PATH_TOOLS = frozenset({"read_files"})
+_MAX_TOOL_CALL_PATHS = 8
+
+
+def _tool_call_paths(tool_name: str, args: Any) -> list[str]:
+    """
+    这次工具调用受影响的文件路径（原样返回，不做绝对化）。
+
+    绝对化要工作区根，而 trace 这层不认它；入口（ACP）自己知道，在那边接。
+
+    @param tool_name 工具名
+    @param args 工具参数字典
+    @return 路径列表；取不到则空列表
+    """
+    if not isinstance(args, dict):
+        return []
+    name = (tool_name or "").strip()
+    if name in _SINGLE_PATH_TOOLS:
+        raw: list[Any] = [args.get("path")]
+    elif name in _MULTI_PATH_TOOLS:
+        paths = args.get("paths")
+        raw = list(paths) if isinstance(paths, list) else []
+    else:
+        return []
+    out: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        text = item.strip()
+        if not text or text in (".", "./") or text in out:
+            continue
+        out.append(text)
+        if len(out) >= _MAX_TOOL_CALL_PATHS:
+            break
+    return out
+
+
 def _format_tool_step_title(tool_name: str, args: Any) -> str:
     target = _short_tool_target(tool_name, args)
     if target:
@@ -299,6 +341,8 @@ class TraceStepRecord:
     sub_thread: str | None = None
     """kind=tool：模型给这次调用的 id（入口据此把「开始」与「完成」串成一条）。"""
     tool_call_id: str | None = None
+    """kind=tool：工具返回像失败（校验错 / 报错文本），入口据此标红而不是当成功。"""
+    tool_failed: bool = False
 
 
 def _resolve_elapsed_kind(kind: str) -> str:
@@ -700,6 +744,7 @@ class TurnTracePrinter:
         elapsed_kind: str | None = None,
         sub_thread: str | None = None,
         tool_call_id: str | None = None,
+        tool_failed: bool = False,
     ) -> int:
         self._step_index += 1
         lines = body_lines if body_lines is not None else (body.splitlines() if body else [])
@@ -717,6 +762,7 @@ class TurnTracePrinter:
                 elapsed_kind=resolved_kind,
                 sub_thread=(sub_thread or "").strip() or None,
                 tool_call_id=(tool_call_id or "").strip() or None,
+                tool_failed=tool_failed,
             )
         )
         return self._step_index
@@ -1121,11 +1167,13 @@ class TurnTracePrinter:
             call_id = str(call.get("id") or "").strip()
             if not name or not call_id or name == "spawn_subagent":
                 continue
+            args = call.get("args") or {}
             planned.append(
                 {
                     "id": call_id,
                     "name": name,
-                    "title": _format_tool_step_title(name, call.get("args") or {}),
+                    "title": _format_tool_step_title(name, args),
+                    "paths": _tool_call_paths(name, args),
                 }
             )
         if planned:
@@ -1293,6 +1341,7 @@ class TurnTracePrinter:
                     body_lines=lines,
                     elapsed_kind="tool",
                     tool_call_id=str(getattr(msg, "tool_call_id", "") or ""),
+                    tool_failed=is_error,
                 )
                 self._print_step_summary(
                     step_id,

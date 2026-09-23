@@ -101,7 +101,11 @@ def run_acp_turn(
     RUNTIME_MANAGER.wait_mcp_ready(req.workspace, timeout=2.0)
 
     trace = TraceSession(mode=rt.trace_session.mode)
-    sink = AcpTraceSink(send_update, id_prefix=req.tool_call_prefix)
+    sink = AcpTraceSink(
+        send_update,
+        id_prefix=req.tool_call_prefix,
+        workspace=req.workspace,
+    )
     trace.trace_sink = sink
 
     edit_settings = resolve_edit_settings(req.workspace)

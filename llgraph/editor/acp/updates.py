@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 ACP_PROTOCOL_VERSION = 1
@@ -166,11 +167,46 @@ def prompt_text(blocks: Any) -> str:
     return "\n\n".join(p.strip() for p in parts if p.strip()).strip()
 
 
+def tool_call_locations(
+    paths: Any,
+    workspace: Path | None,
+) -> list[dict[str, str]]:
+    """
+    受影响文件 → ACP ``ToolCallLocation``（编辑器据此让那一行可点开跳转）。
+
+    ACP 只认绝对路径，相对路径按工作区根补齐；没有工作区根时相对路径直接丢掉——
+    报一条编辑器打不开的路径，点下去是个报错，不如不报。
+
+    @param paths 路径列表（相对工作区或绝对）
+    @param workspace 工作区根
+    @return locations 列表；一个都补不出来时为空
+    """
+    if not isinstance(paths, list):
+        return []
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in paths:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        candidate = Path(item.strip()).expanduser()
+        if not candidate.is_absolute():
+            if workspace is None:
+                continue
+            candidate = Path(workspace) / candidate
+        text = str(candidate)
+        if text in seen:
+            continue
+        seen.add(text)
+        out.append({"path": text})
+    return out
+
+
 def tool_call_pending(
     tool_call_id: str,
     *,
     title: str,
     tool_name: str,
+    locations: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """
     模型刚决定要调的工具 → ACP ``tool_call``（pending）。
@@ -178,15 +214,19 @@ def tool_call_pending(
     @param tool_call_id 本会话内唯一的工具调用 id
     @param title 步骤标题（与跑完那条一致，编辑器里不会换名字）
     @param tool_name 工具名（定 kind）
+    @param locations 受影响文件（绝对路径）；空则不带这个字段
     @return session/update 载荷
     """
-    return {
+    payload: dict[str, Any] = {
         "sessionUpdate": "tool_call",
         "toolCallId": tool_call_id,
         "title": title or "执行工具",
         "kind": acp_tool_kind(tool_name),
         "status": "pending",
     }
+    if locations:
+        payload["locations"] = locations
+    return payload
 
 
 def tool_call_status(tool_call_id: str, status: str) -> dict[str, Any]:
@@ -217,7 +257,7 @@ def tool_call_from_step(
     as_update: bool = False,
 ) -> dict[str, Any] | None:
     """
-    trace 工具步骤 → ACP 工具调用更新（completed）。
+    trace 工具步骤 → ACP 工具调用更新（completed / failed）。
 
     trace 的步骤在工具跑完后才登记（那时才有耗时与输出）。这条调用此前若已经以
     pending 报过（``tool_call_pending``），收尾必须走 ``tool_call_update``——
@@ -225,6 +265,10 @@ def tool_call_from_step(
 
     ``as_update`` 时只报状态与输出，不重发标题 / kind：工具节点的输出里没有调用参数，
     照它算出来的标题会从 ``执行 read_file(a.txt)`` 退化成 ``执行 read_file``。
+
+    工具没抛异常也可能是失败的（参数校验错、``old_string`` 没匹配上），
+    trace 在登记步骤时已经判过（``tool_failed``），这里照它报 ``failed``：
+    一律 ``completed`` 的话，编辑器里一次失败的改写和一次成功的改写长得一模一样。
 
     @param step trace 步骤 dict
     @param tool_call_id 本会话内唯一的工具调用 id
@@ -242,7 +286,7 @@ def tool_call_from_step(
     payload: dict[str, Any] = {
         "sessionUpdate": "tool_call_update" if as_update else "tool_call",
         "toolCallId": tool_call_id,
-        "status": "completed",
+        "status": "failed" if step.get("tool_failed") else "completed",
     }
     if not as_update:
         payload["title"] = title
