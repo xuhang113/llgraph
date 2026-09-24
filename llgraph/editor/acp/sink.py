@@ -12,11 +12,16 @@ from llgraph.editor.acp.updates import (
     agent_message_chunk,
     agent_thought_chunk,
     is_tool_call_step,
+    tool_call_diffs,
     tool_call_from_step,
     tool_call_locations,
     tool_call_pending,
     tool_call_status,
 )
+
+# 一次调用最多留几份文件的改前 / 改后全文：写工具一次只改一份，
+# 留这个上限是为了万一有工具循环写，不至于把一轮的内存堆满
+_MAX_EDITS_PER_CALL = 8
 
 
 class AcpTraceSink:
@@ -28,6 +33,7 @@ class AcpTraceSink:
     in_progress 来自 ToolNode 真正开跑（``tool_started``，在工具线程里被调用），
     completed 来自跑完登记的 trace 步骤（``step_added``）。
     三者靠模型给的 tool_call id 串成一条，编辑器里始终只有一行在动。
+    写工具落地时另报一次改动（``tool_edited``），收尾那条据此带上 diff 块。
 
     trace 行（``line()``）不外发：ACP 没有对应的更新类型，编辑器里刷成思考会很吵。
     """
@@ -60,6 +66,8 @@ class AcpTraceSink:
         self._tool_lock = threading.Lock()
         self._tool_ids: dict[str, str] = {}
         self._open_ids: set[str] = set()
+        # 写工具落地时报上来的改动，按模型给的 tool_call_id 攒着，等这次调用收尾时发出
+        self._edits: dict[str, list[dict[str, Any]]] = {}
 
     def line(self, text: str) -> None:
         """@param text trace 行（仅留档，不外发）"""
@@ -141,6 +149,38 @@ class AcpTraceSink:
                 return
         self._send(tool_call_status(acp_id, "in_progress"))
 
+    def tool_edited(self, edit: Any) -> None:
+        """
+        某次工具调用改了一份文件（在工具线程里被调用，写已经落地了）。
+
+        改动此刻攒着不发：这次调用还没收尾，单发一条 ``tool_call_update``
+        会在编辑器里多出一次刷新，而收尾那条本来就要带 content。
+
+        同一份文件被同一次调用改两回时合成一条（最早的改前 + 最后的改后），
+        编辑器里一次调用挂两个同名 diff 只会让人以为改了两个文件。
+
+        @param edit ``ToolEdit``（tool_call_id / path / old_text / new_text）
+        """
+        raw_id = str(getattr(edit, "tool_call_id", "") or "").strip()
+        path = str(getattr(edit, "path", "") or "").strip()
+        if not raw_id or not path:
+            return
+        with self._tool_lock:
+            edits = self._edits.setdefault(raw_id, [])
+            for existing in edits:
+                if existing["path"] == path:
+                    existing["new_text"] = getattr(edit, "new_text", "")
+                    return
+            if len(edits) >= _MAX_EDITS_PER_CALL:
+                return
+            edits.append(
+                {
+                    "path": path,
+                    "old_text": getattr(edit, "old_text", ""),
+                    "new_text": getattr(edit, "new_text", ""),
+                }
+            )
+
     def step_added(self, step: Any) -> None:
         """@param step TraceStepRecord"""
         payload = _step_to_dict(step)
@@ -155,10 +195,12 @@ class AcpTraceSink:
                 if raw_id:
                     self._tool_ids[raw_id] = acp_id
             self._open_ids.discard(acp_id)
+            edits = self._edits.pop(raw_id, []) if raw_id else []
         update = tool_call_from_step(
             payload,
             tool_call_id=acp_id,
             as_update=as_update,
+            diffs=tool_call_diffs(edits, self._workspace),
         )
         if update is not None:
             self._send(update)

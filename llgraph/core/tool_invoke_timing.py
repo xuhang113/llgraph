@@ -103,13 +103,15 @@ def wrap_tool_node_with_timing(inner: Any) -> None:
 
     这层是链路里唯一「一次工具调用从头包到尾」的位置，所以起步通知
     （``tool_progress``）也搭在这里：计时起点即工具真正开跑的那一刻。
+    同一个括号里顺带把 tool_call_id 记进 ContextVar，工具内部（写工具报改动）
+    才知道自己属于哪次调用。
 
     @param inner ToolNode 实例（原地修改）
     """
     if getattr(inner, "_llgraph_timing_wrapped", False):
         return
 
-    from llgraph.core.tool_progress import notify_tool_started
+    from llgraph.core.tool_progress import notify_tool_started, use_current_tool_call
 
     original_run = inner._run_one
     original_arun = inner._arun_one
@@ -118,7 +120,8 @@ def wrap_tool_node_with_timing(inner: Any) -> None:
         notify_tool_started(str(call.get("id") or ""), str(call.get("name") or ""))
         started = time.perf_counter()
         try:
-            return original_run(call, input_type, tool_runtime)
+            with use_current_tool_call(str(call.get("id") or "")):
+                return original_run(call, input_type, tool_runtime)
         finally:
             record_tool_timing(str(call.get("id") or ""), time.perf_counter() - started)
 
@@ -126,7 +129,8 @@ def wrap_tool_node_with_timing(inner: Any) -> None:
         notify_tool_started(str(call.get("id") or ""), str(call.get("name") or ""))
         started = time.perf_counter()
         try:
-            return await original_arun(call, input_type, tool_runtime)
+            with use_current_tool_call(str(call.get("id") or "")):
+                return await original_arun(call, input_type, tool_runtime)
         finally:
             record_tool_timing(str(call.get("id") or ""), time.perf_counter() - started)
 

@@ -562,6 +562,35 @@ def test_acp_turn_writes_after_permission_granted(
     )
 
 
+def test_acp_turn_sends_the_edit_as_a_diff(
+    edit_workspace: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """改完那条要带 diff：光有「已替换 1 处」，编辑器里还是看不到改了什么。"""
+    updates: list[dict[str, Any]] = []
+    run_acp_turn(
+        AcpTurnRequest(
+            workspace=edit_workspace,
+            thread_id="cli-acpdiff1",
+            message="把 return 1 改成 return 2",
+            allow_write=True,
+            tool_call_prefix="t1_",
+        ),
+        send_update=updates.append,
+        cancel_check=lambda: False,
+    )
+
+    finished = _completed_tool_call(updates)
+    diff = finished["content"][0]
+    assert diff["type"] == "diff"
+    assert diff["path"] == str(edit_workspace / "app.py")
+    assert diff["oldText"] == "def run():\n    return 1\n"
+    assert diff["newText"] == "def run():\n    return 2\n"
+    # 工具原来的文本输出还在（诊断与提示都在里面），只是排在 diff 后面
+    assert finished["content"][1]["type"] == "content"
+
+
 class _FakeEditorFiles:
     """假编辑器的未保存缓冲区（真桥的协议细节在 test_acp_fs_bridge.py 里测）。"""
 

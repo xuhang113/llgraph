@@ -167,15 +167,34 @@ def prompt_text(blocks: Any) -> str:
     return "\n\n".join(p.strip() for p in parts if p.strip()).strip()
 
 
+def absolute_workspace_path(path: Any, workspace: Path | None) -> str | None:
+    """
+    工具参数里的路径 → ACP 要的绝对路径。
+
+    ACP（locations 与 diff 块）只认绝对路径，相对路径按工作区根补齐；
+    没有工作区根时相对路径直接丢掉——报一条编辑器打不开的路径，
+    点下去是个报错，不如不报。
+
+    @param path 路径（相对工作区或绝对）
+    @param workspace 工作区根
+    @return 绝对路径；补不出来时 None
+    """
+    if not isinstance(path, str) or not path.strip():
+        return None
+    candidate = Path(path.strip()).expanduser()
+    if not candidate.is_absolute():
+        if workspace is None:
+            return None
+        candidate = Path(workspace) / candidate
+    return str(candidate)
+
+
 def tool_call_locations(
     paths: Any,
     workspace: Path | None,
 ) -> list[dict[str, str]]:
     """
     受影响文件 → ACP ``ToolCallLocation``（编辑器据此让那一行可点开跳转）。
-
-    ACP 只认绝对路径，相对路径按工作区根补齐；没有工作区根时相对路径直接丢掉——
-    报一条编辑器打不开的路径，点下去是个报错，不如不报。
 
     @param paths 路径列表（相对工作区或绝对）
     @param workspace 工作区根
@@ -186,18 +205,56 @@ def tool_call_locations(
     out: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in paths:
-        if not isinstance(item, str) or not item.strip():
-            continue
-        candidate = Path(item.strip()).expanduser()
-        if not candidate.is_absolute():
-            if workspace is None:
-                continue
-            candidate = Path(workspace) / candidate
-        text = str(candidate)
-        if text in seen:
+        text = absolute_workspace_path(item, workspace)
+        if text is None or text in seen:
             continue
         seen.add(text)
         out.append({"path": text})
+    return out
+
+
+# 一个 diff 块要把改前 + 改后全文都推给编辑器。超过这个量就不发了：
+# 生成的文件动辄几十万字符，一条更新能把 stdio 通道堵住，而那种文件的逐行 diff
+# 在编辑器里本来也没人读。此时那次调用仍有原来的纯文本输出。
+MAX_DIFF_CHARS = 200_000
+
+
+def tool_call_diffs(edits: Any, workspace: Path | None) -> list[dict[str, Any]]:
+    """
+    写工具报上来的改动 → ACP ``diff`` 内容块（编辑器里渲染成改动预览）。
+
+    新建文件的 ``oldText`` 是 null（ACP 据此画成整份新增），与授权弹窗
+    （``permission.py``）同一个写法，免得同一次改动在弹窗与结果里长得不一样。
+
+    @param edits ``[{"path": ..., "old_text": ..., "new_text": ...}]``
+    @param workspace 工作区根（相对路径补绝对用）
+    @return diff 块列表；一个都发不出时为空
+    """
+    if not isinstance(edits, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for edit in edits:
+        if not isinstance(edit, dict):
+            continue
+        abs_path = absolute_workspace_path(edit.get("path"), workspace)
+        if abs_path is None:
+            continue
+        old_text = edit.get("old_text") or ""
+        new_text = edit.get("new_text")
+        if not isinstance(new_text, str) or not isinstance(old_text, str):
+            continue
+        if old_text == new_text:
+            continue
+        if len(old_text) + len(new_text) > MAX_DIFF_CHARS:
+            continue
+        out.append(
+            {
+                "type": "diff",
+                "path": abs_path,
+                "oldText": old_text or None,
+                "newText": new_text,
+            }
+        )
     return out
 
 
@@ -255,6 +312,7 @@ def tool_call_from_step(
     tool_call_id: str,
     max_content_lines: int = 40,
     as_update: bool = False,
+    diffs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """
     trace 工具步骤 → ACP 工具调用更新（completed / failed）。
@@ -270,10 +328,14 @@ def tool_call_from_step(
     trace 在登记步骤时已经判过（``tool_failed``），这里照它报 ``failed``：
     一律 ``completed`` 的话，编辑器里一次失败的改写和一次成功的改写长得一模一样。
 
+    ``diffs`` 排在纯文本输出前面：编辑器里第一眼要看的是「这一刀改了什么」，
+    工具返回的那段文本（诊断、分块提示）是补充说明。
+
     @param step trace 步骤 dict
     @param tool_call_id 本会话内唯一的工具调用 id
     @param max_content_lines 回填给编辑器的输出行数上限
     @param as_update True 时发 ``tool_call_update``（这条调用已经报过 pending）
+    @param diffs 这次调用落下的改动块（``tool_call_diffs`` 的结果）
     @return session/update 载荷；非工具步骤返回 None
     """
     if not is_tool_call_step(step):
@@ -291,11 +353,14 @@ def tool_call_from_step(
     if not as_update:
         payload["title"] = title
         payload["kind"] = "think" if kind == "explore" else acp_tool_kind(tool_name)
+    content: list[dict[str, Any]] = list(diffs or [])
     if lines:
         shown = lines[:max_content_lines]
         hidden = len(lines) - len(shown)
         text = "\n".join(shown)
         if hidden > 0:
             text = f"{text}\n… 还有 {hidden} 行"
-        payload["content"] = [{"type": "content", "content": text_content(text)}]
+        content.append({"type": "content", "content": text_content(text)})
+    if content:
+        payload["content"] = content
     return payload

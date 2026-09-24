@@ -62,6 +62,7 @@ from llgraph.core.read_focus import (
     should_focus_read,
 )
 from llgraph.core.text_file_types import is_probably_text_path, read_path_rejection_reason
+from llgraph.core.tool_progress import notify_file_edited
 from llgraph.permissions.approval import (
     APPROVAL_KIND_EDIT,
     ApprovalRequest,
@@ -1329,6 +1330,7 @@ def create_filesystem_tools(
         if edit_tracker is not None and target.is_file():
             edit_tracker.ensure_snapshot(rel)
         editor_note = _persist_text(target, content, via_editor=from_editor)
+        notify_file_edited(rel, old_text, content)
         _after_write(rel, "write", old_part="", new_part=content)
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
@@ -1394,6 +1396,7 @@ def create_filesystem_tools(
         if target.is_file() and edit_tracker is not None:
             edit_tracker.ensure_snapshot(rel)
         editor_note = _persist_text(target, new_text, via_editor=from_editor)
+        notify_file_edited(rel, old_text, new_text)
         _after_write(rel, "append", old_part="", new_part=content)
         if write_failure_tracker is not None:
             write_failure_tracker.note_success()
@@ -1483,6 +1486,7 @@ def create_filesystem_tools(
         if edit_tracker is not None:
             edit_tracker.ensure_snapshot(rel)
         editor_note = _persist_text(target, applied.new_text, via_editor=from_editor)
+        notify_file_edited(rel, text, applied.new_text)
         old_part = "\n".join(h.old_string for h in hunks)
         new_part = "\n".join(h.new_string for h in hunks)
         _after_write(

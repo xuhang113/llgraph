@@ -80,7 +80,10 @@ def run_acp_turn(
         AgentRuntimeBundle,
         get_or_build_agent_session_for_thread,
     )
-    from llgraph.core.tool_progress import use_tool_start_observer
+    from llgraph.core.tool_progress import (
+        use_tool_edit_observer,
+        use_tool_start_observer,
+    )
     from llgraph.core.write_failure_tracker import WriteFailureTracker
     from llgraph.display.trace_display import TraceSession
     from llgraph.editor.acp.sink import AcpTraceSink
@@ -146,11 +149,13 @@ def run_acp_turn(
             session_id=req.thread_id,
             disabled=False,
         )
-        # 闸门、编辑器文件来源、工具起步观察者都登记在 invoke 外面：工具可能在
+        # 闸门、编辑器文件来源、工具起步 / 编辑观察者都登记在 invoke 外面：工具可能在
         # LangGraph 线程池里跑，ContextVar 由 langchain 在提交任务时随 context 复制过去
         with use_approval_gate(req.permission_ask), use_editor_file_source(
             req.editor_files
-        ), use_tool_start_observer(sink.tool_started):
+        ), use_tool_start_observer(sink.tool_started), use_tool_edit_observer(
+            sink.tool_edited
+        ):
             text = invoke_agent(
                 agent_ctx.agent,
                 req.message,
