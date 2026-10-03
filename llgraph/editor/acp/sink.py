@@ -17,11 +17,15 @@ from llgraph.editor.acp.updates import (
     tool_call_locations,
     tool_call_pending,
     tool_call_status,
+    tool_call_terminal,
 )
 
 # 一次调用最多留几份文件的改前 / 改后全文：写工具一次只改一份，
 # 留这个上限是为了万一有工具循环写，不至于把一轮的内存堆满
 _MAX_EDITS_PER_CALL = 8
+
+# 一次调用最多挂几个编辑器终端：`run_shell_command` 一次只起一条命令
+_MAX_TERMINALS_PER_CALL = 4
 
 
 class AcpTraceSink:
@@ -33,7 +37,9 @@ class AcpTraceSink:
     in_progress 来自 ToolNode 真正开跑（``tool_started``，在工具线程里被调用），
     completed 来自跑完登记的 trace 步骤（``step_added``）。
     三者靠模型给的 tool_call id 串成一条，编辑器里始终只有一行在动。
-    写工具落地时另报一次改动（``tool_edited``），收尾那条据此带上 diff 块。
+    写工具落地时另报一次改动（``tool_edited``），收尾那条据此带上 diff 块；
+    命令交给编辑器终端时再报一次（``tool_terminal``），那条马上发，
+    输出才能边跑边进编辑器。
 
     trace 行（``line()``）不外发：ACP 没有对应的更新类型，编辑器里刷成思考会很吵。
     """
@@ -68,6 +74,8 @@ class AcpTraceSink:
         self._open_ids: set[str] = set()
         # 写工具落地时报上来的改动，按模型给的 tool_call_id 攒着，等这次调用收尾时发出
         self._edits: dict[str, list[dict[str, Any]]] = {}
+        # 这次调用挂上的编辑器终端（收尾那条要重发，否则被文本输出顶掉）
+        self._terminals: dict[str, list[str]] = {}
 
     def line(self, text: str) -> None:
         """@param text trace 行（仅留档，不外发）"""
@@ -181,6 +189,34 @@ class AcpTraceSink:
                 }
             )
 
+    def tool_terminal(self, tool_call_id: str, terminal_id: str) -> None:
+        """
+        某次工具调用的命令跑在编辑器终端里（在工具线程里被调用，命令刚起）。
+
+        这条与改动（``tool_edited``）相反，**马上**发：实时输出靠编辑器拿着这个 id
+        自己渲染，攒到收尾再发就只剩一份跑完的文本。
+
+        没报过 pending 的调用不发，理由与 ``tool_started`` 一样：挂到一条不会收尾的
+        记录上，那个终端在编辑器里永远转圈。
+
+        @param tool_call_id 模型给的 id
+        @param terminal_id 编辑器给的终端 id
+        """
+        raw_id = str(tool_call_id or "").strip()
+        terminal = str(terminal_id or "").strip()
+        if not raw_id or not terminal:
+            return
+        with self._tool_lock:
+            acp_id = self._tool_ids.get(raw_id)
+            if acp_id is None or acp_id not in self._open_ids:
+                return
+            terminals = self._terminals.setdefault(raw_id, [])
+            if terminal in terminals or len(terminals) >= _MAX_TERMINALS_PER_CALL:
+                return
+            terminals.append(terminal)
+            payload = tool_call_terminal(acp_id, list(terminals))
+        self._send(payload)
+
     def step_added(self, step: Any) -> None:
         """@param step TraceStepRecord"""
         payload = _step_to_dict(step)
@@ -196,11 +232,13 @@ class AcpTraceSink:
                     self._tool_ids[raw_id] = acp_id
             self._open_ids.discard(acp_id)
             edits = self._edits.pop(raw_id, []) if raw_id else []
+            terminals = self._terminals.pop(raw_id, []) if raw_id else []
         update = tool_call_from_step(
             payload,
             tool_call_id=acp_id,
             as_update=as_update,
             diffs=tool_call_diffs(edits, self._workspace),
+            terminals=terminals,
         )
         if update is not None:
             self._send(update)

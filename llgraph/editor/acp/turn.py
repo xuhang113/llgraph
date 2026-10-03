@@ -35,6 +35,8 @@ class AcpTurnRequest:
     """写 / 执行前的授权闸门；None 表示不问（写工具直接落地）。"""
     editor_files: Any = None
     """编辑器文件来源（``EditorFileSource``）；None 表示文件工具只读写磁盘。"""
+    editor_terminal: Any = None
+    """编辑器终端来源（``EditorTerminalSource``）；None 表示命令本地起子进程。"""
     tool_call_prefix: str = ""
     """toolCallId 前缀；同一会话每轮换一个，免得第二轮的 id 撞上上一轮那条。"""
 
@@ -80,9 +82,11 @@ def run_acp_turn(
         AgentRuntimeBundle,
         get_or_build_agent_session_for_thread,
     )
+    from llgraph.core.shell_terminal import use_editor_terminal_source
     from llgraph.core.tool_progress import (
         use_tool_edit_observer,
         use_tool_start_observer,
+        use_tool_terminal_observer,
     )
     from llgraph.core.write_failure_tracker import WriteFailureTracker
     from llgraph.display.trace_display import TraceSession
@@ -149,12 +153,14 @@ def run_acp_turn(
             session_id=req.thread_id,
             disabled=False,
         )
-        # 闸门、编辑器文件来源、工具起步 / 编辑观察者都登记在 invoke 外面：工具可能在
-        # LangGraph 线程池里跑，ContextVar 由 langchain 在提交任务时随 context 复制过去
+        # 闸门、编辑器文件 / 终端来源、工具起步 / 编辑 / 终端观察者都登记在 invoke 外面：
+        # 工具可能在 LangGraph 线程池里跑，ContextVar 由 langchain 在提交任务时随 context 复制过去
         with use_approval_gate(req.permission_ask), use_editor_file_source(
             req.editor_files
-        ), use_tool_start_observer(sink.tool_started), use_tool_edit_observer(
-            sink.tool_edited
+        ), use_editor_terminal_source(req.editor_terminal), use_tool_start_observer(
+            sink.tool_started
+        ), use_tool_edit_observer(sink.tool_edited), use_tool_terminal_observer(
+            sink.tool_terminal
         ):
             text = invoke_agent(
                 agent_ctx.agent,

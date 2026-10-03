@@ -7,7 +7,11 @@ import threading
 import time
 from dataclasses import dataclass
 
+from llgraph.core.shell_terminal import EditorTerminalProcess
 from llgraph.sandbox.exec import LiveShellProcess
+
+ShellProcess = LiveShellProcess | EditorTerminalProcess
+"""本地子进程，或编辑器终端里的那条命令（同形接口，见 `core/shell_terminal.py`）。"""
 
 _MAX_KEPT_JOBS = 32
 _COMPLETED_TTL_SEC = 900.0
@@ -28,7 +32,7 @@ class ShellJob:
     command: str
     cwd_rel: str
     fingerprint: str
-    live: LiveShellProcess
+    live: ShellProcess
     created_at: float
 
 
@@ -79,12 +83,8 @@ class ShellJobRegistry:
         for job in jobs:
             if thread_id is not None and job.thread_id != thread_id:
                 continue
-            if job.live.returncode() is None and job.live.error is None:
+            if job.live.returncode() is None:
                 n += 1
-            elif job.live.returncode() is None:
-                # 已记录 error 但仍未 wait 完
-                if job.live.proc.poll() is None:
-                    n += 1
         return n
 
     def find_running(self, thread_id: str, fingerprint: str) -> ShellJob | None:

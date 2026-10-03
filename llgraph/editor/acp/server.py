@@ -37,6 +37,8 @@ class AcpSession:
     """授权闸门（``AcpPermissionGate``）；None 表示写入不逐次确认。"""
     file_bridge: Any = None
     """编辑器文件来源（``AcpFileBridge``）；None 表示只读写磁盘。"""
+    terminal_bridge: Any = None
+    """编辑器终端（``AcpTerminalBridge``）；None 表示命令本地起子进程。"""
     turn_seq: int = 0
     """本会话已开始的轮数；toolCallId 用它做前缀，跨轮不撞号。"""
 
@@ -70,6 +72,7 @@ class AcpServer:
         self._sessions_lock = threading.Lock()
         self.initialized = False
         self._client_fs: tuple[bool, bool] = (False, False)
+        self._client_terminal = False
 
     # ---- 分发 ----
 
@@ -107,9 +110,12 @@ class AcpServer:
         if not isinstance(version, int):
             raise invalid_params("protocolVersion 必须是整数")
         from llgraph.editor.acp.fs_bridge import client_fs_capabilities
+        from llgraph.editor.acp.terminal_bridge import client_terminal_capability
 
-        # 客户端的文件能力只在握手里说一次，会话是之后才建的，先记下来
-        self._client_fs = client_fs_capabilities(params.get("clientCapabilities"))
+        # 客户端的文件 / 终端能力只在握手里说一次，会话是之后才建的，先记下来
+        capabilities = params.get("clientCapabilities")
+        self._client_fs = client_fs_capabilities(capabilities)
+        self._client_terminal = client_terminal_capability(capabilities)
         self.initialized = True
         return {
             # 协商取双方较小值：客户端更新时不至于被我们顶到不认识的版本
@@ -174,6 +180,15 @@ class AcpServer:
                 workspace=workspace,
                 can_read=can_read,
                 can_write=can_write,
+                cancel_check=session.cancelled.is_set,
+            )
+        if self._client_terminal:
+            from llgraph.editor.acp.terminal_bridge import AcpTerminalBridge
+
+            # 同样按会话建：请求里要带 sessionId，编辑器据此把终端归到这个会话名下
+            session.terminal_bridge = AcpTerminalBridge(
+                self._conn,
+                session_id,
                 cancel_check=session.cancelled.is_set,
             )
         return session
@@ -323,6 +338,7 @@ class AcpServer:
                         else None
                     ),
                     editor_files=session.file_bridge,
+                    editor_terminal=session.terminal_bridge,
                     tool_call_prefix=f"t{session.turn_seq}_",
                 ),
                 send_update=lambda update: self._send_update(session, update),

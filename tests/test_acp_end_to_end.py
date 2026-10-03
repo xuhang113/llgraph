@@ -669,6 +669,118 @@ def test_acp_turn_edit_of_a_dirty_file_goes_back_to_the_editor(
     assert target.read_text(encoding="utf-8") == "def run():\n    return 1\n"
 
 
+class _FakeEditorTerminal:
+    """假编辑器终端（真桥的协议细节在 test_acp_terminal.py 里测）。"""
+
+    def __init__(self) -> None:
+        from llgraph.core.shell_terminal import TerminalExit
+
+        self.created: list[dict[str, Any]] = []
+        self.released: list[str] = []
+        self.status = TerminalExit(exit_code=0)
+
+    def create(self, *, command: str, args: list[str], cwd: str, output_byte_limit: int):
+        self.created.append({"command": command, "args": list(args), "cwd": cwd})
+        return "term_e2e"
+
+    def output(self, terminal_id: str):
+        from llgraph.core.shell_terminal import TerminalSnapshot
+
+        return TerminalSnapshot(output="editor-terminal-ran-it\n", exit=self.status)
+
+    def wait_for_exit(self, terminal_id: str):
+        return self.status
+
+    def kill(self, terminal_id: str) -> None:
+        return None
+
+    def release(self, terminal_id: str) -> None:
+        self.released.append(terminal_id)
+
+
+def test_acp_turn_runs_the_command_in_the_editor_terminal(
+    tmp_path: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """命令交给编辑器终端跑：那一行要马上挂上终端块，输出才能边跑边看。"""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    stub_gateway.tool_name = "run_shell_command"
+    stub_gateway.tool_input = {"command": "echo hi"}
+    terminal = _FakeEditorTerminal()
+
+    updates: list[dict[str, Any]] = []
+    run_acp_turn(
+        AcpTurnRequest(
+            workspace=workspace,
+            thread_id="cli-acpterm1",
+            message="跑一下 echo hi",
+            editor_terminal=terminal,
+            tool_call_prefix="t1_",
+        ),
+        send_update=updates.append,
+        cancel_check=lambda: False,
+    )
+
+    assert len(terminal.created) == 1
+    assert terminal.created[0]["args"] == ["-c", "echo hi"]
+    assert terminal.created[0]["cwd"] == str(workspace)
+    # 跑完取一次最终输出就把终端放掉，编辑器那边仍继续显示它
+    assert terminal.released == ["term_e2e"]
+
+    tool_updates = [
+        u for u in updates if u["sessionUpdate"] in ("tool_call", "tool_call_update")
+    ]
+    assert [u["status"] for u in tool_updates[:2]] == ["pending", "in_progress"]
+    assert len({u["toolCallId"] for u in tool_updates}) == 1
+    # 终端块在命令跑完之前就发出去了（这一条才是「实时」）
+    live = tool_updates[2]
+    assert "status" not in live
+    assert live["content"] == [{"type": "terminal", "terminalId": "term_e2e"}]
+    # 收尾那条重发终端块而不是再附一份跑完的文本副本
+    finished = _completed_tool_call(updates)
+    assert finished["content"] == [{"type": "terminal", "terminalId": "term_e2e"}]
+    # 模型那边照旧拿到文本输出
+    assert any("editor-terminal-ran-it" in text for text in stub_gateway.tool_results())
+
+
+def test_acp_turn_without_an_editor_terminal_runs_locally(
+    tmp_path: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """没有编辑器终端：命令本地跑，收尾那条照旧回填文本输出。"""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    stub_gateway.tool_name = "run_shell_command"
+    stub_gateway.tool_input = {"command": "echo local-run"}
+
+    updates: list[dict[str, Any]] = []
+    run_acp_turn(
+        AcpTurnRequest(
+            workspace=workspace,
+            thread_id="cli-acpterm2",
+            message="跑一下 echo",
+            tool_call_prefix="t1_",
+        ),
+        send_update=updates.append,
+        cancel_check=lambda: False,
+    )
+
+    finished = _completed_tool_call(updates)
+    assert finished["content"][0]["type"] == "content"
+    assert "local-run" in finished["content"][0]["content"]["text"]
+    blocks = [
+        block
+        for u in updates
+        if isinstance(u.get("content"), list)
+        for block in u["content"]
+    ]
+    assert blocks
+    assert all(block.get("type") != "terminal" for block in blocks)
+
+
 def test_acp_turn_rejection_keeps_file_and_tells_the_model(
     edit_workspace: Path,
     stub_gateway: _StubState,

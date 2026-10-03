@@ -1,12 +1,15 @@
-"""单次工具调用期间的进度通知：「开始跑了」与「改了哪份文件」。
+"""单次工具调用期间的进度通知：「开始跑了」「改了哪份文件」「挂在哪个终端上」。
 
 trace 的步骤一律在工具**跑完**后才登记（那时才有耗时与输出），而步骤里留下的只是
-工具返回的那段文本。两件事因此在链路上没有位置：
+工具返回的那段文本。三件事因此在链路上没有位置：
 
 - **起步**：``ToolNode`` 每执行一次工具调用之前叫一声，入口（ACP）据此把
   ``tool_call`` 从 pending 推进到 in_progress，长命令期间编辑器里才有动静。
 - **编辑**：写工具落盘那一刻的改前 / 改后全文，跑完就没了（步骤里只剩一句
   「已写入 x 字符」）。入口拿它渲染 diff，编辑器里才看得到这一刀改了什么。
+- **终端**：命令交给编辑器终端跑的那一刻（``core/shell_terminal.py``）报一次
+  终端 id，入口把它挂到这条 ``tool_call`` 上，输出才能边跑边进编辑器；
+  等跑完再报就没有「实时」可言了。
 
 观察者放在 ContextVar 上，理由与 `permissions/approval.py` 的闸门、
 `core/editor_fs.py` 的文件来源一样：工具在 LangGraph 的线程池里跑，
@@ -191,5 +194,74 @@ def notify_file_edited(path: str, old_text: str, new_text: str) -> None:
         return
     try:
         observer(ToolEdit(cid, rel, old_text, new_text))
+    except Exception:  # noqa: BLE001 - 进度通知失败不能升级成工具崩溃
+        return
+
+
+ToolTerminalObserver = Callable[[str, str], None]
+"""``(tool_call_id, terminal_id) -> None``；编辑器终端建好之后被调用。"""
+
+_terminal_observer: ContextVar[ToolTerminalObserver | None] = ContextVar(
+    "llgraph_tool_terminal_observer", default=None
+)
+
+
+def set_tool_terminal_observer(observer: ToolTerminalObserver | None) -> Token:
+    """
+    登记工具终端观察者。
+
+    @param observer 观察者；None 表示不通知
+    @return ContextVar token，交给 ``reset_tool_terminal_observer``
+    """
+    return _terminal_observer.set(observer)
+
+
+def reset_tool_terminal_observer(token: Token) -> None:
+    """
+    还原上一层观察者。
+
+    @param token ``set_tool_terminal_observer`` 的返回值
+    """
+    _terminal_observer.reset(token)
+
+
+@contextmanager
+def use_tool_terminal_observer(
+    observer: ToolTerminalObserver | None,
+) -> Iterator[None]:
+    """
+    在一段执行期间登记观察者（一轮 invoke 外面套一层）。
+
+    @param observer 观察者；None 时等于什么都不做
+    """
+    token = set_tool_terminal_observer(observer)
+    try:
+        yield
+    finally:
+        reset_tool_terminal_observer(token)
+
+
+def current_tool_terminal_observer() -> ToolTerminalObserver | None:
+    """@return 当前观察者；无则 None"""
+    return _terminal_observer.get()
+
+
+def notify_terminal_created(terminal_id: str) -> None:
+    """
+    通知「这次工具调用的命令跑在这个编辑器终端里」。
+
+    认不出归属的不报：入口按 tool_call_id 认行，没有 id 就挂不上去。
+
+    @param terminal_id 编辑器给的终端 id
+    """
+    observer = _terminal_observer.get()
+    if observer is None:
+        return
+    tid = str(terminal_id or "").strip()
+    cid = _current_call_id.get()
+    if not tid or not cid:
+        return
+    try:
+        observer(cid, tid)
     except Exception:  # noqa: BLE001 - 进度通知失败不能升级成工具崩溃
         return

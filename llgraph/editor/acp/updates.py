@@ -258,6 +258,37 @@ def tool_call_diffs(edits: Any, workspace: Path | None) -> list[dict[str, Any]]:
     return out
 
 
+def terminal_content(terminal_id: str) -> dict[str, Any]:
+    """
+    编辑器终端 → ACP ``terminal`` 内容块（编辑器据此在那一行里画实时终端）。
+
+    @param terminal_id ``terminal/create`` 给的 id
+    @return ContentBlock
+    """
+    return {"type": "terminal", "terminalId": terminal_id}
+
+
+def tool_call_terminal(
+    tool_call_id: str,
+    terminal_ids: list[str],
+) -> dict[str, Any]:
+    """
+    命令刚挂上编辑器终端 → 只换 ``content`` 的 ``tool_call_update``。
+
+    这条必须**马上**发：实时输出就靠编辑器拿着这个 id 自己渲染，
+    攒到收尾再发就只剩一份跑完的文本，和本轮之前没区别。
+
+    @param tool_call_id 已发过 ``tool_call`` 的那个 id
+    @param terminal_ids 这次调用的终端 id（给全量：content 是整块替换的）
+    @return session/update 载荷
+    """
+    return {
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": tool_call_id,
+        "content": [terminal_content(tid) for tid in terminal_ids],
+    }
+
+
 def tool_call_pending(
     tool_call_id: str,
     *,
@@ -313,6 +344,7 @@ def tool_call_from_step(
     max_content_lines: int = 40,
     as_update: bool = False,
     diffs: list[dict[str, Any]] | None = None,
+    terminals: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """
     trace 工具步骤 → ACP 工具调用更新（completed / failed）。
@@ -331,11 +363,16 @@ def tool_call_from_step(
     ``diffs`` 排在纯文本输出前面：编辑器里第一眼要看的是「这一刀改了什么」，
     工具返回的那段文本（诊断、分块提示）是补充说明。
 
+    这次调用挂了编辑器终端时**不再回填文本输出**：终端里已经是同一段输出的全文
+    （还带退出状态），再在下面附一份截断过的副本只是同样的东西看两遍。
+    收尾仍要把终端块重发一遍——``content`` 是整块替换的，不重发就被文本顶掉了。
+
     @param step trace 步骤 dict
     @param tool_call_id 本会话内唯一的工具调用 id
     @param max_content_lines 回填给编辑器的输出行数上限
     @param as_update True 时发 ``tool_call_update``（这条调用已经报过 pending）
     @param diffs 这次调用落下的改动块（``tool_call_diffs`` 的结果）
+    @param terminals 这次调用挂上的编辑器终端 id
     @return session/update 载荷；非工具步骤返回 None
     """
     if not is_tool_call_step(step):
@@ -354,7 +391,8 @@ def tool_call_from_step(
         payload["title"] = title
         payload["kind"] = "think" if kind == "explore" else acp_tool_kind(tool_name)
     content: list[dict[str, Any]] = list(diffs or [])
-    if lines:
+    content.extend(terminal_content(tid) for tid in terminals or [])
+    if lines and not terminals:
         shown = lines[:max_content_lines]
         hidden = len(lines) - len(shown)
         text = "\n".join(shown)

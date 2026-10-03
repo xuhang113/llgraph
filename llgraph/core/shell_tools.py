@@ -16,12 +16,17 @@ from llgraph.context.runtime_context import get_active_thread_id
 from llgraph.core.shell_cwd import apply_cd_hops, peel_all_leading_cd
 from llgraph.core.shell_jobs import (
     ShellJob,
+    ShellProcess,
     command_fingerprint,
     get_shell_registry,
     new_job_id,
 )
 from llgraph.core.shell_output import clip_shell_output, combine_stdio
 from llgraph.core.shell_schemas import AwaitShellInput, RunShellCommandInput
+from llgraph.core.shell_terminal import (
+    spawn_editor_terminal,
+    terminal_output_byte_limit,
+)
 from llgraph.core.tool_arg_coerce import format_tool_validation_error
 from llgraph.core.workspace import WorkspaceContext
 from llgraph.permissions.approval import (
@@ -30,7 +35,7 @@ from llgraph.permissions.approval import (
     check_approval,
 )
 from llgraph.permissions.shell import check_shell_command
-from llgraph.sandbox.exec import LiveShellProcess, spawn_sandboxed_shell
+from llgraph.sandbox.exec import spawn_sandboxed_shell
 from llgraph.sandbox.policy import SandboxPolicy
 
 
@@ -138,7 +143,7 @@ def _clip_body(text: str, max_chars: int) -> str:
 
 
 def _format_finished(
-    live: LiveShellProcess,
+    live: ShellProcess,
     *,
     cwd_rel: str,
     max_chars: int,
@@ -259,6 +264,37 @@ def create_shell_tools(
             status=status,
         )
 
+    def _spawn(command: str, work_dir: Path) -> tuple[ShellProcess | None, str]:
+        """
+        起一条命令：能交给编辑器终端就交出去，否则本地起子进程。
+
+        交出去的好处是输出边跑边进编辑器（我们自己起的进程要等跑完才一次性回填）。
+        沙箱开着时不交：编辑器那条路没有 seatbelt / bwrap 包装，
+        交过去等于悄悄把隔离关了。命令能不能跑在这之前已经判完。
+
+        @param command shell 命令
+        @param work_dir 绝对工作目录
+        @return (进程, 错误)；失败时进程为 None
+        """
+        if not sandbox.enabled:
+            live = spawn_editor_terminal(
+                command=command,
+                cwd=work_dir,
+                output_byte_limit=terminal_output_byte_limit(
+                    shell_settings.max_output_chars
+                ),
+                hard_timeout_sec=shell_settings.background_timeout_sec,
+            )
+            if live is not None:
+                return live, ""
+        return spawn_sandboxed_shell(
+            sandbox,
+            command=command,
+            cwd=work_dir,
+            env=os.environ.copy(),
+            hard_timeout_sec=shell_settings.background_timeout_sec,
+        )
+
     def run_shell_command(
         command: str,
         working_directory: str = "",
@@ -347,13 +383,7 @@ def create_shell_tools(
                 f"请先 await_shell：{', '.join(running) or '(未知)'}"
             )
 
-        live, spawn_err = spawn_sandboxed_shell(
-            sandbox,
-            command=rest,
-            cwd=start_abs or ctx.root,
-            env=os.environ.copy(),
-            hard_timeout_sec=shell_settings.background_timeout_sec,
-        )
+        live, spawn_err = _spawn(rest, start_abs or ctx.root)
         if spawn_err or live is None:
             return f"执行失败: {spawn_err or '启动失败'}"
 
