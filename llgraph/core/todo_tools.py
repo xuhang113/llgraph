@@ -18,6 +18,7 @@ from llgraph.core.todo_store import (
     save_todo_state,
 )
 from llgraph.core.tool_arg_coerce import format_tool_validation_error
+from llgraph.core.tool_progress import PlanItem, notify_plan_updated
 
 
 def create_todo_tools(workspace_root: Path) -> list:
@@ -53,6 +54,13 @@ def create_todo_tools(workspace_root: Path) -> list:
         current = load_todo_state(root, thread_id) if merge else empty_todo_state()
         state, notes = apply_todo_write(current, incoming, merge=bool(merge))
         save_todo_state(root, thread_id, state)
+        # 入口（ACP）据此把清单推成编辑器里的计划；CLI / Web 没登记观察者，这里是空操作
+        notify_plan_updated(
+            [
+                PlanItem(id=item.id, content=item.content, status=item.status)
+                for item in state.todos
+            ]
+        )
         return format_todo_tool_result(state, notes)
 
     return [

@@ -6,6 +6,9 @@
 
 回放拿不到实时信息：工具步骤没有耗时（trace 那份没落盘），
 思考也没有单独存过。所以工具只发标题 + 折过的输出，思考整段不发。
+
+任务清单是例外：它不在 ``messages.jsonl`` 里，而是单独落盘的一份当前状态，
+所以回放末尾按现状补一条 ``plan``（见 ``plan_update``）。
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from llgraph.editor.acp.updates import (
     acp_tool_kind,
     agent_message_chunk,
     agent_thought_chunk,
+    session_plan,
     text_content,
     user_message_chunk,
 )
@@ -187,6 +191,32 @@ def replay_updates(
     return updates
 
 
+def plan_update(workspace: Path, thread_id: str) -> list[dict[str, Any]]:
+    """
+    落盘的任务清单 → 一条 ACP ``plan``（续聊时把计划清单也接回来）。
+
+    清单不在 ``messages.jsonl`` 里（它单独落盘，压缩也不会丢），所以回放历史
+    带不出它；不补这一条，重启后编辑器里的计划清单就是空的，而模型下一轮仍按
+    那张表干活——两边看到的不是同一个计划。
+
+    空清单不发：那张表本来就该是空的，发一条空快照只是白刷一次。
+
+    @param workspace 工作区根
+    @param thread_id 会话 ID
+    @return 一条 plan 载荷；没有清单时为空列表
+    """
+    from llgraph.core.todo_store import load_todo_state
+
+    state = load_todo_state(workspace, thread_id)
+    if not state.todos:
+        return []
+    return [
+        session_plan(
+            [{"content": item.content, "status": item.status} for item in state.todos]
+        )
+    ]
+
+
 def load_session_updates(
     workspace: Path,
     thread_id: str,
@@ -206,11 +236,14 @@ def load_session_updates(
     from llgraph.session.session_file_store import load_session_messages
 
     messages = load_session_messages(workspace, thread_id)
-    return replay_updates(
+    updates = replay_updates(
         messages,
         max_messages=max_messages,
         max_tool_output_lines=max_tool_output_lines,
     )
+    # 计划排在历史之后：它是会话当前的状态，不属于时间线上的某一条
+    updates.extend(plan_update(workspace, thread_id))
+    return updates
 
 
 def session_is_resumable(workspace: Path, thread_id: str) -> bool:

@@ -84,6 +84,7 @@ def run_acp_turn(
     )
     from llgraph.core.shell_terminal import use_editor_terminal_source
     from llgraph.core.tool_progress import (
+        use_plan_observer,
         use_tool_edit_observer,
         use_tool_start_observer,
         use_tool_terminal_observer,
@@ -153,7 +154,7 @@ def run_acp_turn(
             session_id=req.thread_id,
             disabled=False,
         )
-        # 闸门、编辑器文件 / 终端来源、工具起步 / 编辑 / 终端观察者都登记在 invoke 外面：
+        # 闸门、编辑器文件 / 终端来源、工具起步 / 编辑 / 终端 / 计划观察者都登记在 invoke 外面：
         # 工具可能在 LangGraph 线程池里跑，ContextVar 由 langchain 在提交任务时随 context 复制过去
         with use_approval_gate(req.permission_ask), use_editor_file_source(
             req.editor_files
@@ -161,7 +162,7 @@ def run_acp_turn(
             sink.tool_started
         ), use_tool_edit_observer(sink.tool_edited), use_tool_terminal_observer(
             sink.tool_terminal
-        ):
+        ), use_plan_observer(sink.todo_plan):
             text = invoke_agent(
                 agent_ctx.agent,
                 req.message,

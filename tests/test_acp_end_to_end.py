@@ -781,6 +781,63 @@ def test_acp_turn_without_an_editor_terminal_runs_locally(
     assert all(block.get("type") != "terminal" for block in blocks)
 
 
+def test_acp_turn_sends_the_todo_list_as_a_plan(
+    tmp_path: Path,
+    stub_gateway: _StubState,
+    clean_runtime: None,
+) -> None:
+    """模型列的待办要变成编辑器里的计划清单，而不是只有 CLI / Web 看得到。"""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    stub_gateway.tool_name = "todo_write"
+    stub_gateway.tool_input = {
+        "merge": False,
+        "todos": [
+            {"id": "t1", "content": "定位入口", "status": "completed"},
+            {"id": "t2", "content": "改 sink", "status": "in_progress"},
+            {"id": "t3", "content": "跑测试", "status": "pending"},
+        ],
+    }
+
+    updates: list[dict[str, Any]] = []
+    run_acp_turn(
+        AcpTurnRequest(
+            workspace=workspace,
+            thread_id="cli-acpplane2e",
+            message="分三步把 sink 改掉",
+            tool_call_prefix="t1_",
+        ),
+        send_update=updates.append,
+        cancel_check=lambda: False,
+    )
+
+    plans = [u for u in updates if u["sessionUpdate"] == "plan"]
+    assert len(plans) == 1, [u["sessionUpdate"] for u in updates]
+    assert plans[0]["entries"] == [
+        {"content": "定位入口", "priority": "medium", "status": "completed"},
+        {"content": "改 sink", "priority": "medium", "status": "in_progress"},
+        {"content": "跑测试", "priority": "medium", "status": "pending"},
+    ]
+    # 计划与那一行工具调用各走各的：清单不是挂在 tool_call 上的 content
+    assert "toolCallId" not in plans[0]
+    tool_updates = [
+        u for u in updates if u["sessionUpdate"] in ("tool_call", "tool_call_update")
+    ]
+    assert [u["status"] for u in tool_updates] == ["pending", "in_progress", "completed"]
+    # 清单在工具收尾之前就发出去了（落盘那一刻报的）
+    assert updates.index(plans[0]) < updates.index(tool_updates[-1])
+    # 续聊也接得回这张表
+    from llgraph.editor.acp.replay import load_session_updates
+
+    reloaded = load_session_updates(workspace, "cli-acpplane2e")
+    assert reloaded[-1]["sessionUpdate"] == "plan"
+    assert [e["status"] for e in reloaded[-1]["entries"]] == [
+        "completed",
+        "in_progress",
+        "pending",
+    ]
+
+
 def test_acp_turn_rejection_keeps_file_and_tells_the_model(
     edit_workspace: Path,
     stub_gateway: _StubState,

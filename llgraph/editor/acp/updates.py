@@ -289,6 +289,72 @@ def tool_call_terminal(
     }
 
 
+# ACP 的 PlanEntryStatus 只有三档。llgraph 的 cancelled 没有对应项：留成 pending
+# 会让编辑器里那张表永远显示「还有活没干」，所以按「不用再做了」归到 completed，
+# 正文前面加一句标记，免得看起来像真做完了。
+_PLAN_STATUS = {
+    "pending": "pending",
+    "in_progress": "in_progress",
+    "completed": "completed",
+    "cancelled": "completed",
+}
+CANCELLED_PLAN_PREFIX = "（已取消）"
+
+# ACP 的 PlanEntry 必填 priority，而 llgraph 的清单没有优先级这个字段。
+# 按顺序硬编一个高低只是凭空造数据，一律中档。
+PLAN_PRIORITY = "medium"
+
+# 与 ``todo_store.MAX_TODOS`` 同量级的保险：清单本来就在工具侧截过，
+# 这里再兜一层，免得别的调用方塞进来一张几千条的表把一条更新撑爆
+MAX_PLAN_ENTRIES = 20
+
+
+def plan_entries(items: Any) -> list[dict[str, Any]]:
+    """
+    任务清单条目 → ACP ``PlanEntry`` 列表。
+
+    清单里的 id 不往外发：ACP 的计划是全量快照，没有「按 id 更新某一条」这回事，
+    编辑器只按顺序渲染。
+
+    @param items ``[{"content": ..., "status": ...}]``（status 用 llgraph 的四档）
+    @return entries 列表；一条都发不出时为空
+    """
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        content = " ".join(str(item.get("content") or "").split())
+        if not content:
+            continue
+        raw_status = str(item.get("status") or "").strip()
+        if raw_status == "cancelled":
+            content = f"{CANCELLED_PLAN_PREFIX}{content}"
+        out.append(
+            {
+                "content": content,
+                "priority": PLAN_PRIORITY,
+                "status": _PLAN_STATUS.get(raw_status, "pending"),
+            }
+        )
+        if len(out) >= MAX_PLAN_ENTRIES:
+            break
+    return out
+
+
+def session_plan(items: Any) -> dict[str, Any]:
+    """
+    任务清单 → ACP ``plan``（编辑器里的计划清单）。
+
+    这条是**全量替换**：每次都把整张表发过去，编辑器照单重画。
+
+    @param items ``[{"content": ..., "status": ...}]``
+    @return session/update 载荷
+    """
+    return {"sessionUpdate": "plan", "entries": plan_entries(items)}
+
+
 def tool_call_pending(
     tool_call_id: str,
     *,

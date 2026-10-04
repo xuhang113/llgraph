@@ -10,6 +10,9 @@ trace 的步骤一律在工具**跑完**后才登记（那时才有耗时与输�
 - **终端**：命令交给编辑器终端跑的那一刻（``core/shell_terminal.py``）报一次
   终端 id，入口把它挂到这条 ``tool_call`` 上，输出才能边跑边进编辑器；
   等跑完再报就没有「实时」可言了。
+- **计划**：``todo_write`` 落盘那一刻的整张清单。它和上面三件不一样——不属于某一次
+  工具调用，而是会话级的一张表；入口（ACP）把它发成编辑器里的计划清单，
+  而工具返回的那段文本只给模型看。
 
 观察者放在 ContextVar 上，理由与 `permissions/approval.py` 的闸门、
 `core/editor_fs.py` 的文件来源一样：工具在 LangGraph 的线程池里跑，
@@ -263,5 +266,79 @@ def notify_terminal_created(terminal_id: str) -> None:
         return
     try:
         observer(cid, tid)
+    except Exception:  # noqa: BLE001 - 进度通知失败不能升级成工具崩溃
+        return
+
+
+@dataclass(frozen=True)
+class PlanItem:
+    """计划清单里的一条（``todo_write`` 落盘之后的快照）。"""
+
+    id: str
+    content: str
+    status: str
+
+
+PlanObserver = Callable[[list[PlanItem]], None]
+"""``(items) -> None``；``todo_write`` 落盘之后被调用，给的是整张表。"""
+
+_plan_observer: ContextVar[PlanObserver | None] = ContextVar(
+    "llgraph_plan_observer", default=None
+)
+
+
+def set_plan_observer(observer: PlanObserver | None) -> Token:
+    """
+    登记计划观察者。
+
+    @param observer 观察者；None 表示不通知
+    @return ContextVar token，交给 ``reset_plan_observer``
+    """
+    return _plan_observer.set(observer)
+
+
+def reset_plan_observer(token: Token) -> None:
+    """
+    还原上一层观察者。
+
+    @param token ``set_plan_observer`` 的返回值
+    """
+    _plan_observer.reset(token)
+
+
+@contextmanager
+def use_plan_observer(observer: PlanObserver | None) -> Iterator[None]:
+    """
+    在一段执行期间登记观察者（一轮 invoke 外面套一层）。
+
+    @param observer 观察者；None 时等于什么都不做
+    """
+    token = set_plan_observer(observer)
+    try:
+        yield
+    finally:
+        reset_plan_observer(token)
+
+
+def current_plan_observer() -> PlanObserver | None:
+    """@return 当前观察者；无则 None"""
+    return _plan_observer.get()
+
+
+def notify_plan_updated(items: list[PlanItem]) -> None:
+    """
+    通知「任务清单现在是这样」。
+
+    给的一律是**整张表**：入口那边（ACP 的 ``plan``）也是全量快照，
+    报增量还得在两头各维护一份当前表，对不上就会画出一张与落盘不符的清单。
+    清空清单同样要报（空列表），否则编辑器里那张表会停在被清空之前的样子。
+
+    @param items 落盘后的全部条目，按清单顺序
+    """
+    observer = _plan_observer.get()
+    if observer is None:
+        return
+    try:
+        observer(list(items))
     except Exception:  # noqa: BLE001 - 进度通知失败不能升级成工具崩溃
         return

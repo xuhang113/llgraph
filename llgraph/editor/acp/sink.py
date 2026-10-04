@@ -12,6 +12,7 @@ from llgraph.editor.acp.updates import (
     agent_message_chunk,
     agent_thought_chunk,
     is_tool_call_step,
+    session_plan,
     tool_call_diffs,
     tool_call_from_step,
     tool_call_locations,
@@ -40,6 +41,9 @@ class AcpTraceSink:
     写工具落地时另报一次改动（``tool_edited``），收尾那条据此带上 diff 块；
     命令交给编辑器终端时再报一次（``tool_terminal``），那条马上发，
     输出才能边跑边进编辑器。
+
+    ``todo_write`` 的清单（``todo_plan``）不挂在任何一行工具调用上：它走 ACP 的
+    ``plan``，在编辑器里是会话级的一张计划清单。
 
     trace 行（``line()``）不外发：ACP 没有对应的更新类型，编辑器里刷成思考会很吵。
     """
@@ -76,6 +80,8 @@ class AcpTraceSink:
         self._edits: dict[str, list[dict[str, Any]]] = {}
         # 这次调用挂上的编辑器终端（收尾那条要重发，否则被文本输出顶掉）
         self._terminals: dict[str, list[str]] = {}
+        # 上一次发出去的计划快照；一模一样的表不重发
+        self._plan_sent: dict[str, Any] | None = None
 
     def line(self, text: str) -> None:
         """@param text trace 行（仅留档，不外发）"""
@@ -215,6 +221,34 @@ class AcpTraceSink:
                 return
             terminals.append(terminal)
             payload = tool_call_terminal(acp_id, list(terminals))
+        self._send(payload)
+
+    def todo_plan(self, items: list[Any]) -> None:
+        """
+        ``todo_write`` 落盘了一张新清单（在工具线程里被调用）。
+
+        每次 ``todo_write`` 之后就发，而不是自己比对「状态是不是真的变了」：
+        ACP 的 ``plan`` 本来就是全量快照，编辑器收到就整块重画，判增量只会在两头
+        各留一份当前表。唯一挡掉的是**一模一样**的那张表——模型重复提交同一份清单
+        （比如 ``merge=true`` 原样写回）时，编辑器里不必白刷一次。
+
+        清空清单也要发（``entries`` 为空）：那张表该跟着清掉。
+
+        @param items 落盘后的全部条目（``PlanItem``），按清单顺序
+        """
+        payload = session_plan(
+            [
+                {
+                    "content": getattr(item, "content", ""),
+                    "status": getattr(item, "status", ""),
+                }
+                for item in items or []
+            ]
+        )
+        with self._tool_lock:
+            if payload == self._plan_sent:
+                return
+            self._plan_sent = payload
         self._send(payload)
 
     def step_added(self, step: Any) -> None:
